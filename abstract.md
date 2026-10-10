@@ -1,14 +1,14 @@
-# SearchNow
+# MediaLake
 ## Abstract
 Local file, data, media search based on embeddings.
 ## Architecture
-- Client program in rust (searchnow-client)
+- Client program in rust (medialake-client)
   - manages user data
   - handles searches
   - does embbeding (by asking the server) - uses filewatcher to watch for modifications
 
   
-- Server program also in rust (searchnow-server)
+- Server program also in rust (medialake-server)
   - does the actual embedding
   - communicates with client via [bierpc](https://github.com/MOBSkuchen/bierpc)
   - owns the model by using llama.cpp
