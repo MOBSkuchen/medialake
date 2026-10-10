@@ -1,0 +1,21 @@
+[package]
+name = "medialake-ffi"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "medialake_core_ffi"
+crate-type = ["cdylib"]
+
+[dependencies]
+medialake-core.workspace = true
+medialake-proto.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-appender.workspace = true
+
+[build-dependencies]
+csbindgen = "1.9"

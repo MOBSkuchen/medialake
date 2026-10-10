@@ -1,6 +1,6 @@
-# Generates ui/SearchNow.App/Assets/SearchNow.ico (rounded accent square + magnifier), multi-size PNG-in-ICO.
+# Generates ui/MediaLake.App/Assets/MediaLake.ico (rounded accent square + two stacked waves), multi-size PNG-in-ICO.
 Add-Type -AssemblyName System.Drawing
-$out = Join-Path (Split-Path $PSScriptRoot -Parent) "ui\SearchNow.App\Assets\SearchNow.ico"
+$out = Join-Path (Split-Path $PSScriptRoot -Parent) "ui\MediaLake.App\Assets\MediaLake.ico"
 $sizes = 16, 24, 32, 48, 64, 128, 256
 $pngs = foreach ($s in $sizes) {
     $bmp = New-Object System.Drawing.Bitmap $s, $s
@@ -15,11 +15,17 @@ $pngs = foreach ($s in $sizes) {
     $path.CloseFigure()
     $brush = New-Object System.Drawing.Drawing2D.LinearGradientBrush ([System.Drawing.Point]::new(0,0)), ([System.Drawing.Point]::new($s,$s)), ([System.Drawing.Color]::FromArgb(255, 0, 120, 215)), ([System.Drawing.Color]::FromArgb(255, 88, 60, 220))
     $g.FillPath($brush, $path)
-    $pen = New-Object System.Drawing.Pen ([System.Drawing.Color]::White), ([Math]::Max(1.5, $s * 0.085))
+    $pen = New-Object System.Drawing.Pen ([System.Drawing.Color]::White), ([Math]::Max(1.5, $s * 0.1))
     $pen.StartCap = 'Round'; $pen.EndCap = 'Round'
-    $cx = $s * 0.43; $cy = $s * 0.43; $rad = $s * 0.22
-    $g.DrawEllipse($pen, $cx - $rad, $cy - $rad, 2 * $rad, 2 * $rad)
-    $g.DrawLine($pen, $cx + $rad * 0.72, $cy + $rad * 0.72, $s * 0.78, $s * 0.78)
+    # Two tildes stacked vertically, each one a single S-curve spanning the middle of the square.
+    $x0 = $s * 0.2; $x1 = $s * 0.8; $w = $x1 - $x0; $amp = $s * 0.075
+    foreach ($cy in @(($s * 0.36), ($s * 0.64))) {
+        $g.DrawBezier($pen,
+            [single]$x0, [single]($cy + $amp),
+            [single]($x0 + $w / 3), [single]($cy - $amp * 1.33),
+            [single]($x0 + 2 * $w / 3), [single]($cy + $amp * 1.33),
+            [single]$x1, [single]($cy - $amp))
+    }
     $ms = New-Object System.IO.MemoryStream
     $bmp.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
     ,@{ Size = $s; Bytes = $ms.ToArray() }
