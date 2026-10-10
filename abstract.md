@@ -30,7 +30,7 @@ Below, files will appear based on similarity to the text. A file can be clicked 
 
 Very much like Spotlight on Mac - but only for files.
 
-At the top left is a large, fat text "SearchNow" and at the right is a settings button.
+At the top left is a large, fat text "MediaLake" and at the right is a settings button.
 
 ### Settings menu
 Contains 3 parts:

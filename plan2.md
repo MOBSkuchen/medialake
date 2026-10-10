@@ -17,7 +17,9 @@ Decisions:
 | Data | `~/Library/Application Support/MediaLake/` with the same files as `%LOCALAPPDATA%\MediaLake\` |
 | Secrets | **Keychain** replaces DPAPI |
 | Installer | **`.pkg`** (pkgbuild + productbuild). Hotkey and autostart are asked on first run in the app, because a pkg cannot show input pages |
-| Distribution | Outside the App Store, not sandboxed. Developer ID signing + notarisation are optional switches in the build script |
+| Distribution | Outside the App Store, not sandboxed, **ad-hoc signed**. The Gatekeeper warning on first install is accepted; no Developer ID or notarisation |
+| Bundle identifier | `com.sonvogel.medialake` (app, pkg, keychain entry, login item) |
+| Name in the UI | Always **"MediaLake"**: window title, menu bar, dialogs. "SearchNow" appears nowhere |
 | Scripts | `scripts/windows/` and `scripts/macos/`, one variant of each script per platform ✅ done with this plan |
 
 ---
@@ -143,8 +145,8 @@ random id it generates) and returns the reference `keychain:<id>`, which goes in
 change. Pairing again and uninstalling delete the old item.
 
 Keychain access is tied to the code signature. Ad-hoc signed development builds get a new identity on every
-rebuild, so macOS asks for the keychain password again after each build. That is expected and goes away
-with a stable Developer ID.
+rebuild, so macOS asks for the keychain password again after each build. Because releases are ad-hoc signed
+too (§5.4), users in remote mode see this prompt once after every update (§9).
 
 ### 3.4 Video and images
 
@@ -188,7 +190,7 @@ log-scale mappings are copied from the C# code so both apps read the same.
   panel is created once and only shown and hidden.
 - It grows when there are results and shrinks back when empty, like the Windows window.
 - Layout, top to bottom, same as `MainWindow.xaml`:
-  1. Large bold title on the left, gear button on the right.
+  1. Large bold "MediaLake" title on the left, gear button on the right.
   2. Search field (placeholder "Search files, images, audio…"), debounced, newest request wins.
   3. Thin indeterminate bar while a search runs.
   4. Result list. Each row: 44 pt thumbnail or file icon, name, folder, optional two-line snippet, coloured
@@ -243,7 +245,7 @@ and only changes the fields it edits, so fields it does not know survive a save.
    and `resources/`). It allows "Install for me only" (`~/Applications`, no admin password), matching the
    per-user Windows install.
 3. `scripts/postinstall` starts the app for the logged-in user, the counterpart of "Start MediaLake now".
-4. Optional: sign with a Developer ID Installer certificate, notarise, staple.
+4. The pkg itself is left unsigned (see §5.4).
 
 ### 5.2 What moves from the installer into the app
 
@@ -275,7 +277,8 @@ behind, which the README documents.
   bundle, both with the hardened runtime.
 - Without a Developer ID and notarisation, Gatekeeper blocks the downloaded pkg; the user has to allow it
   under System Settings → Privacy & Security. That matches the unsigned Windows installer (SmartScreen
-  warning) and is acceptable for now. A Developer ID needs a paid Apple Developer membership.
+  warning). **Decided: the warning is accepted**; the release is ad-hoc signed and the README explains the
+  one-time approval. The Developer ID switches stay in the build script but are not part of the plan.
 
 ## 6. Scripts ✅
 
@@ -317,7 +320,7 @@ Prerequisite: both repositories on the Mac. `medialake` has no git remote yet, a
 | M4 | Settings | All three pages wired; folder add/remove; quality switch + download; login item; remote pairing against a Windows server |
 | M5 | Media | Video frames via AVFoundation behind the experimental toggle; HEIC via ImageIO; thumbnails |
 | M6 | Installer | `build-release.sh --installer` produces a pkg; clean-machine install, upgrade over a running app, uninstall with and without data |
-| M7 | Polish + docs | Permission-denied states, `--selftest` / `--screenshot`, README final, signing + notarisation if a Developer ID exists |
+| M7 | Polish + docs | Permission-denied states, `--selftest` / `--screenshot`, README final, including how to approve the unsigned pkg in System Settings |
 
 ## 9. Open Questions / Risks
 
@@ -332,14 +335,13 @@ Prerequisite: both repositories on the Mac. `medialake` has no git remote yet, a
    out brittle, embed the `cdylib` in `Contents/Frameworks` and sign it instead.
 4. **Folder permissions.** Prompts appear on first access per protected folder and can be denied. A denied
    folder must show as such rather than as an empty index.
-5. **Developer ID.** Without the paid membership the pkg is not notarised and Gatekeeper warns. Decide
-   before the first public release, not before development.
-6. **Bundle identifier.** `com.medialake.app` is a placeholder. It keys the keychain entry, the login item
-   and the permission grants, so it must be final before anyone installs a build.
-7. **Intel Macs.** Not planned: no Intel hardware to test on, and Metal performance for this model on
+5. **Ad-hoc signing and updates.** macOS ties keychain access and folder permissions to the code
+   signature, and an ad-hoc signature changes with every build. After each update users are likely asked
+   again for the keychain item (remote mode only) and for Documents / Desktop / Downloads access. Confirm
+   on a real update in M6; if it is too annoying, a self-signed certificate kept across releases gives a
+   stable identity without an Apple membership.
+6. **Intel Macs.** Not planned: no Intel hardware to test on, and Metal performance for this model on
    Intel GPUs is unknown. A universal build is possible later (`lipo` of two server builds).
-8. **Case-sensitive volumes.** See §3.2.
-9. **Window title.** The Windows search window still shows "SearchNow" after the rename to MediaLake. The
-   Mac window should show whatever Windows settles on; decide once and use it in both.
-10. **Not in scope:** App Store distribution, auto-update, iCloud "dataless" files (indexing would download
+7. **Case-sensitive volumes.** See §3.2.
+8. **Not in scope:** App Store distribution, auto-update, iCloud "dataless" files (indexing would download
     them; skip files that are not local), Spotlight importer or Quick Look integration.

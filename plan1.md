@@ -164,7 +164,7 @@ medialake/
 - **Lifetime:** starts at login (Run key set by the installer), lives in the **tray**, and keeps the core loaded so the index is warm. The window is hidden and shown, never recreated. It's single-instance: a second launch signals the running instance to show its window (named mutex + message).
 - **Global hotkey:** `RegisterHotKey` via Win32 interop. Pressing it shows the window centred on the **monitor containing the cursor/foreground window** and focuses the search box. Esc or losing focus hides the window.
 - **Search window** (borderless, rounded, Mica/Acrylic backdrop, Spotlight-like):
-  - Top left: a large bold "SearchNow" title. Top right: a settings button (gear).
+  - Top left: a large bold "MediaLake" title. Top right: a settings button (gear).
   - Search box: typing is debounced (~150 ms) and runs the search on a background thread.
   - Result list: shell icon or thumbnail, file name, shortened path, modality badge, and an optional snippet. On the right of each row is an **"Open in Explorer"** button, which runs `explorer.exe /select,"path"`.
   - Click or Enter opens the file with its default app (`ShellExecute`).
