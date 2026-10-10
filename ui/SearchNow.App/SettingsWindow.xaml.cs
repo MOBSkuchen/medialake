@@ -38,6 +38,8 @@ public sealed partial class SettingsWindow : Window
         SystemBackdrop = new Microsoft.UI.Xaml.Media.MicaBackdrop();
         AppWindow.Resize(new Windows.Graphics.SizeInt32(960, 720));
         AppWindow.SetIcon(System.IO.Path.Combine(AppContext.BaseDirectory, "Assets", "SearchNow.ico"));
+        var none = unchecked((int)0xFFFFFFFE);
+        Win32.DwmSetWindowAttribute(WinRT.Interop.WindowNative.GetWindowHandle(this), 34, ref none, sizeof(int));
         DirList.ItemsSource = _dirs;
         Nav.SelectedItem = Nav.MenuItems[0];
         _ = LoadAsync();
@@ -235,6 +237,46 @@ public sealed partial class SettingsWindow : Window
         app.ApplyHotkey(combo);
         _ = SaveAsync();
         Nav.Focus(FocusState.Programmatic);
+    }
+
+    private async void KillDaemon_Click(object sender, RoutedEventArgs e)
+    {
+        var dlg = new ContentDialog
+        {
+            Title = "Quit SearchNow?",
+            Content = "Stops the background process and the embedding server. The shortcut stops working until you start SearchNow again.",
+            PrimaryButtonText = "Quit",
+            CloseButtonText = "Cancel",
+            XamlRoot = Content.XamlRoot,
+        };
+        if (await dlg.ShowAsync() == ContentDialogResult.Primary) ((App)Application.Current).QuitApp();
+    }
+
+    private async void Uninstall_Click(object sender, RoutedEventArgs e)
+    {
+        var uninstaller = Directory.EnumerateFiles(AppContext.BaseDirectory, "unins*.exe").FirstOrDefault();
+        if (uninstaller == null)
+        {
+            await new ContentDialog
+            {
+                Title = "Uninstall",
+                Content = "This copy was not installed with the SearchNow installer. Remove it by deleting its folder, or use Windows Settings > Apps.",
+                CloseButtonText = "OK",
+                XamlRoot = Content.XamlRoot,
+            }.ShowAsync();
+            return;
+        }
+        var dlg = new ContentDialog
+        {
+            Title = "Uninstall SearchNow?",
+            Content = "SearchNow closes and the uninstaller starts. It asks whether to keep your index, settings and models.",
+            PrimaryButtonText = "Uninstall",
+            CloseButtonText = "Cancel",
+            XamlRoot = Content.XamlRoot,
+        };
+        if (await dlg.ShowAsync() != ContentDialogResult.Primary) return;
+        System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(uninstaller) { UseShellExecute = true });
+        ((App)Application.Current).QuitApp();
     }
 
     private void Autostart_Toggled(object sender, RoutedEventArgs e)

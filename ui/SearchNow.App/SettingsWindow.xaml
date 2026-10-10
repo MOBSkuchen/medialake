@@ -40,6 +40,14 @@
                     </StackPanel>
 
                     <ToggleSwitch x:Name="AutostartSwitch" Header="Start SearchNow when I sign in" Toggled="Autostart_Toggled" />
+
+                    <StackPanel Spacing="8">
+                        <TextBlock Text="Maintenance" FontWeight="SemiBold" />
+                        <StackPanel Orientation="Horizontal" Spacing="12">
+                            <Button Content="Kill daemon" Click="KillDaemon_Click" ToolTipService.ToolTip="Stop SearchNow and its embedding server" />
+                            <Button Content="Uninstall" Click="Uninstall_Click" />
+                        </StackPanel>
+                    </StackPanel>
                 </StackPanel>
             </ScrollViewer>
 

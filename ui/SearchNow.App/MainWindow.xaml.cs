@@ -125,6 +125,9 @@ public sealed partial class MainWindow : Window
         AppWindow.IsShownInSwitchers = false;
         var round = 2; // DWMWCP_ROUND
         Win32.DwmSetWindowAttribute(_hwnd, 33, ref round, sizeof(int));
+        // no 1px light border around the borderless window (DWMWA_BORDER_COLOR = DWMWA_COLOR_NONE)
+        var none = unchecked((int)0xFFFFFFFE);
+        Win32.DwmSetWindowAttribute(_hwnd, 34, ref none, sizeof(int));
 
         Activated += (_, e) =>
         {

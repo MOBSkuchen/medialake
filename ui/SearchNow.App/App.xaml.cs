@@ -140,6 +140,8 @@ public partial class App : Application
 
     public void ApplyHotkey(string hotkey) => Hotkey.Register(hotkey);
 
+    public void QuitApp() => Quit();
+
     private void Quit()
     {
         _tray?.Dispose();
