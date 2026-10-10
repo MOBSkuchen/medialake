@@ -1,7 +1,7 @@
 # Recreates vendor/llama-cpp-rs (llama-cpp-rs + llama.cpp at a pinned tag). Needs git.
 param([string]$LlamaTag = "b11535")
 $ErrorActionPreference = "Stop"
-$root = Split-Path $PSScriptRoot -Parent
+$root = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
 $dst = Join-Path $root "vendor\llama-cpp-rs"
 if (Test-Path $dst) { Write-Host "vendor already present: $dst"; exit 0 }
 git config --global core.longpaths true
