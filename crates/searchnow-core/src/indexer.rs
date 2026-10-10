@@ -47,6 +47,8 @@ pub struct Indexer {
     paused: AtomicBool,
     events: broadcast::Sender<Event>,
     current: Mutex<Option<String>>,
+    /// When the current batch started (for the time estimate).
+    batch_start: Mutex<Option<std::time::Instant>>,
 }
 
 fn key(p: &Path) -> String {
@@ -107,6 +109,7 @@ impl Indexer {
             paused: AtomicBool::new(false),
             events,
             current: Mutex::new(None),
+            batch_start: Mutex::new(None),
         })
     }
 
@@ -142,7 +145,9 @@ impl Indexer {
             }
             q.pending.push_back(p);
         }
-        self.total.fetch_add(1, Ordering::Relaxed);
+        if self.total.fetch_add(1, Ordering::Relaxed) == 0 {
+            *self.batch_start.lock().unwrap() = Some(std::time::Instant::now());
+        }
         self.notify.notify_one();
     }
 
@@ -163,12 +168,17 @@ impl Indexer {
 
     fn progress(&self) {
         let queued = self.queue_len() as u64;
-        let _ = self.events.send(Event::Progress {
-            queued,
-            done: self.done.load(Ordering::Relaxed),
-            total: self.total.load(Ordering::Relaxed),
-            current: self.current.lock().unwrap().clone(),
-        });
+        let done = self.done.load(Ordering::Relaxed);
+        let total = self.total.load(Ordering::Relaxed);
+        // remaining time from the average speed of this batch (needs a few samples to mean anything)
+        let eta_secs = match *self.batch_start.lock().unwrap() {
+            Some(t) if done >= 3 && total > done => {
+                let per_file = t.elapsed().as_secs_f64() / done as f64;
+                Some((per_file * (total - done) as f64).ceil() as u64)
+            }
+            _ => None,
+        };
+        let _ = self.events.send(Event::Progress { queued, done, total, current: self.current.lock().unwrap().clone(), eta_secs });
     }
 
     async fn worker(self: Arc<Self>, _id: usize) {
@@ -225,7 +235,8 @@ impl Indexer {
                 let _ = self.events.send(Event::Idle { files, chunks });
                 self.total.store(0, Ordering::Relaxed);
                 self.done.store(0, Ordering::Relaxed);
-            } else if self.done.load(Ordering::Relaxed) % 5 == 0 {
+                *self.batch_start.lock().unwrap() = None;
+            } else {
                 self.progress();
             }
         }

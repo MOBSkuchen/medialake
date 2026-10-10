@@ -65,6 +65,16 @@ public sealed partial class SettingsWindow : Window
             HotkeyError.Text = ex.Message;
             return;
         }
+        // size hints in the quality list
+        foreach (var o in QualityCombo.Items)
+        {
+            if (o is ComboBoxItem { Tag: string tag } ci && _models.TryGetValue(tag, out var info))
+            {
+                var label = tag switch { "heavy" => "Heavy: most precise", "light" => "Light: smallest and fastest", _ => "Normal: recommended" };
+                var size = info.size >= 1L << 30 ? $"{info.size / 1073741824.0:0.0} GB" : $"{info.size / 1048576.0:0} MB";
+                ci.Content = $"{label}  Â·  {size}" + (info.downloaded ? "  Â·  downloaded" : "");
+            }
+        }
         _loading = true;
         HotkeyText.Text = (string?)_cfg["hotkey"] ?? "Ctrl+Alt+Space";
         AutostartSwitch.IsOn = Registry.CurrentUser.OpenSubKey(RunKey)?.GetValue(RunValue) != null;

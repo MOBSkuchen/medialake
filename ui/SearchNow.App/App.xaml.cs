@@ -161,7 +161,7 @@ public partial class App : Application
             await Task.Delay(800);
             var query = Environment.GetEnvironmentVariable("SEARCHNOW_TEST_QUERY") ?? "a cat";
             // wait for the first index run so there is something to find
-            var deadline = DateTime.UtcNow.AddSeconds(240);
+            var deadline = DateTime.UtcNow.AddSeconds(Environment.GetEnvironmentVariable("SEARCHNOW_TEST_NOWAIT") != null ? 0 : 240);
             while (DateTime.UtcNow < deadline)
             {
                 var st = await Core!.CallAsync("status");

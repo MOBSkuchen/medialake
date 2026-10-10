@@ -6,13 +6,6 @@
   #define AppVersion "0.1.0"
 #endif
 #define AppExe "SearchNow.exe"
-#define ModelUrlBase "https://huggingface.co/ggml-org/embeddinggemma-2-GGUF/resolve/main/"
-; Normal quality (default). Keep in sync with crates/searchnow-proto/src/models.rs
-#define ModelFile "embeddinggemma-2-Q8_0.gguf"
-#define ModelSha "2188ac1deca4b77dffefd603c2776a9d76d9d74ec01841392982ebb840b09135"
-#define MmprojFile "mmproj-embeddinggemma-2-Q8_0.gguf"
-#define MmprojSha "c4a8a52691ecef40618438928bdf9e68379b854e24166f292592353db0aab64f"
-
 [Setup]
 AppId={{6F2A6A6E-5E0B-4F5A-9C7B-5EA4C4E9A1D1}
 AppName={#AppName}
@@ -61,16 +54,10 @@ Filename: "{sys}\taskkill.exe"; Parameters: "/F /IM searchnow-server.exe"; Flags
 [Code]
 var
   HotkeyPage: TInputQueryWizardPage;
-  DownloadPage: TDownloadWizardPage;
 
 function DataDir: String;
 begin
   Result := ExpandConstant('{localappdata}\SearchNow');
-end;
-
-function ModelsDir: String;
-begin
-  Result := DataDir + '\models';
 end;
 
 { ---------- hotkey validation: at least one modifier + exactly one key ---------- }
@@ -169,14 +156,9 @@ begin
     'Use at least one of Ctrl, Alt, Shift, Win plus a key, for example Ctrl+Alt+Space.');
   HotkeyPage.Add('Shortcut:', False);
   HotkeyPage.Values[0] := 'Ctrl+Alt+Space';
-
-  DownloadPage := CreateDownloadPage('Downloading the search model',
-    'SearchNow needs the EmbeddingGemma 2 model (about 870 MB). It is downloaded once and stays on this computer.', nil);
 end;
 
 function NextButtonClick(CurPageID: Integer): Boolean;
-var
-  ModelOk, MmprojOk: Boolean;
 begin
   Result := True;
   if CurPageID = HotkeyPage.ID then
@@ -186,52 +168,15 @@ begin
       MsgBox('Please enter a valid shortcut, e.g. Ctrl+Alt+Space (at least one modifier and exactly one key).', mbError, MB_OK);
       Result := False;
     end;
-  end
-  else if CurPageID = wpReady then
-  begin
-    ModelOk := FileExists(ModelsDir + '\{#ModelFile}');
-    MmprojOk := FileExists(ModelsDir + '\{#MmprojFile}');
-    if ModelOk and MmprojOk then
-      Exit;
-    DownloadPage.Clear;
-    if not ModelOk then
-      DownloadPage.Add('{#ModelUrlBase}{#ModelFile}', '{#ModelFile}', '{#ModelSha}');
-    if not MmprojOk then
-      DownloadPage.Add('{#ModelUrlBase}{#MmprojFile}', '{#MmprojFile}', '{#MmprojSha}');
-    DownloadPage.Show;
-    try
-      try
-        DownloadPage.Download;
-      except
-        if DownloadPage.AbortedByUser then
-          Log('Model download aborted by user.')
-        else
-          SuppressibleMsgBox(AddPeriod(GetExceptionMessage), mbCriticalError, MB_OK, IDOK);
-        Result := False;
-      end;
-    finally
-      DownloadPage.Hide;
-    end;
   end;
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
 var
-  Cfg, Name: String;
-  Names: array[0..1] of String;
-  I: Integer;
+  Cfg: String;
 begin
   if CurStep = ssPostInstall then
   begin
-    ForceDirectories(ModelsDir);
-    Names[0] := '{#ModelFile}';
-    Names[1] := '{#MmprojFile}';
-    for I := 0 to 1 do
-    begin
-      Name := Names[I];
-      if (not FileExists(ModelsDir + '\' + Name)) and FileExists(ExpandConstant('{tmp}\') + Name) then
-        CopyFile(ExpandConstant('{tmp}\') + Name, ModelsDir + '\' + Name, False);
-    end;
     { first install: write the chosen hotkey; an existing config is left alone }
     Cfg := DataDir + '\config.toml';
     if not FileExists(Cfg) then
@@ -244,7 +189,7 @@ begin
   if CurUninstallStep = usPostUninstall then
   begin
     if (not UninstallSilent) and DirExists(DataDir) then
-      if MsgBox('Also delete your SearchNow index, settings and the downloaded model (about 900 MB)?',
+      if MsgBox('Also delete your SearchNow index, settings and the downloaded models?',
                 mbConfirmation, MB_YESNO or MB_DEFBUTTON2) = IDYES then
         DelTree(DataDir, True, True, True);
   end;

@@ -6,7 +6,7 @@ use serde::Serialize;
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {
     /// Indexing progress. `queued` = still waiting; `total` = files in the current batch.
-    Progress { queued: u64, done: u64, total: u64, current: Option<String> },
+    Progress { queued: u64, done: u64, total: u64, current: Option<String>, eta_secs: Option<u64> },
     /// Local/remote embedding server state: idle, starting, ready, failed.
     Server { state: String, detail: String, backend: String, quality: String },
     /// Model download progress (bytes).
