@@ -103,11 +103,11 @@ where the code is Windows-only today.
 | `core.rs:91`, `core.rs:192`, `tests/e2e.rs:14` | `medialake-server.exe`, `medialake-server-cpu.exe` | Build names with `std::env::consts::EXE_SUFFIX`. The CPU twin is looked up as today and is absent on macOS, which the code already tolerates |
 | `supervisor.rs:275` | `CREATE_NO_WINDOW` | Nothing needed (already `cfg(windows)`) |
 | `supervisor.rs` `job` module | Job Object kills the child with the client | No Job Object. The server already exits when its stdin closes and the child is `kill_on_drop`; verify by force-quitting the app and checking that the server is gone |
-| `config.rs:132`, `server/state.rs:60` | `LOCALAPPDATA` | `~/Library/Application Support/MediaLake` (and `…/MediaLake/server`). Put the lookup in one helper so the two crates cannot drift. `MEDIALAKE_HOME` / `MEDIALAKE_MODEL_DIR` keep working |
-| `config.rs` default hotkey | `Ctrl+Alt+Space` | `Alt+Space` (shown as ⌥Space). Not Cmd+Space, which is Spotlight |
+| `config.rs:132`, `server/state.rs:60` | `LOCALAPPDATA` | `~/Library/Application Support/MediaLake` (and `…/MediaLake/server`). Put the lookup in one helper in `medialake-proto`, the only crate both the client and the server depend on, so the two cannot drift. `MEDIALAKE_HOME` / `MEDIALAKE_MODEL_DIR` keep working |
+| `config.rs` default hotkey | `Ctrl+Alt+Space` | `Alt+Space` (shown as ⌥Space). Not Cmd+Space, which is Spotlight. ⌥Space is also the default of Raycast and Alfred; users of those pick another one on the first-run screen |
 | `config.rs` `normalize_path` | Strips `\\?\` | No-op on macOS already |
 | `remote.rs` `protect` / `unprotect` | DPAPI | **Keychain** (§3.3). Today's non-Windows fallback stores the secret as plain hex, which must not ship |
-| `core.rs:258`, `server/serve.rs:52` | `COMPUTERNAME` | One `host_name()` helper: `COMPUTERNAME`, else `gethostname` |
+| `core.rs:258`, `server/serve.rs:52` | `COMPUTERNAME` | One `host_name()` helper in `medialake-proto`: `COMPUTERNAME`, else `gethostname` |
 | `indexer.rs:686` | `THREAD_PRIORITY_BELOW_NORMAL` | `pthread_set_qos_class_self_np(QOS_CLASS_UTILITY)`. Not `BACKGROUND`: that pins the thread to efficiency cores and throttles I/O, which makes a first index take far too long |
 | `extract.rs:89` `is_hidden_or_system` | File attributes | `UF_HIDDEN` from `st_flags` |
 | `extract.rs` `is_ignored` | `$RECYCLE.BIN`, `System Volume Information`, `thumbs.db`, `desktop.ini` | Add `.Trash`, `.Spotlight-V100`, `.fseventsd`, `.DocumentRevisions-V100`, and `~/Library`. Dot-files are already skipped. Do **not** descend into packages: `.app`, `.framework`, `.bundle`, `.photoslibrary`, `.xcodeproj` and similar |
@@ -137,10 +137,10 @@ file. Accepted for v1 and listed in §9.
 
 ### 3.3 Credentials
 
-`protect` stores the secret as a generic password in the login keychain (service `MediaLake`, account =
-`client_id`) and returns the reference `keychain:<client_id>`, which goes into the existing
+`protect` stores the secret as a generic password in the login keychain (service `MediaLake`, account = a
+random id it generates) and returns the reference `keychain:<id>`, which goes into the existing
 `secret_protected` config field. `unprotect` reads it back. The signatures and the config schema do not
-change. Uninstall deletes the item.
+change. Pairing again and uninstalling delete the old item.
 
 Keychain access is tied to the code signature. Ad-hoc signed development builds get a new identity on every
 rebuild, so macOS asks for the keychain password again after each build. That is expected and goes away
@@ -207,7 +207,7 @@ and only changes the fields it edits, so fields it does not know survive a save.
 
 | Page | Windows control | macOS control |
 |---|---|---|
-| General | Hotkey box (click, press combination; validated by registering it) | Recorder view with the same flow and the same error texts |
+| General | Hotkey box (click, press combination; validated by registering it) | Recorder view with the same flow. Registering is **not** a reliable conflict check on macOS: it can succeed for a combination that Spotlight, the input-source switcher or another launcher already owns. The recorder therefore also rejects a short list of known system shortcuts (⌘Space, ⌃Space, ⌘Tab, …) and says so |
 | General | "Start MediaLake when I sign in" (HKCU Run key) | Toggle backed by `SMAppService.mainApp` |
 | General | "Kill daemon" with confirmation | Same button and dialog; quits the app and the server |
 | General | "Uninstall" (starts the Inno uninstaller) | Same button; runs the in-app uninstall (§5.3) |
