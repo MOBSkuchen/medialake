@@ -1,0 +1,37 @@
+[package]
+name = "searchnow-core"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "searchnow_core"
+
+[[bin]]
+name = "searchnow-cli"
+path = "src/bin/cli.rs"
+
+[dependencies]
+bierpc.workspace = true
+bier_derive.workspace = true
+searchnow-proto.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-appender.workspace = true
+sha2.workspace = true
+toml = "0.8"
+rusqlite = { version = "0.32", features = ["bundled"] }
+usearch = "=2.21.4"
+half = "2"
+walkdir = "2"
+notify = "7"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif", "bmp", "tiff"] }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_Security_Cryptography"] }
+ureq = "2"
+pdf-extract = "0.12"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+symphonia = { version = "0.5", features = ["mp3", "aac", "isomp4", "flac", "ogg", "vorbis", "wav", "pcm", "alac"] }
+windows = { version = "0.62", features = ["Win32_Media_MediaFoundation", "Win32_System_Com", "Win32_Foundation", "Win32_System_Variant", "Win32_UI_Shell_PropertiesSystem", "Win32_System_Com_StructuredStorage"] }
