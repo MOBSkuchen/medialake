@@ -4,6 +4,14 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path $PSScriptRoot -Parent
 Set-Location $root
 
+# Windows PowerShell 5.1 turns anything a native tool writes to stderr (cargo warnings, cmake notes) into a
+# terminating NativeCommandError under "Stop". Run native tools with "Continue" and check $LASTEXITCODE instead.
+function Invoke-Native([scriptblock]$cmd) {
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try { & $cmd | Out-Host } finally { $ErrorActionPreference = $prev }
+}
+
 # toolchain (per-user installs, see scripts/dev-env.sh)
 $env:LIBCLANG_PATH = Join-Path $env:LOCALAPPDATA "Programs\llvm\clang+llvm-23.1.3-x86_64-pc-windows-msvc\bin"
 $cmake = "C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin"
@@ -12,7 +20,7 @@ $env:PATH = "$cmake;$dotnet;$env:PATH"
 $env:DOTNET_ROOT = $dotnet
 
 # CPU build (also the fallback when a machine has no Vulkan runtime) + client DLL
-cargo build --release -p medialake-ffi -p medialake-server
+Invoke-Native { cargo build --release -p medialake-ffi -p medialake-server }
 if ($LASTEXITCODE) { throw "cargo build failed" }
 Copy-Item (Join-Path $root "target\release\medialake-server.exe") (Join-Path $root "target\release\medialake-server-cpu.exe") -Force
 
@@ -32,8 +40,8 @@ set "CARGO_TARGET_DIR=C:\t"
 cd /d $root
 cargo build --release -p medialake-server --features vulkan
 "@ | Set-Content $bat -Encoding ASCII
-    cmd /c $bat
-    if ($LASTEXITCODE) { cmd /c $bat }
+    Invoke-Native { cmd /c $bat }
+    if ($LASTEXITCODE) { Invoke-Native { cmd /c $bat } }
     if ($LASTEXITCODE -eq 0) { $gpuExe = "C:\t\release\medialake-server.exe" } else { Write-Warning "Vulkan build failed; shipping the CPU server only" }
 }
 
@@ -41,7 +49,7 @@ $out = Join-Path $root "dist\app"
 if (Test-Path $out) { Remove-Item -Recurse -Force $out }
 # `dotnet publish` drops the compiled XAML (.xbf) and MediaLake.pri for unpackaged WinUI apps; the
 # self-contained build output is complete, so stage that.
-dotnet build ui\MediaLake.App\MediaLake.App.csproj -c Release -p:Platform=x64
+Invoke-Native { dotnet build ui\MediaLake.App\MediaLake.App.csproj -c Release -p:Platform=x64 }
 if ($LASTEXITCODE) { throw "dotnet build failed" }
 $bin = Join-Path $root "ui\MediaLake.App\bin\x64\Release\net10.0-windows10.0.19041.0\win-x64"
 New-Item -ItemType Directory -Force $out | Out-Null
@@ -58,6 +66,6 @@ Write-Host "staged $out ($mb MB)"
 
 if ($Installer) {
     $iscc = Join-Path $env:LOCALAPPDATA "Programs\Inno Setup 6\ISCC.exe"
-    & $iscc "/DAppVersion=$Version" installer\medialake.iss
+    Invoke-Native { & $iscc "/DAppVersion=$Version" installer\medialake.iss }
     if ($LASTEXITCODE) { throw "ISCC failed" }
 }
