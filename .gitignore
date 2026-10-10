@@ -1,0 +1,7 @@
+target/
+.idea/
+/vendor/llama-cpp-rs/
+/dist/
+*.log
+/poc/
+*.lock

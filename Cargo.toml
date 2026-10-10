@@ -1,0 +1,32 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+bierpc = { path = "../rpc/bierpc" }
+bier_derive = { path = "../rpc/bier_derive" }
+tokio = { version = "1.49", features = ["full"] }
+sha2 = "0.10"
+rcgen = "0.14"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+searchnow-proto = { path = "crates/searchnow-proto" }
+searchnow-llama = { path = "crates/searchnow-llama" }
+searchnow-core = { path = "crates/searchnow-core" }
+
+# crates.io llama-cpp-sys-2 vendors a llama.cpp without the gemma-embedding2 arch; use llama-cpp-rs
+# main with its llama.cpp submodule moved to b11535 (see vendor/README.md).
+[patch.crates-io]
+llama-cpp-sys-2 = { path = "vendor/llama-cpp-rs/llama-cpp-sys-2" }
+
+[profile.release]
+debug = "line-tables-only"
