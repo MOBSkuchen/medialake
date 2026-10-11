@@ -1,0 +1,2 @@
+# shell scripts must keep LF endings (bash on macOS and Git Bash both choke on CRLF)
+*.sh text eol=lf

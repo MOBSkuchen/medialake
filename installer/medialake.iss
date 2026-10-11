@@ -1,4 +1,4 @@
-; MediaLake installer (Inno Setup 6). Build:  scripts\build-release.ps1 -Installer
+; MediaLake installer (Inno Setup 6). Build:  scripts\windows\build-release.ps1 -Installer
 ; Per-user install: no administrator rights needed.
 
 #define AppName "MediaLake"
@@ -33,7 +33,7 @@ Name: "autostart"; Description: "Start MediaLake when I sign in"; GroupDescripti
 Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Options:"; Flags: unchecked
 
 [Files]
-; the published, self-contained app (see scripts\build-release.ps1)
+; the published, self-contained app (see scripts\windows\build-release.ps1)
 Source: "..\dist\app\*"; DestDir: "{app}"; Flags: recursesubdirs ignoreversion createallsubdirs
 
 [Icons]

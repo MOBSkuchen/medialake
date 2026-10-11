@@ -1,6 +1,6 @@
 # Generates ui/MediaLake.App/Assets/MediaLake.ico (rounded accent square + two stacked waves), multi-size PNG-in-ICO.
 Add-Type -AssemblyName System.Drawing
-$out = Join-Path (Split-Path $PSScriptRoot -Parent) "ui\MediaLake.App\Assets\MediaLake.ico"
+$out = Join-Path (Split-Path (Split-Path $PSScriptRoot -Parent) -Parent) "ui\MediaLake.App\Assets\MediaLake.ico"
 $sizes = 16, 24, 32, 48, 64, 128, 256
 $pngs = foreach ($s in $sizes) {
     $bmp = New-Object System.Drawing.Bitmap $s, $s

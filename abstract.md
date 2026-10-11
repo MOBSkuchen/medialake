@@ -20,16 +20,17 @@ Local file, data, media search based on embeddings.
 - Currently only supports EmbeddingGemma2 as a model
 
 ## UI
-Client UI uses WinUI; the (client) application is currently natively windows only.
+Client UI uses the native toolkit of each platform: WinUI on Windows, SwiftUI/AppKit on macOS (planned, see `plan2.md`).
+Both hosts load the same rust client; only the UI differs.
 The app is opened by using a keyboard shortcut (defined during installation).
 
 ### Base app
 It opens a window, which is centered in the middle of the current monitor. The user may type into it. 
-Below, files will appear based on similarity to the text. A file can be clicked on and should also have a "Open in Explorer" option on the right.
+Below, files will appear based on similarity to the text. A file can be clicked on and should also have a "Open in Explorer" option on the right ("Show in Finder" on macOS).
 
 Very much like Spotlight on Mac - but only for files.
 
-At the top left is a large, fat text "SearchNow" and at the right is a settings button.
+At the top left is a large, fat text "MediaLake" and at the right is a settings button.
 
 ### Settings menu
 Contains 3 parts:
@@ -39,3 +40,4 @@ Contains 3 parts:
 
 ## Installer
 The installer program installs the client+server combo, as well as downloading the default model and prompting the user for a keyboard shortcut.
+On Windows this is an Inno Setup installer; on macOS a `.pkg`, where the shortcut is asked on first start instead (a pkg cannot ask questions).

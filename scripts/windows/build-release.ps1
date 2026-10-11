@@ -1,7 +1,7 @@
-# Builds everything and stages dist\app for the installer:  scripts\build-release.ps1 [-Version 0.1.0] [-Installer]
+# Builds everything and stages dist\app for the installer:  scripts\windows\build-release.ps1 [-Version 0.1.0] [-Installer]
 param([string]$Version = "0.1.0", [switch]$Installer)
 $ErrorActionPreference = "Stop"
-$root = Split-Path $PSScriptRoot -Parent
+$root = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
 Set-Location $root
 
 # Windows PowerShell 5.1 turns anything a native tool writes to stderr (cargo warnings, cmake notes) into a
@@ -12,7 +12,7 @@ function Invoke-Native([scriptblock]$cmd) {
     try { & $cmd | Out-Host } finally { $ErrorActionPreference = $prev }
 }
 
-# toolchain (per-user installs, see scripts/dev-env.sh)
+# toolchain (per-user installs, see scripts/windows/dev-env.sh)
 $env:LIBCLANG_PATH = Join-Path $env:LOCALAPPDATA "Programs\llvm\clang+llvm-23.1.3-x86_64-pc-windows-msvc\bin"
 $cmake = "C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin"
 $dotnet = Join-Path $env:LOCALAPPDATA "Microsoft\dotnet"
