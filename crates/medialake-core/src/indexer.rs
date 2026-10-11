@@ -255,7 +255,7 @@ impl Indexer {
         let ids = {
             let st = self.store.lock().unwrap();
             let mut ids = st.delete_file(&p).unwrap_or_default();
-            ids.extend(st.delete_under(&format!("{}\\", p.trim_end_matches('\\'))).unwrap_or_default());
+            ids.extend(st.delete_under(&format!("{}{}", p.trim_end_matches(std::path::MAIN_SEPARATOR), std::path::MAIN_SEPARATOR)).unwrap_or_default());
             ids
         };
         if !ids.is_empty() {
@@ -277,7 +277,7 @@ impl Indexer {
             if st.rename_file(&f, &t, &name).unwrap_or(false) {
                 moved.push(t.clone());
             }
-            moved.extend(st.rename_prefix(f.trim_end_matches('\\'), t.trim_end_matches('\\')).unwrap_or_default());
+            moved.extend(st.rename_prefix(f.trim_end_matches(std::path::MAIN_SEPARATOR), t.trim_end_matches(std::path::MAIN_SEPARATOR)).unwrap_or_default());
             moved
         };
         if moved.is_empty() {
@@ -691,5 +691,14 @@ fn lower_priority() {
     }
 }
 
-#[cfg(not(windows))]
+/// QOS_CLASS_UTILITY, not BACKGROUND: background pins the thread to efficiency cores and throttles
+/// disk I/O, which makes a first index take far too long.
+#[cfg(target_os = "macos")]
+fn lower_priority() {
+    unsafe {
+        libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_UTILITY, 0);
+    }
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 fn lower_priority() {}

@@ -1,4 +1,4 @@
-//! Remote server support: pairing, credential protection (DPAPI) and a reconnecting backend.
+//! Remote server support: pairing, credential protection (DPAPI / Keychain) and a reconnecting backend.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -49,15 +49,55 @@ pub fn unprotect(text: &str) -> Result<Vec<u8>, String> {
     }
 }
 
-#[cfg(not(windows))]
+/// Keychain: the secret is a generic password (service `MediaLake`, account = a random id); the config
+/// holds the reference `keychain:<id>`.
+#[cfg(target_os = "macos")]
+const KEYCHAIN_SERVICE: &str = "MediaLake";
+#[cfg(target_os = "macos")]
+const KEYCHAIN_PREFIX: &str = "keychain:";
+
+#[cfg(target_os = "macos")]
+pub fn protect(data: &[u8]) -> Result<String, String> {
+    let mut id = [0u8; 16];
+    // SAFETY: arc4random_buf fills exactly `len` bytes of the buffer.
+    unsafe { libc::arc4random_buf(id.as_mut_ptr().cast(), id.len()) };
+    let id = hex(&id);
+    // the secret is raw bytes; store it as hex so that it stays a plain string item
+    security_framework::passwords::set_generic_password(KEYCHAIN_SERVICE, &id, hex(data).as_bytes())
+        .map_err(|e| format!("cannot store the credential in the Keychain: {e}"))?;
+    Ok(format!("{KEYCHAIN_PREFIX}{id}"))
+}
+
+#[cfg(target_os = "macos")]
+pub fn unprotect(text: &str) -> Result<Vec<u8>, String> {
+    let id = text.strip_prefix(KEYCHAIN_PREFIX).ok_or("corrupt credential")?;
+    let v = security_framework::passwords::get_generic_password(KEYCHAIN_SERVICE, id)
+        .map_err(|e| format!("cannot read the credential from the Keychain: {e}"))?;
+    let s = String::from_utf8(v).map_err(|_| "corrupt credential".to_string())?;
+    unhex(&s).ok_or_else(|| "corrupt credential".into())
+}
+
+/// Deletes the stored secret behind a `secret_protected` value (re-pairing, uninstall). Best effort.
+#[cfg(target_os = "macos")]
+pub fn discard(text: &str) {
+    if let Some(id) = text.strip_prefix(KEYCHAIN_PREFIX) {
+        let _ = security_framework::passwords::delete_generic_password(KEYCHAIN_SERVICE, id);
+    }
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 pub fn protect(data: &[u8]) -> Result<String, String> {
     Ok(hex(data))
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 pub fn unprotect(text: &str) -> Result<Vec<u8>, String> {
     unhex(text).ok_or_else(|| "corrupt credential".into())
 }
+
+/// DPAPI blobs live in the config itself; there is nothing to delete.
+#[cfg(not(target_os = "macos"))]
+pub fn discard(_text: &str) {}
 
 // ---------------- connection ----------------
 

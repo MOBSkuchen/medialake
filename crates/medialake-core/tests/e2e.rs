@@ -11,7 +11,7 @@ fn server_exe() -> PathBuf {
     let mut p = std::env::current_exe().unwrap();
     p.pop(); // deps
     p.pop();
-    p.join("medialake-server.exe")
+    p.join(format!("medialake-server{}", std::env::consts::EXE_SUFFIX))
 }
 
 async fn start(home: &Path, mutate: impl FnOnce(&mut Config)) -> std::sync::Arc<Core> {

@@ -1,4 +1,4 @@
-//! Video frame extraction with Windows Media Foundation (nothing to bundle).
+//! Video frame extraction with Windows Media Foundation or AVFoundation (nothing to bundle).
 
 use std::path::Path;
 
@@ -100,7 +100,54 @@ pub fn prepare_video(path: &Path) -> Result<PreparedVideo, String> {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+#[allow(deprecated)] // copyCGImageAtTime is the synchronous API; the async one needs a runloop
+pub fn prepare_video(path: &Path) -> Result<PreparedVideo, String> {
+    use objc2::rc::autoreleasepool;
+    use objc2_av_foundation::{AVAssetImageGenerator, AVURLAsset};
+    use objc2_core_foundation::CGSize;
+    use objc2_core_media::{CMTime, CMTimeGetSeconds, CMTimeMakeWithSeconds};
+    use objc2_foundation::{NSString, NSURL};
+
+    autoreleasepool(|_| unsafe {
+        let url = NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()));
+        let asset = AVURLAsset::URLAssetWithURL_options(&url, None);
+        let generator = AVAssetImageGenerator::assetImageGeneratorWithAsset(&asset);
+        generator.setAppliesPreferredTrackTransform(true);
+        // decode at a size the pipeline would downscale to anyway
+        let side = crate::extract::MAX_IMAGE_SIDE as f64;
+        generator.setMaximumSize(CGSize::new(side, side));
+
+        let duration = CMTimeGetSeconds(asset.duration());
+        let duration = if duration.is_finite() && duration > 0.0 { duration } else { 0.0 };
+        let n = MAX_FRAMES;
+        let mut frames = Vec::new();
+        let mut hasher = <sha2::Sha256 as sha2::Digest>::new();
+        for i in 0..n {
+            let t = if duration > 0.0 { duration * (2 * i + 1) as f64 / (2 * n) as f64 } else { 0.0 };
+            let time: CMTime = CMTimeMakeWithSeconds(t, 600);
+            let Ok(cg) = generator.copyCGImageAtTime_actualTime_error(time, std::ptr::null_mut()) else {
+                if duration == 0.0 {
+                    break;
+                }
+                continue;
+            };
+            let rgb = crate::apple::cgimage_to_rgb(&cg)?;
+            let prepared = crate::extract::prepare_decoded(image::DynamicImage::ImageRgb8(rgb))?;
+            sha2::Digest::update(&mut hasher, &prepared.pixel_hash);
+            frames.push(prepared.jpeg);
+            if duration == 0.0 {
+                break; // unknown duration: one frame from the start
+            }
+        }
+        if frames.is_empty() {
+            return Err("no frames could be decoded".to_string());
+        }
+        Ok(PreparedVideo { frames, hash: sha2::Digest::finalize(hasher).to_vec() })
+    })
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 pub fn prepare_video(_path: &Path) -> Result<PreparedVideo, String> {
-    Err("video frame extraction needs Windows".into())
+    Err("video frame extraction needs Windows or macOS".into())
 }

@@ -191,7 +191,7 @@ impl Store {
 
     /// Deletes all files whose path starts with `prefix` (directory removal); returns chunk ids.
     pub fn delete_under(&self, prefix: &str) -> rusqlite::Result<Vec<i64>> {
-        let like = format!("{}%", prefix.replace('%', "\\%").replace('_', "\\_"));
+        let like = format!("{}%", like_escape(prefix));
         let mut st = self.conn.prepare("SELECT c.id FROM chunks c JOIN files f ON f.id=c.file_id WHERE f.path LIKE ?1 ESCAPE '\\'")?;
         let ids: Vec<i64> = st.query_map([&like], |r| r.get(0))?.collect::<Result<_, _>>()?;
         self.conn.execute("DELETE FROM files WHERE path LIKE ?1 ESCAPE '\\'", [&like])?;
@@ -208,13 +208,13 @@ impl Store {
 
     /// Moves all files below directory `old` to `new` (a directory rename). Returns the new paths.
     pub fn rename_prefix(&self, old: &str, new: &str) -> rusqlite::Result<Vec<String>> {
-        let like = format!("{}\\%", old.replace('%', "\\%").replace('_', "\\_"));
+        let like = format!("{}{}%", like_escape(old), like_escape(std::path::MAIN_SEPARATOR_STR));
         let mut st = self.conn.prepare("SELECT path FROM files WHERE path LIKE ?1 ESCAPE '\\'")?;
         let paths: Vec<String> = st.query_map([&like], |r| r.get(0))?.collect::<Result<_, _>>()?;
         let mut out = Vec::new();
         for p in paths {
             let np = format!("{}{}", new, &p[old.len()..]);
-            let name = np.rsplit('\\').next().unwrap_or(&np).to_string();
+            let name = np.rsplit(std::path::MAIN_SEPARATOR).next().unwrap_or(&np).to_string();
             self.conn.execute("DELETE FROM files WHERE path=?1", [&np])?;
             self.conn.execute("UPDATE files SET path=?2, name=?3 WHERE path=?1", [&p, &np, &name])?;
             out.push(np);
@@ -368,4 +368,9 @@ impl Store {
     pub fn rollback(&self) {
         let _ = self.conn.execute_batch("ROLLBACK");
     }
+}
+
+/// Escapes `\`, `%` and `_` for a LIKE pattern used with `ESCAPE '\'`.
+fn like_escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
 }

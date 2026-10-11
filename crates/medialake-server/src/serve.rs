@@ -49,7 +49,7 @@ pub struct PairArgs {
 }
 
 fn default_public(bind: SocketAddr) -> String {
-    let host = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "localhost".into());
+    let host = medialake_proto::platform::host_name("localhost");
     format!("{host}:{}", bind.port())
 }
 

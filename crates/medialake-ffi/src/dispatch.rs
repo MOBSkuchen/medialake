@@ -44,6 +44,10 @@ pub async fn call(core: &std::sync::Arc<Core>, method: &str, args: Value) -> Res
             core.use_local().await?;
             Ok(json!({}))
         }
+        "forget_remote" => {
+            core.forget_remote()?;
+            Ok(json!({}))
+        }
         "models" => Ok(json!({ "qualities": core.models_status(), "dir": core.model_dir() })),
         "download_model" => {
             let q = args["quality"].as_str().and_then(medialake_proto::models::Quality::parse).ok_or("bad quality")?;

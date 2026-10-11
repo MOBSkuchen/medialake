@@ -2,6 +2,7 @@
 
 pub mod models;
 pub mod pairing;
+pub mod platform;
 pub mod pinning;
 
 use bier_derive::{Deserialize, Serialize};

@@ -104,11 +104,17 @@ fn init_logging(dir: &Option<PathBuf>, file: &str) -> Option<Guard> {
 }
 
 pub(crate) fn backend_name() -> &'static str {
-    if cfg!(feature = "vulkan") { "vulkan" } else { "cpu" }
+    if cfg!(target_os = "macos") {
+        "metal"
+    } else if cfg!(feature = "vulkan") {
+        "vulkan"
+    } else {
+        "cpu"
+    }
 }
 
 fn gpu_layers(c: &Common) -> i32 {
-    c.gpu_layers.unwrap_or(if cfg!(feature = "vulkan") { 999 } else { 0 })
+    c.gpu_layers.unwrap_or(if cfg!(any(target_os = "macos", feature = "vulkan")) { 999 } else { 0 })
 }
 
 pub(crate) fn start_engine(c: &Common) -> anyhow::Result<(Engine, Quality)> {

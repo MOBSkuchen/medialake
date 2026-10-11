@@ -25,7 +25,7 @@ use crate::watcher::FileWatcher;
 
 #[derive(Default, Clone)]
 pub struct StartOptions {
-    /// Path of `medialake-server.exe` (default: next to the current executable).
+    /// Path of `medialake-server` (with the platform executable suffix) (default: next to the current executable).
     pub server_exe: Option<PathBuf>,
     /// Overrides the models directory.
     pub model_dir: Option<PathBuf>,
@@ -88,7 +88,7 @@ fn default_server_exe() -> PathBuf {
         return PathBuf::from(p);
     }
     let me = std::env::current_exe().unwrap_or_default();
-    me.parent().unwrap_or(std::path::Path::new(".")).join("medialake-server.exe")
+    me.parent().unwrap_or(std::path::Path::new(".")).join(format!("medialake-server{}", std::env::consts::EXE_SUFFIX))
 }
 
 impl Core {
@@ -189,7 +189,7 @@ impl Core {
             exe: self.opts.server_exe.clone().unwrap_or_else(default_server_exe),
             fallback_exe: {
                 let exe = self.opts.server_exe.clone().unwrap_or_else(default_server_exe);
-                let cpu = exe.with_file_name("medialake-server-cpu.exe");
+                let cpu = exe.with_file_name(format!("medialake-server-cpu{}", std::env::consts::EXE_SUFFIX));
                 cpu.exists().then_some(cpu)
             },
             model_dir: self.model_dir.clone(),
@@ -255,14 +255,16 @@ impl Core {
 
     /// Redeems a pairing code and switches to the remote server.
     pub async fn pair_remote(&self, code: &str) -> Result<PairResult, String> {
-        let name = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "MediaLake client".into());
+        let name = medialake_proto::platform::host_name("MediaLake client");
         let paired = crate::remote::pair(code, &name).await?;
         let server_quality = Quality::parse(&paired.info.quality);
         let mut reindex = false;
         {
             let mut c = self.cfg.write().unwrap();
             c.server_mode = ServerMode::Remote;
-            c.remote = Some(paired.creds.clone());
+            if let Some(old) = c.remote.replace(paired.creds.clone()) {
+                crate::remote::discard(&old.secret_protected);
+            }
             if let Some(q) = server_quality {
                 if c.quality != q {
                     c.quality = q;
@@ -276,6 +278,19 @@ impl Core {
             reindex = self.ensure_index_quality(q).await;
         }
         Ok(PairResult { address: paired.creds.address, quality: paired.info.quality, backend: paired.info.backend, reindex })
+    }
+
+    /// Deletes the stored remote credential (Keychain item on macOS) and the paired server from the
+    /// config. Used by the uninstall.
+    pub fn forget_remote(&self) -> Result<(), String> {
+        let old = {
+            let mut c = self.cfg.write().unwrap();
+            c.remote.take()
+        };
+        if let Some(old) = old {
+            crate::remote::discard(&old.secret_protected);
+        }
+        self.save_config().map_err(|e| e.to_string())
     }
 
     /// Back to the bundled server.

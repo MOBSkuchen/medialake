@@ -6,6 +6,8 @@ pub mod core;
 pub mod events;
 pub mod extract;
 pub mod extract_ext;
+#[cfg(target_os = "macos")]
+pub mod apple;
 pub mod video;
 pub mod indexer;
 pub mod models;

@@ -35,6 +35,8 @@ const TEXT_EXT: &[&str] = &[
     "gradle", "cmake", "mk", "vue", "svelte", "proto", "tf",
 ];
 const IMAGE_EXT: &[&str] = &["jpg", "jpeg", "png", "gif", "bmp", "webp", "tif", "tiff"];
+/// Decoded through ImageIO (the `image` crate cannot read HEIC).
+const MAC_IMAGE_EXT: &[&str] = &["heic", "heif"];
 const AUDIO_EXT: &[&str] = &["mp3", "wav", "flac", "ogg", "oga", "opus", "m4a", "aac"];
 const VIDEO_EXT: &[&str] = &["mp4", "mkv", "avi", "mov", "webm", "wmv", "m4v"];
 const DOC_EXT: &[&str] = &["pdf", "docx", "xlsx", "pptx", "odt"];
@@ -49,7 +51,7 @@ pub fn classify(path: &Path) -> Modality {
     let e = e.as_str();
     if TEXT_EXT.contains(&e) {
         Modality::Text
-    } else if IMAGE_EXT.contains(&e) {
+    } else if IMAGE_EXT.contains(&e) || (cfg!(target_os = "macos") && MAC_IMAGE_EXT.contains(&e)) {
         Modality::Image
     } else if AUDIO_EXT.contains(&e) {
         Modality::Audio
@@ -62,6 +64,36 @@ pub fn classify(path: &Path) -> Modality {
     }
 }
 
+/// Bundle directories that are opaque to the index: their contents are not documents of the user.
+#[cfg(target_os = "macos")]
+const PACKAGE_EXT: &[&str] = &[
+    "app", "framework", "bundle", "plugin", "kext", "xpc", "appex", "photoslibrary", "musiclibrary", "tvlibrary", "imovielibrary",
+    "fcpbundle", "xcodeproj", "xcworkspace", "xcassets", "playground", "pkg", "lproj", "dSYM", "sparsebundle", "sparseimage",
+];
+
+#[cfg(target_os = "macos")]
+fn is_ignored_macos(path: &Path) -> bool {
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let mut prefix = std::path::PathBuf::new();
+    for c in path.components() {
+        prefix.push(c.as_os_str());
+        let std::path::Component::Normal(n) = c else { continue };
+        let n = n.to_string_lossy();
+        if matches!(n.as_ref(), ".Trash" | ".Trashes" | ".Spotlight-V100" | ".fseventsd" | ".DocumentRevisions-V100" | ".TemporaryItems" | ".VolumeIcon.icns") {
+            return true;
+        }
+        if n == "Library" && home.as_deref().is_some_and(|h| prefix.parent() == Some(h)) {
+            return true;
+        }
+        if let Some((_, ext)) = n.rsplit_once('.') {
+            if PACKAGE_EXT.iter().any(|p| p.eq_ignore_ascii_case(ext)) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Directories and files that are never indexed.
 pub fn is_ignored(path: &Path) -> bool {
     for c in path.components() {
@@ -71,6 +103,10 @@ pub fn is_ignored(path: &Path) -> bool {
                 return true;
             }
         }
+    }
+    #[cfg(target_os = "macos")]
+    if is_ignored_macos(path) {
+        return true;
     }
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
     let lower = name.to_ascii_lowercase();
@@ -84,7 +120,7 @@ pub fn is_ignored(path: &Path) -> bool {
         || lower == "desktop.ini"
 }
 
-/// Hidden / system attribute (Windows).
+/// Hidden / system attribute (Windows), `UF_HIDDEN` or a not-downloaded iCloud placeholder (macOS).
 pub fn is_hidden_or_system(meta: &std::fs::Metadata) -> bool {
     #[cfg(windows)]
     {
@@ -93,7 +129,15 @@ pub fn is_hidden_or_system(meta: &std::fs::Metadata) -> bool {
         const SYSTEM: u32 = 0x4;
         meta.file_attributes() & (HIDDEN | SYSTEM) != 0
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::macos::fs::MetadataExt;
+        const UF_HIDDEN: u32 = 0x8000;
+        // iCloud "dataless" placeholder: reading it would download the file
+        const SF_DATALESS: u32 = 0x4000_0000;
+        meta.st_flags() & (UF_HIDDEN | SF_DATALESS) != 0
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = meta;
         false
@@ -268,8 +312,17 @@ pub struct PreparedImage {
 }
 
 pub fn prepare_image(bytes: &[u8]) -> Result<PreparedImage, String> {
-    let img = image::load_from_memory(bytes).map_err(|e| e.to_string())?;
-    prepare_decoded(img)
+    match image::load_from_memory(bytes) {
+        Ok(img) => prepare_decoded(img),
+        // HEIC and anything else only ImageIO understands
+        #[cfg(target_os = "macos")]
+        Err(e) => match crate::apple::decode_image(bytes, MAX_IMAGE_SIDE) {
+            Ok(img) => prepare_decoded(img),
+            Err(_) => Err(e.to_string()),
+        },
+        #[cfg(not(target_os = "macos"))]
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 pub fn prepare_decoded(img: image::DynamicImage) -> Result<PreparedImage, String> {
@@ -331,5 +384,16 @@ mod tests {
         assert!(is_ignored(Path::new("C:/p/node_modules/x/y.js")));
         assert!(is_ignored(Path::new("C:/p/~$doc.docx")));
         assert!(!is_ignored(Path::new("C:/p/report.docx")));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ignore_macos_packages_and_system_folders() {
+        assert!(is_ignored(Path::new("/Users/a/Pictures/Photos.photoslibrary/originals/x.jpg")));
+        assert!(is_ignored(Path::new("/Applications/Foo.app/Contents/Info.plist")));
+        assert!(is_ignored(Path::new("/Users/a/.Trash/x.txt")));
+        assert!(is_ignored(Path::new("/Volumes/D/.Spotlight-V100/x")));
+        assert!(!is_ignored(Path::new("/Users/a/Documents/report.docx")));
+        assert!(!is_ignored(Path::new("/Users/a/Documents/Library/x.txt")));
     }
 }

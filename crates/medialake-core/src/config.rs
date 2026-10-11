@@ -20,7 +20,7 @@ pub enum ServerMode {
     Remote,
 }
 
-/// Credentials of a paired remote server. The secret is stored DPAPI-protected (base64).
+/// Credentials of a paired remote server. The secret is stored DPAPI-protected (Windows) or as a `keychain:<id>` reference (macOS).
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
 pub struct RemoteCreds {
     /// `host:port`, resolved at connect time.
@@ -62,7 +62,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Config {
-            hotkey: "Ctrl+Alt+Space".into(),
+            hotkey: if cfg!(target_os = "macos") { "Alt+Space" } else { "Ctrl+Alt+Space" }.into(),
             quality: Quality::Normal,
             server_mode: ServerMode::Local,
             remote: None,
@@ -101,7 +101,7 @@ impl Config {
     }
 }
 
-/// Where everything lives. `root` defaults to `%LOCALAPPDATA%\MediaLake`.
+/// Where everything lives. `root` defaults to `%LOCALAPPDATA%\MediaLake` (macOS: `~/Library/Application Support/MediaLake`).
 #[derive(Clone, Debug)]
 pub struct Paths {
     pub root: PathBuf,
@@ -129,8 +129,7 @@ impl Paths {
         if let Ok(p) = std::env::var("MEDIALAKE_HOME") {
             return PathBuf::from(p);
         }
-        let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
-        base.join("MediaLake")
+        medialake_proto::platform::data_dir()
     }
 
     pub fn ensure(&self) -> std::io::Result<()> {

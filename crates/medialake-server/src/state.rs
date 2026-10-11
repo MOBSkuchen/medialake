@@ -57,8 +57,7 @@ pub fn random_bytes<const N: usize>() -> [u8; N] {
 }
 
 pub fn default_state_dir() -> PathBuf {
-    let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
-    base.join("MediaLake").join("server")
+    medialake_proto::platform::data_dir().join("server")
 }
 
 impl StateDir {

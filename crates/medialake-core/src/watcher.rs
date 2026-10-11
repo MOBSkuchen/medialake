@@ -58,6 +58,11 @@ impl FileWatcher {
                 }
                 EventKind::Modify(ModifyKind::Name(_)) => {
                     for p in paths {
+                        // FSEvents reports a rename as an unpaired name change on each path: the one
+                        // that still exists is the new name, the missing one the old name.
+                        #[cfg(target_os = "macos")]
+                        let _ = tx.send(if p.symlink_metadata().is_ok() { Change::RenamedTo(p) } else { Change::RenamedFrom(p) });
+                        #[cfg(not(target_os = "macos"))]
                         let _ = tx.send(Change::Touched(p));
                     }
                 }
