@@ -9,7 +9,7 @@ Decisions:
 | Topic | Decision |
 |---|---|
 | Rust crates | **Unchanged set and names.** Windows-only code moves behind `cfg(windows)` with a macOS sibling next to it; no new crate, no fork |
-| UI | **Swift, SwiftUI + AppKit**, in `ui/MediaLake.Mac/`, mirroring `ui/MediaLake.App/` file by file. UI only, like the C# host |
+| UI | **Swift, SwiftUI + AppKit**, in `ui/MediaLake.Mac/`, mirroring `../ui/MediaLake.App` file by file. UI only, like the C# host |
 | Core in the UI process | `medialake-ffi` linked into the Swift app as a **static library** (same `sn_*` C ABI, same JSON). One process, as on Windows |
 | Local server | `medialake-server` child process inside the app bundle, same supervisor, same bierpc path |
 | GPU | **Metal** (llama.cpp's Apple backend) replaces Vulkan. **One** server binary; no `-cpu` twin |
@@ -20,7 +20,7 @@ Decisions:
 | Distribution | Outside the App Store, not sandboxed, **ad-hoc signed**. The Gatekeeper warning on first install is accepted; no Developer ID or notarisation |
 | Bundle identifier | `com.sonvogel.medialake` (app, pkg, keychain entry, login item) |
 | Name in the UI | Always **"MediaLake"**: window title, menu bar, dialogs. "SearchNow" appears nowhere |
-| Scripts | `scripts/windows/` and `scripts/macos/`, one variant of each script per platform ✅ done with this plan |
+| Scripts | `../scripts/windows` and `scripts/macos/`, one variant of each script per platform ✅ done with this plan |
 
 ---
 
@@ -116,7 +116,7 @@ where the code is Windows-only today.
 | `video.rs` | Media Foundation | AVFoundation (§3.4) |
 | `watcher.rs` | `notify` → ReadDirectoryChangesW | `notify` → FSEvents, same crate (§3.2) |
 | `medialake-ffi/build.rs` | csbindgen → `NativeMethods.g.cs` | Also run **cbindgen** → `ui/MediaLake.Mac/Sources/CMediaLakeCore/include/medialake_core_ffi.h`. Both files are generated on every build and checked in |
-| `medialake-ffi` crate type | `cdylib` | Unchanged in `Cargo.toml`. The macOS build runs `cargo rustc -p medialake-ffi --release --crate-type staticlib`, so the Windows build output is untouched |
+| `medialake-ffi` crate type | `cdylib` | Unchanged in `../Cargo.toml`. The macOS build runs `cargo rustc -p medialake-ffi --release --crate-type staticlib`, so the Windows build output is untouched |
 
 Unchanged and expected to just build: `medialake-proto`, bierpc, `rusqlite` (bundled), `usearch` (keep the
 `=2.21.4` pin so both platforms run the same version), `symphonia`, `pdf-extract`, `zip`, `image`, `ureq`,
@@ -284,9 +284,9 @@ behind, which the README documents.
 
 Done together with this plan. Each script has one variant per platform:
 
-| Purpose | `scripts/windows/` | `scripts/macos/` |
+| Purpose | `../scripts/windows` | `../scripts/macos` |
 |---|---|---|
-| Fetch the pinned llama.cpp into `vendor/` | `setup-vendor.ps1` | `setup-vendor.sh` |
+| Fetch the pinned llama.cpp into `../vendor` | `setup-vendor.ps1` | `setup-vendor.sh` |
 | Toolchain environment | `dev-env.sh` (Git Bash) | `dev-env.sh` |
 | Build, stage, optionally build the installer | `build-release.ps1 [-Version x] [-Installer]` | `build-release.sh [--version x] [--installer]` |
 | Generate the app icon | `make-icon.ps1` → `.ico` | `make-icon.sh` → `.icns` |
@@ -299,17 +299,17 @@ The Windows scripts only moved; their repo-root lookup went up one level. `build
 
 | File | Change |
 |---|---|
-| `README.md` | ✅ Layout table, script paths, a macOS build section and macOS data locations (marked as planned). Once the port works: remove "planned", add permissions and uninstall notes |
+| `../README.md` | ✅ Layout table, script paths, a macOS build section and macOS data locations (marked as planned). Once the port works: remove "planned", add permissions and uninstall notes |
 | `abstract.md` | ✅ UI section names both hosts; "Open in Explorer" / "Show in Finder" |
-| `vendor/README.md` | ✅ Both setup scripts |
+| `../vendor/README.md` | ✅ Both setup scripts |
 | `plan1.md` | ✅ Script path, pointer to this plan |
-| `installer/medialake.iss` | ✅ Script path in the comments |
-| `docs/calibration.md` | Later: add a Metal row if scores differ from Vulkan/CPU (they should not) |
+| `../installer/medialake.iss` | ✅ Script path in the comments |
+| `calibration.md` | Later: add a Metal row if scores differ from Vulkan/CPU (they should not) |
 
 ## 8. Phases / Milestones
 
 Prerequisite: both repositories on the Mac. `medialake` has no git remote yet, and `bierpc` /
-`bier_derive` are path dependencies on the sibling `../rpc`, including the two fixes from `poc/README.md`.
+`bier_derive` are path dependencies on the sibling `../../rpc`, including the two fixes from `poc/README.md`.
 
 | # | Phase | Done when |
 |---|---|---|

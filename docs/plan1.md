@@ -64,7 +64,7 @@ medialake/
 └─ docs/
 ```
 
-`bierpc` and `bier_derive` are **path dependencies on the local repo** `../rpc` (`C:\Users\jaspe\RustroverProjects\rpc`).
+`bierpc` and `bier_derive` are **path dependencies on the local repo** `../../rpc` (`C:\Users\jaspe\RustroverProjects\rpc`).
 
 ## 3. Components
 
@@ -196,8 +196,8 @@ Based on the current code in `rpc/` (latest commits add rustls TLS and I/O timeo
   - Single calls are raised to a sane limit (e.g. 16 MB) via `ClientConfig`/`ServerConfig`.
   - Video and large audio use `call_persistent`: the session writes length-prefixed chunks directly to the stream, and the server's `PersistentRpcServerHandler` reads them and returns the embeddings.
 - **Timeouts:** connect/handshake/idle/request timeouts come from bierpc's config. The client reconnects when a connection is `poisoned`.
-- **bierpc: `RpcServer::local_addr()`** ✅ added (uncommitted in `../rpc`). It reports the OS-assigned port when binding to port 0, which the supervisor needs for `--port 0`.
-- **bier_derive fix** ✅ (uncommitted in `../rpc`): named fields of enum variants now generate `<#ty>::deserialize`, so generic field types such as `texts: Vec<String>` compile.
+- **bierpc: `RpcServer::local_addr()`** ✅ added (uncommitted in `../../rpc`). It reports the OS-assigned port when binding to port 0, which the supervisor needs for `--port 0`.
+- **bier_derive fix** ✅ (uncommitted in `../../rpc`): named fields of enum variants now generate `<#ty>::deserialize`, so generic field types such as `texts: Vec<String>` compile.
 - **Not needed:** a bulk bytes fast path. A 2 MB `Vec<u8>` takes 22 ms in a single call, and large payloads stream at more than 100 MB/s via persistent calls (spike 0c).
 
 ## 5. Model Management
@@ -257,7 +257,7 @@ Based on the current code in `rpc/` (latest commits add rustls TLS and I/O timeo
 
 ## 10. Implementation status (phases 1-9) and deviations from the plan
 
-All nine phases are implemented; see `README.md` for build/run instructions and `docs/calibration.md` for the score calibration.
+All nine phases are implemented; see `../README.md` for build/run instructions and `docs/calibration.md` for the score calibration.
 
 | Area | What exists |
 |---|---|
@@ -265,8 +265,8 @@ All nine phases are implemented; see `README.md` for build/run instructions and 
 | `medialake-server` | `--local` child mode (token on stdin, `READY <port>`, exits when stdin closes), `serve` (TLS, pinned cert), `pair`, `clients list/revoke`, `bench`; query-priority job queue; warm-up |
 | `medialake-core` | config, SQLite store + usearch HNSW (rebuilt from SQLite when stale), indexer (dedup queue, per-file serialisation, re-embed rules), `notify` watcher with debounce/rename handling, extractors (text CDC chunks, PDF, docx/pptx/xlsx/odt, images, audio via symphonia, video frames via Media Foundation), supervisor (Job Object, restart with backoff, idle stop, CPU fallback exe), model manager (resumable, SHA-256 verified), remote pairing + DPAPI credentials, search ranking |
 | `medialake-ffi` | `sn_init / sn_call(method, json) / sn_set_event_callback / sn_shutdown` (+ csbindgen bindings) |
-| `ui/MediaLake.App` | WinUI 3 search window (hotkey, tray, single instance, thumbnails, snippets), Settings (General / Model / Index) |
-| `installer/medialake.iss` | Per-user Inno Setup: hotkey page, model download with SHA-256, autostart task, uninstall question |
+| `../ui/MediaLake.App` | WinUI 3 search window (hotkey, tray, single instance, thumbnails, snippets), Settings (General / Model / Index) |
+| `../installer/medialake.iss` | Per-user Inno Setup: hotkey page, model download with SHA-256, autostart task, uninstall question |
 
 Deviations and findings:
 
@@ -274,7 +274,7 @@ Deviations and findings:
 * **Persistent calls are not used for embedding payloads.** Everything (images, 60 s audio segments, 8 video frames) fits a single message with `max_message_bytes = 32 MB`; spike 0c showed single calls are fast enough.
 * **Text chunking** is content-defined on line boundaries without overlap, so that an edit only changes nearby chunks. The *min change* rule measures the change at **line granularity** against the last embed (per-chunk line signatures are stored), which makes a byte threshold meaningful.
 * **Video** uses Media Foundation (`IMFSourceReader`, 8 evenly spaced frames, RGB32 -> JPEG), as planned.
-* **GPU:** Vulkan build via `--features vulkan` (needs the Vulkan SDK, the VS developer environment and a short `CARGO_TARGET_DIR`; `scripts/windows/build-release.ps1` does all of it). Measured on an RTX 3060 Ti vs CPU (normal quality): ~1000-token text 50 ms vs 1.7 s, image 60-90 ms vs 1.5-2.6 s, 4-frame video 0.28 s vs 8.3 s. The release ships `medialake-server.exe` (Vulkan) and `medialake-server-cpu.exe`; the supervisor falls back to the CPU build when the first cannot start (no Vulkan runtime).
+* **GPU:** Vulkan build via `--features vulkan` (needs the Vulkan SDK, the VS developer environment and a short `CARGO_TARGET_DIR`; `../scripts/windows/build-release.ps1` does all of it). Measured on an RTX 3060 Ti vs CPU (normal quality): ~1000-token text 50 ms vs 1.7 s, image 60-90 ms vs 1.5-2.6 s, 4-frame video 0.28 s vs 8.3 s. The release ships `medialake-server.exe` (Vulkan) and `medialake-server-cpu.exe`; the supervisor falls back to the CPU build when the first cannot start (no Vulkan runtime).
 * **Server selection** (local vs remote) is switchable at runtime: `Core::pair_remote` / `use_local`; the index is rebuilt when the server's quality differs from the stored one.
 * **Calibration** (24 documents, 12 queries): `score_floor 0.58`, `score_ceiling 0.74`, default threshold `0.4`, plus a `relative_cut` of 0.06 raw cosine below the best hit.
 * **Packaging:** `dotnet publish` omits the compiled XAML for unpackaged WinUI apps, so the release script stages the self-contained *build* output (~300 MB staged, 76 MB installer). Satellite resource folders other than en-US/de-DE are removed.

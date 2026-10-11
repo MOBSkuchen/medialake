@@ -4,7 +4,7 @@ Local, semantic search for your files: text, code, PDF/Office documents, images,
 (experimental) video are embedded **by content** with EmbeddingGemma 2 (llama.cpp) and found with natural-language
 queries from a Spotlight-like window.
 
-Windows is the supported platform. A macOS port is planned in `plan2.md`; the macOS parts below are marked.
+Windows is the supported platform. A macOS port is planned in `docs/plan2.md`; the macOS parts below are marked.
 
 ## Layout
 
@@ -47,7 +47,7 @@ cd ui/MediaLake.App && dotnet build -c Release -p:Platform=x64
 
 ## Build (macOS, planned)
 
-See `plan2.md`. Prerequisites: Rust, Xcode, CMake (`brew install cmake`), and the sibling `../rpc` checkout.
+See `docs/plan2.md`. Prerequisites: Rust, Xcode, CMake (`brew install cmake`), and the sibling `../rpc` checkout.
 None of the macOS scripts has been run on a Mac yet. `setup-vendor.sh` is a direct port of the Windows one;
 `build-release.sh` and `make-icon.sh` are written for the planned layout and need `ui/MediaLake.Mac` and
 `installer/macos` first.
