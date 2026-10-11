@@ -20,7 +20,7 @@ Local file, data, media search based on embeddings.
 - Currently only supports EmbeddingGemma2 as a model
 
 ## UI
-Client UI uses the native toolkit of each platform: WinUI on Windows, SwiftUI/AppKit on macOS (planned, see `plan2.md`).
+Client UI uses the native toolkit of each platform: WinUI on Windows, SwiftUI/AppKit on macOS (see `plan2.md`).
 Both hosts load the same rust client; only the UI differs.
 The app is opened by using a keyboard shortcut (defined during installation).
 

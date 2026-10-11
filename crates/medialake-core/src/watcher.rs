@@ -26,15 +26,30 @@ enum Change {
 pub struct FileWatcher {
     watcher: std::sync::Mutex<RecommendedWatcher>,
     watched: std::sync::Mutex<Vec<IndexedDir>>,
+    /// (canonical root, root as configured), for roots that sit behind a symlink such as `/tmp`, `/var`
+    /// or a symlinked home folder. FSEvents reports resolved paths, the index uses the configured ones.
+    #[cfg(target_os = "macos")]
+    aliases: Arc<std::sync::Mutex<Vec<(PathBuf, PathBuf)>>>,
 }
 
 impl FileWatcher {
     pub fn start(indexer: Arc<Indexer>, cfg: Arc<RwLock<Config>>) -> notify::Result<Arc<FileWatcher>> {
         let (tx, mut rx) = mpsc::unbounded_channel::<Change>();
+        #[cfg(target_os = "macos")]
+        let aliases: Arc<std::sync::Mutex<Vec<(PathBuf, PathBuf)>>> = Default::default();
+        #[cfg(target_os = "macos")]
+        let event_aliases = aliases.clone();
         let watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
             let Ok(ev) = res else { return };
             tracing::debug!("fs event {:?} {:?}", ev.kind, ev.paths);
-            let mut paths = ev.paths.into_iter();
+            #[cfg(target_os = "macos")]
+            let ev_paths: Vec<PathBuf> = {
+                let a = event_aliases.lock().unwrap();
+                ev.paths.into_iter().map(|p| unalias(&a, p)).collect()
+            };
+            #[cfg(not(target_os = "macos"))]
+            let ev_paths = ev.paths;
+            let mut paths = ev_paths.into_iter();
             match ev.kind {
                 EventKind::Create(_) | EventKind::Modify(ModifyKind::Data(_)) | EventKind::Modify(ModifyKind::Any) | EventKind::Modify(ModifyKind::Metadata(_)) => {
                     for p in paths {
@@ -74,7 +89,12 @@ impl FileWatcher {
                 _ => {}
             }
         })?;
-        let fw = Arc::new(FileWatcher { watcher: std::sync::Mutex::new(watcher), watched: std::sync::Mutex::new(vec![]) });
+        let fw = Arc::new(FileWatcher {
+            watcher: std::sync::Mutex::new(watcher),
+            watched: std::sync::Mutex::new(vec![]),
+            #[cfg(target_os = "macos")]
+            aliases,
+        });
 
         // debouncer: path -> due time; ticks every 250 ms
         tokio::spawn(async move {
@@ -146,6 +166,18 @@ impl FileWatcher {
             let _ = w.unwatch(&d.path);
         }
         cur.clear();
+        #[cfg(target_os = "macos")]
+        {
+            let mut a = self.aliases.lock().unwrap();
+            a.clear();
+            for d in dirs {
+                if let Ok(canon) = d.path.canonicalize() {
+                    if canon != d.path {
+                        a.push((canon, d.path.clone()));
+                    }
+                }
+            }
+        }
         for d in dirs {
             let mode = if d.recursive { RecursiveMode::Recursive } else { RecursiveMode::NonRecursive };
             match w.watch(Path::new(&d.path), mode) {
@@ -154,4 +186,15 @@ impl FileWatcher {
             }
         }
     }
+}
+
+/// Rewrites a path below a resolved root back to the root as configured.
+#[cfg(target_os = "macos")]
+fn unalias(aliases: &[(PathBuf, PathBuf)], p: PathBuf) -> PathBuf {
+    for (canon, root) in aliases {
+        if let Ok(rest) = p.strip_prefix(canon) {
+            return root.join(rest);
+        }
+    }
+    p
 }

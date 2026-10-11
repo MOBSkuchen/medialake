@@ -1,0 +1,10 @@
+#!/bin/sh
+# Quit a running MediaLake (and its server) before the files are replaced.
+osascript -e 'tell application id "com.sonvogel.medialake" to quit' >/dev/null 2>&1
+for i in 1 2 3 4 5 6 7 8 9 10; do
+    pgrep -x MediaLake >/dev/null 2>&1 || break
+    sleep 0.5
+done
+pkill -x MediaLake >/dev/null 2>&1
+pkill -x medialake-server >/dev/null 2>&1
+exit 0

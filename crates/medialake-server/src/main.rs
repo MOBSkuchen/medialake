@@ -41,7 +41,7 @@ pub(crate) struct Common {
     model_dir: PathBuf,
     #[arg(long, default_value = "normal")]
     quality: String,
-    /// Layers to offload (0 = CPU). Default: all when built with Vulkan, else 0.
+    /// Layers to offload (0 = CPU). Default: all on macOS (Metal) or when built with Vulkan, else 0.
     #[arg(long)]
     gpu_layers: Option<i32>,
     /// Write a rolling log file into this directory (stderr is always used).

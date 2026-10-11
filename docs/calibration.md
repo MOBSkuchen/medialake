@@ -1,7 +1,7 @@
 # Score calibration
 
 Raw cosine similarities of EmbeddingGemma 2 are compressed. Measured on a 24-document text corpus
-(12 queries with a known best document, 2 queries without a match; `normal` quality, CPU):
+(12 queries with a known best document, 2 queries without a match; `normal` quality, CPU; on macOS, Metal and CPU agree to the third decimal on the bench media, see `plan2.md` §10):
 
 | | raw cosine |
 |---|---|

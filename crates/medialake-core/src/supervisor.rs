@@ -329,13 +329,15 @@ enum Exit {
     Crashed(String),
 }
 
-/// Windows Job Object: the child is killed when the client process goes away.
+/// Windows Job Object: the child is killed when the client process goes away. Elsewhere nothing is
+/// needed: the server exits when its stdin closes (the pipe closes with the client) and the child is
+/// `kill_on_drop`.
 mod job {
-    use std::sync::OnceLock;
     use tokio::process::Child;
 
     #[cfg(windows)]
     pub fn assign(child: &Child) {
+        use std::sync::OnceLock;
         use windows_sys::Win32::System::JobObjects::*;
 
         static JOB: OnceLock<isize> = OnceLock::new();

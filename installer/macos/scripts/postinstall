@@ -1,0 +1,14 @@
+#!/bin/sh
+# "Start MediaLake now": open the app for the logged-in user. Hotkey and autostart are asked in the app
+# on first run, because a pkg cannot show input pages.
+app="$2/MediaLake.app"
+[ -d "$app" ] || app="/Applications/MediaLake.app"
+user="$(/usr/bin/stat -f%Su /dev/console 2>/dev/null)"
+if [ -n "$user" ] && [ "$user" != "root" ]; then
+    if [ "$(id -u)" = "0" ]; then
+        /usr/bin/sudo -u "$user" /usr/bin/open "$app" >/dev/null 2>&1
+    else
+        /usr/bin/open "$app" >/dev/null 2>&1
+    fi
+fi
+exit 0

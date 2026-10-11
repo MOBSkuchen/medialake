@@ -345,3 +345,38 @@ Prerequisite: both repositories on the Mac. `medialake` has no git remote yet, a
 7. **Case-sensitive volumes.** See §3.2.
 8. **Not in scope:** App Store distribution, auto-update, iCloud "dataless" files (indexing would download
     them; skip files that are not local), Spotlight importer or Quick Look integration.
+
+## 10. Implementation status (macOS port)
+
+Implemented and tested on an Apple Silicon Mac (macOS 26, Xcode 26 toolchain, Swift 6.3 in Swift 5 language mode).
+
+| Phase | Status |
+|---|---|
+| M0a Metal | ✅ `medialake-server bench` on b11535: text, image and audio vectors are valid; Metal and `--gpu-layers 0` agree (cos(cat,car) 0.824 / 0.823, cos(dog,rain) 0.794 / 0.792). `normal`: load 1.9 s, text 8 ms, ~1000-token text 256 ms, image 259 ms, 4 frames 1.0 s, audio 67 ms (CPU is 3-4x slower) |
+| M0b/c Swift ↔ Rust, panel, hotkey | ✅ static library linked, events arrive from the Rust thread; non-activating `NSPanel` takes keyboard input; Carbon hotkey registers without any permission |
+| M1 Rust | ✅ `cargo test --workspace --lib`, the ignored e2e tests and `medialake-cli add/search` pass on macOS. The Windows build was **not** compiled on this machine (it needs MSVC); the Windows code paths changed only through the shared helpers below |
+| M2 services | ✅ rename / move between roots / move out / directory rename tests (`e2e.rs::renames_and_moves`); Keychain round trip (unit test); the server dies when the app is force-quit (`kill -9`); ignore list and package handling (unit test + corpus run) |
+| M3-M5 | ✅ app shell, search panel, settings (3 pages), first-run panel, status item, single instance (`open` twice keeps one process), HEIC via ImageIO and video via AVFoundation (both indexed in the CLI run on generated media) |
+| M6 | ✅ `build-release.sh --installer` produces `dist/MediaLake-0.1.0.pkg`; installed for the current user, upgraded over the running app (preinstall quits it, postinstall starts the new one), uninstalled with `MEDIALAKE_TEST_UNINSTALL=delete`. Not done: install on a clean second Mac and the Gatekeeper dialog |
+| M7 | ✅ README; `--selftest` / `--screenshot` work (`MEDIALAKE_TEST_SETTINGS=<page>\|<png>` for the settings window) |
+
+Deviations from the plan, and things the plan did not know:
+
+- **Path separator.** `store.rs` / `indexer.rs` hard-coded `\` for directory prefixes (delete/rename of a
+  directory). They use `MAIN_SEPARATOR` now and escape the backslash in LIKE patterns, which also repairs directory
+  operations on Windows paths.
+- **Symlinked roots.** FSEvents reports resolved paths (`/tmp` → `/private/tmp`, `/var` → `/private/var`). The
+  watcher rewrites them back to the configured root, otherwise every event looked like a new file.
+- **`cargo` workspace** now has `exclude = ["vendor"]`: the vendored llama-cpp-rs is a workspace of its own and its
+  `bindgen = { workspace = true }` could not resolve when cargo treated it as a member of this one.
+- **bierpc** is `../bierpc` (not `../rpc`).
+- **Added FFI method** `forget_remote` (deletes the Keychain item and the pairing); used by the uninstall. The `sn_*`
+  C functions are unchanged; `sn_set_event_callback` now spells the callback type inline so that cbindgen emits a
+  usable C header (identical ABI).
+- **Login item** is started without arguments by `SMAppService`; the app recognises it by the launch event
+  instead of `--background`.
+- **dataless iCloud files** are skipped like hidden files (`SF_DATALESS`).
+- **pkg payload and `com.apple.provenance`**: when built from a sandboxed tool the payload also lists `._*`
+  AppleDouble entries for the provenance attribute; they are harmless and absent when built from a normal terminal.
+- Not covered by a test: remote pairing against a Windows server (M4), the first-run model download button in the
+  UI (the download manager itself is shared with Windows), real Gatekeeper behaviour, the case-sensitive volume case.

@@ -133,7 +133,7 @@ pub unsafe extern "C" fn sn_shutdown(h: *mut Handle) {
 /// # Safety
 /// `h` must be a live handle.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn sn_set_event_callback(h: *mut Handle, cb: Option<EventCallback>) {
+pub unsafe extern "C" fn sn_set_event_callback(h: *mut Handle, cb: Option<extern "C" fn(*const c_char)>) {
     if let Some(h) = unsafe { h.as_ref() } {
         *h.cb.lock().unwrap() = cb;
     }

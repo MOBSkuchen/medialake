@@ -2,9 +2,6 @@
 # Builds everything and stages dist/app/MediaLake.app for the installer:
 #   scripts/macos/build-release.sh [--version 0.1.0] [--installer]
 #
-# NOT YET RUNNABLE: written against the layout in plan2.md. It needs ui/MediaLake.Mac and installer/macos,
-# which do not exist yet, and it has never been run on a Mac.
-#
 # Signing (all optional; without them the app is ad-hoc signed and Gatekeeper warns on other machines):
 #   MEDIALAKE_SIGN_ID            "Developer ID Application: ..."  signs the app and the nested server
 #   MEDIALAKE_INSTALLER_SIGN_ID  "Developer ID Installer: ..."    signs the .pkg
@@ -42,6 +39,9 @@ cp target/release/medialake-server "$app/Contents/MacOS/medialake-server"
 cp "$ui/Resources/Info.plist" "$app/Contents/Info.plist"
 cp "$ui/Resources/AppIcon.icns" "$app/Contents/Resources/AppIcon.icns"
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $version" -c "Set :CFBundleVersion $version" "$app/Contents/Info.plist"
+
+# Extended attributes (provenance, quarantine) become ._ files in the pkg and break strict signatures.
+xattr -cr "$app"
 
 # Nested code first, then the bundle. The hardened runtime is required for notarisation.
 sign_id="${MEDIALAKE_SIGN_ID:--}"
