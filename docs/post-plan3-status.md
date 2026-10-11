@@ -16,7 +16,7 @@ mount decision and measurements: `a0-macos-mount.md`.
 | X2 backend | Done: bandwidth limits, Verify, error states, docs | see below |
 | A0 spike: macOS mount | Done: built-in NFSv3 loopback chosen; macFUSE / FUSE-T not installed here, so not measured | `a0-macos-mount.md`, `crates/medialake-mount/spike/` |
 | A1 mount frontend | Done: browse offline, load on open (block-wise), upload on save, evict under the limit, pin, crash cleanup, fallback to a mirror. Finder / Office checks by hand are not done (see below) | `crates/medialake-mount/`, `medialake-core/src/sync.rs` |
-| A2 macOS UI + installer | Done: Sync page, status item, notifications, first-run choice, uninstall. Verified by building and by driving the real app binary; not clicked through by a person. A pkg was built, not notarised | `ui/MediaLake.Mac/Sources/MediaLake/Sync*.swift`, `installer/macos/` |
+| A2 macOS UI + installer | Done: Sync page, status item, notifications, two-page welcome window (search with optional shortcut, then sync), uninstall. Verified by building and by driving the real app binary; not clicked through by a person. A pkg was built, not notarised | `ui/MediaLake.Mac/Sources/MediaLake/Sync*.swift`, `installer/macos/` |
 | X1 search integration (macOS) | Done in code: indexing never downloads, name-only entries are upgraded once fetched. Needs a model to exercise end to end, which was not run | `indexer.rs` (`ContentGate`), `watcher.rs`, `sync.rs` (`would_download`) |
 
 ## Try it
@@ -107,6 +107,10 @@ runs inside the app when `[[sync.hosted]]` has entries.
   frontend needs (`lazy`, `meta_path`, `place_placeholder`, `content_hash`, `note_content`, ranged
   `Transport::read_range`), so it is a frontend plus UI. The mirror uses plain `std::fs`; `\\?\` long paths
   are not added, and nothing was run on Windows. Linux should work as is for the mirror.
+  The welcome window, the search hint, the optional shortcut and the installer without a shortcut page were
+  also written for the WinUI app (`WelcomeWindow.xaml`, `MainWindow`, `App.xaml.cs`, `medialake.iss`) **without
+  a .NET SDK at hand: that code has not been compiled or run.** Its sync page is a minimal join form; the
+  Windows Sync settings page (W2) does not exist yet.
 - **By-hand checks on a Mac** (A1's acceptance list): Finder copy in and out, Quick Look and column-view
   previews (does browsing read more than the first block?), TextEdit / Pages / Preview / an Office app saving
   on the volume, Spotlight staying out, macOS 14 and 15, Intel. The Cocoa save patterns that can be scripted

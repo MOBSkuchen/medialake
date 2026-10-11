@@ -72,22 +72,6 @@ final class ResultItem: ObservableObject, Identifiable {
 
 // MARK: - View model
 
-struct QualityOption: Identifiable, Hashable {
-    let name: String
-    let size: Int64
-    var id: String { name }
-
-    var label: String {
-        let l: String
-        switch name {
-        case "heavy": l = "Heavy: most precise"
-        case "light": l = "Light: smallest and fastest"
-        default: l = "Normal: recommended"
-        }
-        return "\(l)  ·  \(formatSize(size))"
-    }
-}
-
 func formatSize(_ bytes: Int64) -> String {
     bytes >= 1 << 30 ? String(format: "%.1f GB", Double(bytes) / 1_073_741_824.0) : String(format: "%.0f MB", Double(bytes) / 1_048_576.0)
 }
@@ -110,30 +94,20 @@ final class SearchModel: ObservableObject {
     @Published var resultsVisible = false
     @Published var focusTick = 0
 
-    @Published var setupVisible = false
-    @Published var qualities: [QualityOption] = []
-    @Published var setupQuality = "normal"
-    @Published var setupInfo = ""
-    @Published var setupProgress: Double?
-    @Published var downloading = false
-    @Published var hotkeyText = "Alt+Space"
-    @Published var hotkeyError = ""
-    @Published var autostart = false
-    @Published var autostartError = ""
-    /// The model finished downloading while the setup window was open.
-    @Published var setupDone = false
+    /// `ready`, `no_model` or `off` (from the core's status): anything but `ready` shows the hint in the
+    /// bottom-left corner instead of searching.
+    @Published var searchState = "ready"
+    /// Progress (0...1) of a running model download.
+    @Published var downloadFraction: Double?
 
     @Published var progressText = ""
     @Published var serverText = ""
     @Published var indexFraction: Double?
 
-    var currentQuality = "normal"
     var onHide: (() -> Void)?
     var onOpenSettings: (() -> Void)?
-    /// First run: the search model is missing, so the setup window replaces the search panel.
-    var onNeedSetup: (() -> Void)?
-    var onCloseSetup: (() -> Void)?
-    var applyHotkey: ((String) -> String?)?
+    /// The hint's button: the welcome window, on the search page.
+    var onOpenWelcome: (() -> Void)?
 
     private var searchId = 0
     private var debounce: Task<Void, Never>?
@@ -150,7 +124,12 @@ final class SearchModel: ObservableObject {
         searchId += 1
         let id = searchId
         let q = query.trimmingCharacters(in: .whitespaces)
-        if setupVisible { return }
+        if searchState != "ready" {
+            items = []
+            showEmpty("")
+            loading = false
+            return
+        }
         if q.isEmpty {
             items = []
             showEmpty("")
@@ -190,7 +169,7 @@ final class SearchModel: ObservableObject {
 
     private func showEmpty(_ text: String?) {
         emptyText = text ?? ""
-        resultsVisible = text == nil && !setupVisible
+        resultsVisible = text == nil
     }
 
     func moveSelection(_ delta: Int) {
@@ -210,71 +189,17 @@ final class SearchModel: ObservableObject {
         onHide?()
     }
 
-    // MARK: first run
+    // MARK: is search set up?
 
-    func checkSetup() async {
-        guard let core, !downloading else { return }
-        do {
-            let cfg = try await core.callAsync("get_settings")
-            let models = try await core.callAsync("models")
-            let mode = cfg["server_mode"] as? String
-            currentQuality = cfg["quality"] as? String ?? "normal"
-            hotkeyText = cfg["hotkey"] as? String ?? hotkeyText
-            let list = (models["qualities"] as? [[String: Any]]) ?? []
-            qualities = list.map { QualityOption(name: $0["quality"] as? String ?? "", size: ($0["size"] as? NSNumber)?.int64Value ?? 0) }
-            if !qualities.contains(where: { $0.name == setupQuality }) || !setupVisible { setupQuality = currentQuality }
-            let current = list.first { ($0["quality"] as? String) == currentQuality }
-            let missing = mode == "local" && current != nil && (current?["downloaded"] as? Bool) == false
-            setSetup(missing)
-            autostart = LoginItem.isEnabled
-        } catch {
-            // the status line shows core errors
-        }
-    }
-
-    private func setSetup(_ visible: Bool) {
-        setupVisible = visible
-        if visible {
+    /// Asks the core. Called when the window opens and whenever the setup may have changed.
+    func refreshSearchState() async {
+        guard let core, let st = try? await core.callAsync("status") else { return }
+        searchState = st["search"] as? String ?? "ready"
+        if st["downloading"] as? Bool != true { downloadFraction = nil }
+        if searchState != "ready" {
+            items = []
             resultsVisible = false
             emptyText = ""
-        }
-    }
-
-    func download() async {
-        guard let core else { return }
-        let quality = setupQuality
-        downloading = true
-        setupProgress = 0
-        setupInfo = "Starting download…"
-        do {
-            if quality != currentQuality {
-                var cfg = try await core.callAsync("get_settings")
-                cfg["quality"] = quality
-                _ = try await core.callAsync("set_settings", cfg)
-                currentQuality = quality
-            }
-            _ = try await core.callAsync("download_model", ["quality": quality])
-            setupInfo = ""
-        } catch {
-            setupInfo = error.localizedDescription
-        }
-        downloading = false
-        setupProgress = nil
-        await checkSetup()
-        if !setupVisible && setupInfo.isEmpty {
-            serverText = "Model ready. Add folders to index in Settings."
-            setupDone = true
-            focusTick += 1
-        }
-    }
-
-    func setAutostart(_ on: Bool) {
-        if let err = LoginItem.set(on) {
-            autostartError = err
-            autostart = LoginItem.isEnabled
-        } else {
-            autostartError = ""
-            autostart = on
         }
     }
 
@@ -302,16 +227,15 @@ final class SearchModel: ObservableObject {
             let detail = ev["detail"] as? String ?? ""
             switch ev["state"] as? String {
             case "starting": serverText = "Model starting…"
-            case "failed": serverText = setupVisible ? "" : (detail.isEmpty ? "Embedding server failed" : detail)
+            case "failed": serverText = searchState != "ready" ? "" : (detail.isEmpty ? "Embedding server failed" : detail)
             default: serverText = ""
             }
         case "download":
             let d = (ev["done"] as? NSNumber)?.doubleValue ?? 0
             let t = (ev["total"] as? NSNumber)?.doubleValue ?? 0
-            setupProgress = t > 0 ? d / t : 0
-            setupInfo = "\(formatSize(Int64(d))) of \(formatSize(Int64(t)))  ·  \(String(format: "%.0f", t > 0 ? d / t * 100 : 0))%"
+            downloadFraction = t > 0 ? d / t : 0
         case "error":
-            if !setupVisible { serverText = ev["message"] as? String ?? "" }
+            if searchState == "ready" { serverText = ev["message"] as? String ?? "" }
         default:
             break
         }
@@ -401,10 +325,6 @@ final class MainWindowController: NSObject {
 
     /// Shown centred on the screen under the mouse pointer.
     func show() {
-        if model.setupVisible {
-            model.onNeedSetup?()
-            return
-        }
         let mouse = NSEvent.mouseLocation
         let screen = NSScreen.screens.first { NSMouseInRect(mouse, $0.frame, false) } ?? NSScreen.main ?? NSScreen.screens[0]
         let wa = screen.visibleFrame
@@ -414,14 +334,7 @@ final class MainWindowController: NSObject {
         panel.makeKeyAndOrderFront(nil)
         everShown = true
         model.focusTick += 1
-        Task {
-            await model.checkSetup()
-            // the model turned out to be missing: the setup window takes over
-            if model.setupVisible, panel.isVisible {
-                hide()
-                model.onNeedSetup?()
-            }
-        }
+        Task { await model.refreshSearchState() }
     }
 
     func hide() { panel.orderOut(nil) }
@@ -493,8 +406,24 @@ struct SearchView: View {
             .frame(maxHeight: .infinity)
 
             VStack(alignment: .leading, spacing: 4) {
-                if let f = model.indexFraction { ProgressView(value: f).progressViewStyle(.linear).frame(height: 4) }
-                Text(model.statusText).font(.system(size: 12)).opacity(0.65).lineLimit(1).truncationMode(.tail)
+                if let f = model.downloadFraction, model.searchState != "ready" {
+                    ProgressView(value: f).progressViewStyle(.linear).frame(height: 4)
+                } else if let f = model.indexFraction {
+                    ProgressView(value: f).progressViewStyle(.linear).frame(height: 4)
+                }
+                HStack(spacing: 6) {
+                    if model.searchState == "ready" {
+                        Text(model.statusText).font(.system(size: 12)).opacity(0.65).lineLimit(1).truncationMode(.tail)
+                    } else if let f = model.downloadFraction {
+                        Text("Downloading the search model… \(Int(f * 100)) %").font(.system(size: 12)).opacity(0.65)
+                    } else {
+                        Text(model.searchState == "off" ? "Search is turned off." : "Search is not set up yet.")
+                            .font(.system(size: 12)).opacity(0.65)
+                        Button("Set up search…") { model.onOpenWelcome?() }
+                            .buttonStyle(.link).font(.system(size: 12))
+                    }
+                    Spacer(minLength: 0)
+                }
             }
         }
         .padding(.horizontal, 24)
@@ -564,110 +493,5 @@ struct ResultRow: View {
         .padding(.horizontal, 6).padding(.vertical, 6)
         .background(RoundedRectangle(cornerRadius: 8).fill(selected ? Color.accentColor.opacity(0.22) : Color.clear))
         .contentShape(Rectangle())
-    }
-}
-
-// MARK: - First-run setup window
-
-/// A normal window (so it can always be closed with the button, ⌘W or Esc). Closing it does not stop a
-/// running download: the download lives in the core and the model, not in the window.
-final class SetupWindow: NSWindow {
-    override func cancelOperation(_ sender: Any?) { performClose(nil) }
-}
-
-@MainActor
-final class SetupWindowController: NSObject {
-    let window: SetupWindow
-    var rootView: NSView { window.contentView! }
-
-    init(model: SearchModel) {
-        window = SetupWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 540, height: 10),
-            styleMask: [.titled, .closable], backing: .buffered, defer: false)
-        super.init()
-        window.title = "MediaLake"
-        window.isReleasedWhenClosed = false
-        let host = NSHostingView(rootView: SetupView(model: model))
-        window.contentView = host
-        window.setContentSize(host.fittingSize)
-        window.center()
-    }
-
-    func show() {
-        NSApp.activate(ignoringOtherApps: true)
-        window.makeKeyAndOrderFront(nil)
-    }
-
-    func close() { window.close() }
-}
-
-struct SetupView: View {
-    @ObservedObject var model: SearchModel
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            Text("Welcome to MediaLake").font(.system(size: 26, weight: .bold))
-            if model.setupDone {
-                ready
-            } else {
-                download
-            }
-        }
-        .padding(28)
-        .frame(width: 540, alignment: .leading)
-    }
-
-    private var download: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            Text("MediaLake understands your files with an AI model that runs on this computer. It is downloaded once and stays here. Pick a quality (you can change it later in Settings):")
-                .opacity(0.8).fixedSize(horizontal: false, vertical: true)
-            Picker("", selection: $model.setupQuality) {
-                ForEach(model.qualities) { q in Text(q.label).tag(q.name) }
-            }
-            .labelsHidden()
-            .frame(maxWidth: 460, alignment: .leading)
-            .disabled(model.downloading)
-
-            VStack(alignment: .leading, spacing: 6) {
-                Text("Global shortcut").fontWeight(.semibold)
-                HotkeyRecorder(text: $model.hotkeyText, error: $model.hotkeyError) { model.applyHotkey?($0) }
-            }
-            VStack(alignment: .leading, spacing: 4) {
-                Toggle("Start MediaLake when I sign in", isOn: Binding(get: { model.autostart }, set: { model.setAutostart($0) }))
-                if !model.autostartError.isEmpty { Text(model.autostartError).foregroundColor(.red).font(.system(size: 12)) }
-            }
-
-            if let p = model.setupProgress { ProgressView(value: p).progressViewStyle(.linear) }
-            if !model.setupInfo.isEmpty { Text(model.setupInfo).opacity(0.75).fixedSize(horizontal: false, vertical: true) }
-            if model.downloading {
-                Text("You can close this window: the download continues in the background.").opacity(0.6).font(.system(size: 12))
-            }
-
-            HStack {
-                Spacer()
-                Button(model.downloading ? "Hide" : "Close") { model.onCloseSetup?() }.keyboardShortcut(.cancelAction)
-                Button("Download") { Task { await model.download() } }
-                    .buttonStyle(.borderedProminent)
-                    .keyboardShortcut(.defaultAction)
-                    .disabled(model.downloading || model.qualities.isEmpty)
-            }
-        }
-    }
-
-    private var ready: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            Text("The model is ready. Press \(HotkeySpec.display(of: model.hotkeyText)) anywhere to search. Add the folders you want to search in Settings.")
-                .opacity(0.8).fixedSize(horizontal: false, vertical: true)
-            HStack {
-                Spacer()
-                Button("Close") { model.onCloseSetup?() }.keyboardShortcut(.cancelAction)
-                Button("Add folders…") {
-                    model.onCloseSetup?()
-                    model.onOpenSettings?()
-                }
-                .buttonStyle(.borderedProminent)
-                .keyboardShortcut(.defaultAction)
-            }
-        }
     }
 }

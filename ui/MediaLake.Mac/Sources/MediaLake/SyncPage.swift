@@ -189,15 +189,37 @@ struct SyncPage: View {
                 Text("Name shown to others").frame(width: 190, alignment: .leading)
                 TextField("", text: $model.deviceName).textFieldStyle(.roundedBorder).frame(width: 220)
             }
-            HStack {
-                Text("Upload limit (kbit/s, 0 = none)").frame(width: 190, alignment: .leading)
-                TextField("", value: $model.uploadLimit, format: .number).textFieldStyle(.roundedBorder).frame(width: 90)
-            }
-            HStack {
-                Text("Download limit (kbit/s, 0 = none)").frame(width: 190, alignment: .leading)
-                TextField("", value: $model.downloadLimit, format: .number).textFieldStyle(.roundedBorder).frame(width: 90)
-            }
+            LimitRow(title: "Limit upload speed", kbps: $model.uploadLimit)
+            LimitRow(title: "Limit download speed", kbps: $model.downloadLimit)
             Button("Save") { Task { await model.saveSyncSettings() } }
+        }
+    }
+}
+
+/// A speed limit with an on/off switch: off means unlimited (stored as 0), on shows the number.
+private struct LimitRow: View {
+    let title: String
+    @Binding var kbps: Int
+    /// What the switch brings back when it is turned on again.
+    @State private var remembered = 8000
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Toggle(title, isOn: Binding(
+                get: { kbps > 0 },
+                set: { on in
+                    if on {
+                        kbps = max(remembered, 1)
+                    } else {
+                        if kbps > 0 { remembered = kbps }
+                        kbps = 0
+                    }
+                }))
+                .frame(width: 190, alignment: .leading)
+            if kbps > 0 {
+                TextField("", value: $kbps, format: .number.grouping(.never)).textFieldStyle(.roundedBorder).frame(width: 90)
+                Text("kbit/s").font(.system(size: 12)).opacity(0.7)
+            }
         }
     }
 }
@@ -278,7 +300,7 @@ private struct FolderCard: View {
 
 // MARK: - Join
 
-private struct JoinSheet: View {
+struct JoinSheet: View {
     @ObservedObject var model: SyncModel
     let close: () -> Void
 
@@ -409,7 +431,7 @@ private struct JoinSheet: View {
 
 // MARK: - Share, invite
 
-private struct ShareSheet: View {
+struct ShareSheet: View {
     @ObservedObject var model: SyncModel
     let close: () -> Void
     @State private var root = ""

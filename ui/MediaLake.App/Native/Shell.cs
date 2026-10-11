@@ -70,6 +70,12 @@ internal static class Hotkey
     /// <summary>Registers the hotkey; the previous one is released first. Returns an error text or null.</summary>
     public static string? Register(string text)
     {
+        // no shortcut is a valid choice: release the old one
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            Win32.UnregisterHotKey(_hwnd, Id);
+            return null;
+        }
         if (!TryParse(text, out var mods, out var vk)) return "Use at least one modifier and one key, e.g. Ctrl+Alt+Space.";
         Win32.UnregisterHotKey(_hwnd, Id);
         if (!Win32.RegisterHotKey(_hwnd, Id, mods | Win32.MOD_NOREPEAT, vk))

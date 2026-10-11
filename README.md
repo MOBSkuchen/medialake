@@ -95,8 +95,10 @@ Uninstall with Settings > General > Uninstall (moves the app to the Trash, remov
 item, optionally deletes the data folder). Dragging the app to the Trash by hand also works but leaves
 `~/Library/Application Support/MediaLake` and the login item entry behind.
 
-Test hooks of the app (same as on Windows, plus `MEDIALAKE_TEST_SETUP=<png>`): `--selftest`, `--screenshot <png>`, `--background`,
-`MEDIALAKE_TEST_QUERY` / `_WAIT` / `_NOWAIT` / `_SETTINGS=<page>|<png>`; the log goes to `logs/selftest.log`.
+Test hooks of the app (the same on Windows): `--selftest`, `--screenshot <png>`, `--background`,
+`MEDIALAKE_TEST_QUERY` / `_WAIT` / `_NOWAIT` / `_SETTINGS=<page>|<png>` / `_WELCOME=<folder>` (renders the welcome
+window's pages); on macOS also `_WELCOME_ACTION=skip|continue` (presses that button and logs the resulting settings)
+and `_SYNC_DEMO=<mount point>`. The log goes to `logs/selftest.log`.
 
 ## Remote server
 

@@ -16,6 +16,7 @@ public partial class App : Application
     private Mutex? _mutex;
     private MainWindow? _main;
     private SettingsWindow? _settings;
+    private WelcomeWindow? _welcome;
     private TrayIcon? _tray;
 
     public App()
@@ -76,6 +77,7 @@ public partial class App : Application
             {
                 _main?.OnCoreEvent(ev);
                 _settings?.OnCoreEvent(ev);
+                _welcome?.OnCoreEvent(ev);
             });
         }
 
@@ -86,16 +88,20 @@ public partial class App : Application
 
         Hotkey.Attach(_main.Hwnd);
         Hotkey.Pressed += () => dq.TryEnqueue(Toggle);
-        var hotkey = "Ctrl+Alt+Space";
+        // no shortcut is a valid choice (and what a fresh install has until the welcome window sets one)
+        var hotkey = "";
         try
         {
-            if (Core != null) hotkey = Core.Call("get_settings").GetProperty("hotkey").GetString() ?? hotkey;
+            if (Core != null) hotkey = Core.Call("get_settings").GetProperty("hotkey").GetString() ?? "";
         }
         catch { }
-        var err = Hotkey.Register(hotkey);
-        if (err != null) LogLine($"hotkey {hotkey}: {err}");
+        if (hotkey.Length > 0)
+        {
+            var err = Hotkey.Register(hotkey);
+            if (err != null) LogLine($"hotkey {hotkey}: {err}");
+        }
 
-        _tray = new TrayIcon(_main.Hwnd, "MediaLake  (" + hotkey + ")");
+        _tray = new TrayIcon(_main.Hwnd, hotkey.Length > 0 ? "MediaLake  (" + hotkey + ")" : "MediaLake");
         _tray.Open += () => dq.TryEnqueue(Toggle);
         _tray.Settings += () => dq.TryEnqueue(ShowSettings);
         _tray.Quit += () => dq.TryEnqueue(Quit);
@@ -113,7 +119,58 @@ public partial class App : Application
         if (StartupError != null) _main.OnCoreEvent(JsonDocument.Parse($"{{\"type\":\"error\",\"message\":{JsonSerializer.Serialize(StartupError)}}}").RootElement);
 
         if (testMode) _ = RunTestAsync(selfTest, shot);
-        else if (!argv.Contains("--background") && Core != null && IsFirstRun()) _main.ShowSearch();
+        else if (Core != null) _ = StartupAsync(argv.Contains("--background"));
+    }
+
+    /// <summary>
+    /// A fresh install (no config yet) gets the welcome window, unless it was started in the background:
+    /// that leaves it for the next time the app is opened. An app that has been set up opens nothing,
+    /// except the search window when there is nothing to see yet.
+    /// </summary>
+    private async Task StartupAsync(bool background)
+    {
+        var welcomeDone = true;
+        var ready = true;
+        try
+        {
+            var cfg = await Core!.CallAsync("get_settings");
+            welcomeDone = !cfg.TryGetProperty("welcome_done", out var w) || w.GetBoolean();
+            var st = await Core.CallAsync("status");
+            ready = !st.TryGetProperty("search", out var s) || s.GetString() == "ready";
+        }
+        catch { }
+        await (_main?.RefreshSearchStateAsync() ?? Task.CompletedTask);
+        if (!welcomeDone)
+        {
+            if (!background) ShowWelcome(0);
+            return;
+        }
+        if (background) return;
+        if (!ready || IsFirstRun()) _main?.ShowSearch();
+    }
+
+    /// <summary>The welcome window (shortcut and model, then sync); <paramref name="page"/> is 0 or 1.</summary>
+    public void ShowWelcome(int page = 0)
+    {
+        if (_welcome == null)
+        {
+            _welcome = new WelcomeWindow();
+            _welcome.Closed += (_, _) =>
+            {
+                _welcome = null;
+                SearchChanged();
+            };
+        }
+        _main?.Hide();
+        _welcome.Open(page);
+    }
+
+    /// <summary>Search was set up or switched off: the search window re-reads its state.</summary>
+    public void SearchChanged()
+    {
+        _ = _main?.RefreshSearchStateAsync();
+        // an open Settings window holds an older copy of the shortcut, the model and the search switch
+        if (_settings != null) _ = _settings.ReloadAsync();
     }
 
     private static bool IsFirstRun()
@@ -184,6 +241,16 @@ public partial class App : Application
                 _settings!.SelectPage(int.Parse(parts[0]));
                 await Task.Delay(1500);
                 await SaveScreenshotAsync(_settings.RootElement, parts[1]);
+            }
+            // MEDIALAKE_TEST_WELCOME=<folder>: the two pages of the welcome window
+            if (Environment.GetEnvironmentVariable("MEDIALAKE_TEST_WELCOME") is { } dir)
+            {
+                ShowWelcome(0);
+                await Task.Delay(1500);
+                await SaveScreenshotAsync(_welcome!.RootElement, Path.Combine(dir, "welcome-search.png"));
+                _welcome.Open(1);
+                await Task.Delay(500);
+                await SaveScreenshotAsync(_welcome.RootElement, Path.Combine(dir, "welcome-sync.png"));
             }
         }
         catch (Exception ex) { log.Add("FAIL " + ex); }

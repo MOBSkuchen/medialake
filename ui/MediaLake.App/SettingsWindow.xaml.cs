@@ -53,6 +53,9 @@ public sealed partial class SettingsWindow : Window
 
     // ---------- load / save ----------
 
+    /// <summary>Re-reads the settings (the welcome window changed the shortcut, the model or the search switch).</summary>
+    public Task ReloadAsync() => LoadAsync();
+
     private async Task LoadAsync()
     {
         var core = App.Core;
@@ -84,7 +87,7 @@ public sealed partial class SettingsWindow : Window
         RefreshQualityLabels();
         SelectModelItem();
         _loading = true;
-        HotkeyText.Text = (string?)_cfg["hotkey"] ?? "Ctrl+Alt+Space";
+        ShowHotkey((string?)_cfg["hotkey"] ?? "");
         AutostartSwitch.IsOn = Registry.CurrentUser.OpenSubKey(RunKey)?.GetValue(RunValue) != null;
 
         var mode = (string?)_cfg["server_mode"] ?? "local";
@@ -121,6 +124,9 @@ public sealed partial class SettingsWindow : Window
         if (core == null || _loading) return;
         try
         {
+            // the welcome window saves its own settings: do not write back an older copy of its flag
+            var fresh = await core.CallAsync("get_settings");
+            if (fresh.TryGetProperty("welcome_done", out var wd)) _cfg["welcome_done"] = wd.GetBoolean();
             var res = await core.CallAsync("set_settings", JsonSerializer.Deserialize<JsonElement>(_cfg.ToJsonString()));
             if (res.TryGetProperty("reindex", out var r) && r.GetBoolean()) await RefreshStatsAsync();
         }
@@ -229,7 +235,7 @@ public sealed partial class SettingsWindow : Window
         parts.Add(name);
         var combo = string.Join('+', parts);
         var app = (App)Application.Current;
-        var previous = (string?)_cfg["hotkey"] ?? "Ctrl+Alt+Space";
+        var previous = (string?)_cfg["hotkey"] ?? "";
         var err = Hotkey.Register(combo); // validates by actually registering it
         if (err != null)
         {
@@ -238,11 +244,28 @@ public sealed partial class SettingsWindow : Window
             return;
         }
         HotkeyError.Text = "";
-        HotkeyText.Text = combo;
+        ShowHotkey(combo);
         _cfg["hotkey"] = combo;
         app.ApplyHotkey(combo);
         _ = SaveAsync();
         Nav.Focus(FocusState.Programmatic);
+    }
+
+    /// <summary>"Not set" and a Remove button when there is no shortcut: nobody has to have one.</summary>
+    private void ShowHotkey(string combo)
+    {
+        HotkeyText.Text = combo.Length == 0 ? "Not set" : combo;
+        HotkeyText.Opacity = combo.Length == 0 ? 0.6 : 1;
+        HotkeyRemove.Visibility = combo.Length == 0 ? Visibility.Collapsed : Visibility.Visible;
+    }
+
+    private void HotkeyRemove_Click(object sender, RoutedEventArgs e)
+    {
+        HotkeyError.Text = "";
+        ShowHotkey("");
+        _cfg["hotkey"] = "";
+        ((App)Application.Current).ApplyHotkey("");
+        _ = SaveAsync();
     }
 
     private async void KillDaemon_Click(object sender, RoutedEventArgs e)

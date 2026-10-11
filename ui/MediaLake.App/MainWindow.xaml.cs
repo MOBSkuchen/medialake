@@ -95,7 +95,6 @@ public sealed partial class MainWindow : Window
 
     private const int CollapsedHeight = 188; // title + input + status
     private const int ExpandedHeight = 580;
-    private const int SetupHeight = 400; // first run: title + download panel only
     private const int WindowWidth = 760;
 
     private readonly nint _hwnd;
@@ -107,9 +106,10 @@ public sealed partial class MainWindow : Window
     private double _curHeight = CollapsedHeight; // DIPs
     private double _targetHeight = CollapsedHeight;
     private Microsoft.UI.Dispatching.DispatcherQueueTimer? _anim;
-    private string _currentQuality = "normal";
-    private bool _setupVisible;
-    private bool _downloading;
+    /// "ready", "no_model" or "off" (the core's status): anything but "ready" shows the hint instead of searching.
+    private string _searchState = "ready";
+    /// Progress (0..1) of a running model download.
+    private double? _downloadFraction;
 
     public MainWindow()
     {
@@ -145,7 +145,7 @@ public sealed partial class MainWindow : Window
 
     // ---------- show / hide / size ----------
 
-    private int TargetHeight => _setupVisible ? SetupHeight : QueryBox.Text.Trim().Length > 0 ? ExpandedHeight : CollapsedHeight;
+    private int TargetHeight => QueryBox.Text.Trim().Length > 0 ? ExpandedHeight : CollapsedHeight;
 
     public void ShowSearch()
     {
@@ -164,7 +164,7 @@ public sealed partial class MainWindow : Window
         _everShown = true;
         QueryBox.Focus(FocusState.Programmatic);
         QueryBox.SelectAll();
-        _ = CheckSetupAsync();
+        _ = RefreshSearchStateAsync();
     }
 
     public void Hide() => AppWindow.Hide();
@@ -205,8 +205,7 @@ public sealed partial class MainWindow : Window
         var q = QueryBox.Text.Trim();
         var id = Interlocked.Increment(ref _searchId);
         UpdateExpansion();
-        if (_setupVisible) return;
-        if (q.Length == 0)
+        if (_searchState != "ready" || q.Length == 0)
         {
             Items.Clear();
             ShowEmpty("");
@@ -250,7 +249,7 @@ public sealed partial class MainWindow : Window
     private void ShowEmpty(string? text)
     {
         EmptyText.Text = text ?? "";
-        ResultsList.Visibility = text == null && !_setupVisible ? Visibility.Visible : Visibility.Collapsed;
+        ResultsList.Visibility = text == null ? Visibility.Visible : Visibility.Collapsed;
     }
 
     private static async Task LoadThumbAsync(ResultItem item)
@@ -267,103 +266,30 @@ public sealed partial class MainWindow : Window
         catch { /* no thumbnail: the glyph stays */ }
     }
 
-    // ---------- first run: model download ----------
+    // ---------- is search set up? ----------
 
-    private static string FormatSize(long bytes) =>
-        bytes >= 1L << 30 ? $"{bytes / 1073741824.0:0.0} GB" : $"{bytes / 1048576.0:0} MB";
-
-    /// <summary>Shows the model chooser/downloader when the current quality is not on disk yet.</summary>
-    public async Task CheckSetupAsync()
+    /// <summary>Asks the core whether search can be used ("ready", "no_model", "off") and shows the hint if not.</summary>
+    public async Task RefreshSearchStateAsync()
     {
         var core = App.Core;
-        if (core == null || _downloading) return;
+        if (core == null) return;
         try
         {
-            var cfg = await core.CallAsync("get_settings");
-            var models = await core.CallAsync("models");
-            var mode = cfg.GetProperty("server_mode").GetString();
-            _currentQuality = cfg.GetProperty("quality").GetString() ?? "normal";
-            var list = models.GetProperty("qualities").EnumerateArray().ToList();
-
-            var selected = SetupQuality.SelectedItem is ComboBoxItem { Tag: string t } ? t : _currentQuality;
-            SetupQuality.Items.Clear();
-            foreach (var q in list)
+            var st = await core.CallAsync("status");
+            _searchState = st.TryGetProperty("search", out var s) ? s.GetString() ?? "ready" : "ready";
+            if (!(st.TryGetProperty("downloading", out var d) && d.GetBoolean())) _downloadFraction = null;
+            if (_searchState != "ready")
             {
-                var name = q.GetProperty("quality").GetString()!;
-                var size = q.GetProperty("size").GetInt64();
-                var label = name switch
-                {
-                    "heavy" => "Heavy: most precise",
-                    "light" => "Light: smallest and fastest",
-                    _ => "Normal: recommended",
-                };
-                var item = new ComboBoxItem { Content = $"{label}  ·  {FormatSize(size)}", Tag = name };
-                SetupQuality.Items.Add(item);
-                if (name == selected) SetupQuality.SelectedItem = item;
+                Items.Clear();
+                ResultsList.Visibility = Visibility.Collapsed;
+                EmptyText.Text = "";
             }
-            var current = list.FirstOrDefault(q => q.GetProperty("quality").GetString() == _currentQuality);
-            var missing = mode == "local" && current.ValueKind == JsonValueKind.Object && !current.GetProperty("downloaded").GetBoolean();
-            SetSetupVisible(missing);
+            RefreshStatus();
         }
         catch { /* the status line shows core errors */ }
     }
 
-    private void SetSetupVisible(bool visible)
-    {
-        _setupVisible = visible;
-        SetupPanel.Visibility = visible ? Visibility.Visible : Visibility.Collapsed;
-        // first run: only the download is offered, no search box and no settings
-        QueryBox.Visibility = SettingsButton.Visibility = visible ? Visibility.Collapsed : Visibility.Visible;
-        if (visible) LoadingBar.Visibility = Visibility.Collapsed;
-        if (visible)
-        {
-            ResultsList.Visibility = Visibility.Collapsed;
-            EmptyText.Text = "";
-        }
-        UpdateExpansion();
-    }
-
-    private async void SetupDownload_Click(object sender, RoutedEventArgs e)
-    {
-        var core = App.Core;
-        if (core == null || SetupQuality.SelectedItem is not ComboBoxItem { Tag: string quality }) return;
-        _downloading = true;
-        SetupButton.IsEnabled = false;
-        SetupQuality.IsEnabled = false;
-        SetupBar.Value = 0;
-        SetupBar.Visibility = Visibility.Visible;
-        SetupInfo.Text = "Starting download…";
-        try
-        {
-            if (quality != _currentQuality)
-            {
-                var cfg = JsonNode.Parse((await core.CallAsync("get_settings")).GetRawText())!.AsObject();
-                cfg["quality"] = quality;
-                await core.CallAsync("set_settings", JsonSerializer.Deserialize<JsonElement>(cfg.ToJsonString()));
-                _currentQuality = quality;
-            }
-            await core.CallAsync("download_model", new { quality });
-            SetupInfo.Text = "";
-        }
-        catch (Exception ex)
-        {
-            SetupInfo.Text = ex.Message;
-        }
-        finally
-        {
-            _downloading = false;
-            SetupButton.IsEnabled = true;
-            SetupQuality.IsEnabled = true;
-            SetupBar.Visibility = Visibility.Collapsed;
-        }
-        await CheckSetupAsync();
-        if (!_setupVisible)
-        {
-            _serverText = "Model ready. Add folders to index in Settings.";
-            RefreshStatus();
-            QueryBox.Focus(FocusState.Programmatic);
-        }
-    }
+    private void HintLink_Click(object sender, RoutedEventArgs e) => ((App)Application.Current).ShowWelcome(0);
 
     // ---------- keyboard / mouse ----------
 
@@ -422,8 +348,6 @@ public sealed partial class MainWindow : Window
         }
     }
 
-    private void SetupHide_Click(object sender, RoutedEventArgs e) => Hide();
-
     private void Escape_Invoked(KeyboardAccelerator sender, KeyboardAcceleratorInvokedEventArgs args)
     {
         Hide();
@@ -477,18 +401,17 @@ public sealed partial class MainWindow : Window
                 _serverText = state switch
                 {
                     "starting" => "Model starting…",
-                    "failed" => _setupVisible ? "" : string.IsNullOrEmpty(detail) ? "Embedding server failed" : detail!,
+                    "failed" => _searchState != "ready" ? "" : string.IsNullOrEmpty(detail) ? "Embedding server failed" : detail!,
                     _ => "",
                 };
                 break;
             case "download":
                 var d = ev.GetProperty("done").GetDouble();
                 var t = ev.GetProperty("total").GetDouble();
-                SetupBar.Value = t > 0 ? d / t : 0;
-                SetupInfo.Text = $"{FormatSize((long)d)} of {FormatSize((long)t)}  ·  {(t > 0 ? d / t * 100 : 0):0}%";
+                _downloadFraction = t > 0 ? d / t : 0;
                 break;
             case "error":
-                if (!_setupVisible) _serverText = ev.GetProperty("message").GetString() ?? "";
+                if (_searchState == "ready") _serverText = ev.GetProperty("message").GetString() ?? "";
                 break;
         }
         RefreshStatus();
@@ -496,6 +419,23 @@ public sealed partial class MainWindow : Window
 
     private void RefreshStatus()
     {
+        if (_searchState != "ready")
+        {
+            // the hint, bottom left: what is missing, and the way to the setup
+            HintBar.Visibility = _downloadFraction != null ? Visibility.Visible : Visibility.Collapsed;
+            HintLink.Visibility = _downloadFraction == null ? Visibility.Visible : Visibility.Collapsed;
+            if (_downloadFraction is double f)
+            {
+                HintBar.Value = f;
+                StatusText.Text = $"Downloading the search model… {f * 100:0} %";
+            }
+            else
+            {
+                StatusText.Text = _searchState == "off" ? "Search is turned off." : "Search is not set up yet.";
+            }
+            return;
+        }
+        HintBar.Visibility = HintLink.Visibility = Visibility.Collapsed;
         var parts = new[] { _serverText, _progressText }.Where(s => !string.IsNullOrEmpty(s));
         StatusText.Text = string.Join("  ·  ", parts);
     }

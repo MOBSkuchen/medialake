@@ -34,7 +34,8 @@ Local file, data, media search based on embeddings.
 ## UI
 Client UI uses the native toolkit of each platform: WinUI on Windows, SwiftUI/AppKit on macOS (see `plan2.md`).
 Both hosts load the same rust client; only the UI differs.
-The app is opened by using a keyboard shortcut (defined during installation).
+The app is opened from its menu bar / notification area icon, or by a keyboard shortcut if the user chose one
+(optional: nobody has to). The shortcut is chosen in the welcome window, not by the installer.
 
 ### Base app
 It opens a window, which is centered in the middle of the current monitor. The user may type into it. 
@@ -50,9 +51,20 @@ Contains 4 parts:
 2. Model: Options for local and also remote. Remote prompts for an input code. More on that later. Also add a dropdown for the model to use and a confidence threshold slider.
 3. Index: Select (also recursively) and deselect directories to index. Also add 2 sliders for index timeout after modification and for modification size (in bytes)
 4. Sync: joined folders (state, pause, conflict policy, "keep on this Mac" browser, history, leave), conflicts, sharing
-   folders from this computer (invite a device, per-device access), bandwidth limits. The first start asks whether
-   MediaLake is for search, sync, or both.
+   folders from this computer (invite a device, per-device access), bandwidth limits (each with an on/off switch).
 
 ## Installer
-The installer program installs the client+server combo, as well as downloading the default model and prompting the user for a keyboard shortcut.
-On Windows this is an Inno Setup installer; on macOS a `.pkg`, where the shortcut is asked on first start instead (a pkg cannot ask questions).
+The installer program installs the client+server combo and nothing else; it asks no questions (a pkg cannot, and the
+two platforms should behave alike). On Windows this is an Inno Setup installer; on macOS a `.pkg`.
+
+### Welcome window
+The app's first start (a fresh install: no `config.toml`, so `welcome_done = false`) opens "Welcome to MediaLake":
+1. **Search**: model and quality, an optional keyboard shortcut, start at login. **Download** saves the choices,
+   registers the shortcut and downloads the model in the background (the window moves on at once); **Skip for now**
+   sets up no shortcut and downloads no model and leaves search off.
+2. **Sync**: join a folder another computer shares (paste an invitation code), share a folder from this computer
+   (macOS), or skip. *Back* returns to page 1.
+
+Closing the window counts as done. Until search is set up the search window says so in its bottom-left corner
+("Search is not set up yet. Set up search…") and the link opens the welcome window on page 1. The state comes from the
+core (`status.search`: `ready`, `no_model`, `off`), so both platforms show the same thing.

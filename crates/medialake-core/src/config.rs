@@ -142,7 +142,12 @@ pub struct Config {
     /// `false` = no model, no indexer, no watcher, no search; the app is only a sync client / host.
     pub search_enabled: bool,
     pub sync: SyncConfig,
+    /// The global shortcut to show the search window. Empty = none: nobody has to set one.
     pub hotkey: String,
+    /// The welcome window (shortcut, model, sync) has been dealt with, by finishing or skipping it.
+    /// A config file from before this existed counts as done; only "no config at all" is a first run.
+    #[serde(default = "welcome_done_for_old_files")]
+    pub welcome_done: bool,
     /// The embedding model; changing it (or the quality) re-indexes everything.
     pub model: Model,
     pub quality: Quality,
@@ -169,6 +174,12 @@ pub struct Config {
     pub relative_cut: f32,
 }
 
+/// What a config file without `welcome_done` means: it was written by a version that had no welcome
+/// window, so the user is not new.
+fn welcome_done_for_old_files() -> bool {
+    true
+}
+
 impl Default for Config {
     fn default() -> Self {
         let model = Model::default();
@@ -176,7 +187,8 @@ impl Default for Config {
         Config {
             search_enabled: true,
             sync: SyncConfig::default(),
-            hotkey: if cfg!(target_os = "macos") { "Alt+Space" } else { "Ctrl+Alt+Space" }.into(),
+            hotkey: String::new(),
+            welcome_done: false,
             model,
             quality: Quality::Normal,
             server_mode: ServerMode::Local,
@@ -269,5 +281,48 @@ pub fn normalize_path(p: &Path) -> PathBuf {
     match s.strip_prefix(r"\\?\") {
         Some(rest) if !rest.starts_with("UNC\\") => PathBuf::from(rest),
         _ => p.to_path_buf(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_fresh_install_has_no_shortcut_and_has_not_seen_the_welcome_window() {
+        let d = tempfile::tempdir().unwrap();
+        let c = Config::load(&d.path().join("config.toml")).unwrap();
+        assert!(!c.welcome_done);
+        assert_eq!(c.hotkey, "");
+    }
+
+    #[test]
+    fn a_config_from_before_the_welcome_window_counts_as_done() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("config.toml");
+        // what the Windows installer used to write, and what an older app saved
+        std::fs::write(&p, "hotkey = \"Ctrl+Alt+Space\"\n").unwrap();
+        let c = Config::load(&p).unwrap();
+        assert!(c.welcome_done);
+        assert_eq!(c.hotkey, "Ctrl+Alt+Space");
+        std::fs::write(&p, "threshold = 0.5\n").unwrap();
+        assert!(Config::load(&p).unwrap().welcome_done);
+    }
+
+    #[test]
+    fn the_welcome_flag_and_an_empty_shortcut_round_trip() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("config.toml");
+        let mut c = Config::default();
+        c.save(&p).unwrap();
+        let back = Config::load(&p).unwrap();
+        assert!(!back.welcome_done, "a saved first-run config is still a first run");
+        assert_eq!(back.hotkey, "");
+        c.welcome_done = true;
+        c.hotkey = "Ctrl+Space".into();
+        c.save(&p).unwrap();
+        let back = Config::load(&p).unwrap();
+        assert!(back.welcome_done);
+        assert_eq!(back.hotkey, "Ctrl+Space");
     }
 }

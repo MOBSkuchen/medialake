@@ -1,0 +1,93 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Window
+    x:Class="MediaLake.WelcomeWindow"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    Title="MediaLake">
+    <Grid x:Name="Root" Padding="28" RowSpacing="10">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+
+        <TextBlock Text="Welcome to MediaLake" FontSize="26" FontWeight="Bold" />
+        <TextBlock Grid.Row="1" Opacity="0.7" TextWrapping="Wrap"
+                   Text="Everything on these two pages is optional, and you can change it later in Settings." />
+
+        <!-- page 1: search -->
+        <ScrollViewer x:Name="PageSearch" Grid.Row="2">
+            <StackPanel Spacing="16" Padding="0,8,0,0">
+                <TextBlock Text="Search" Style="{StaticResource SubtitleTextBlockStyle}" />
+                <TextBlock TextWrapping="Wrap" Opacity="0.8"
+                           Text="MediaLake understands your files with an AI model that runs on this computer. It is downloaded once and stays here." />
+
+                <StackPanel Spacing="6">
+                    <TextBlock Text="Model" FontWeight="SemiBold" />
+                    <ComboBox x:Name="ModelCombo" MinWidth="440" SelectionChanged="Model_SelectionChanged" />
+                    <ComboBox x:Name="QualityCombo" MinWidth="440" />
+                </StackPanel>
+
+                <StackPanel Spacing="6">
+                    <TextBlock Text="Keyboard shortcut (optional)" FontWeight="SemiBold" />
+                    <StackPanel Orientation="Horizontal" Spacing="12">
+                        <Border x:Name="HotkeyBox" BorderThickness="1" CornerRadius="4" Padding="14,8" MinWidth="220" IsTabStop="True"
+                                BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}"
+                                Background="{ThemeResource ControlFillColorDefaultBrush}"
+                                KeyDown="HotkeyBox_KeyDown" GotFocus="HotkeyBox_GotFocus" LostFocus="HotkeyBox_LostFocus" Tapped="HotkeyBox_Tapped">
+                            <TextBlock x:Name="HotkeyText" Text="Not set" Opacity="0.6" />
+                        </Border>
+                        <Button x:Name="HotkeyRemove" Content="Remove" Click="HotkeyRemove_Click" Visibility="Collapsed" VerticalAlignment="Center" />
+                        <TextBlock x:Name="HotkeyHint" Text="Click, then press the combination" VerticalAlignment="Center" Opacity="0.6" />
+                    </StackPanel>
+                    <TextBlock x:Name="HotkeyError" Foreground="{ThemeResource SystemFillColorCriticalBrush}" TextWrapping="Wrap" />
+                    <TextBlock Opacity="0.7" TextWrapping="Wrap"
+                               Text="Press it anywhere to open the search window. Without one, open MediaLake from its icon in the notification area." />
+                </StackPanel>
+
+                <ToggleSwitch x:Name="AutostartSwitch" Header="Start MediaLake when I sign in" Toggled="Autostart_Toggled" />
+            </StackPanel>
+        </ScrollViewer>
+
+        <!-- page 2: sync -->
+        <ScrollViewer x:Name="PageSync" Grid.Row="2" Visibility="Collapsed">
+            <StackPanel Spacing="14" Padding="0,8,0,0">
+                <TextBlock Text="Sync" Style="{StaticResource SubtitleTextBlockStyle}" />
+                <TextBlock TextWrapping="Wrap" Opacity="0.8"
+                           Text="Keep folders in step between your computers. Paste the invitation code of a folder that another computer shares." />
+                <StackPanel Orientation="Horizontal" Spacing="8">
+                    <TextBox x:Name="CodeBox" PlaceholderText="Invitation code (SN1-…)" Width="400" />
+                    <Button x:Name="ConnectButton" Content="Connect" Click="Connect_Click" />
+                </StackPanel>
+                <TextBlock Opacity="0.7" TextWrapping="Wrap"
+                           Text="The code comes from the computer that shares the folder (&quot;Invite a device&quot;). Sharing a folder from this PC is done with medialake-server for now." />
+
+                <StackPanel x:Name="JoinPanel" Spacing="8" Visibility="Collapsed">
+                    <ComboBox x:Name="SyncCombo" MinWidth="440" SelectionChanged="Sync_SelectionChanged" />
+                    <StackPanel Orientation="Horizontal" Spacing="8">
+                        <TextBox x:Name="LocationBox" Width="400" Header="Put it in" />
+                        <Button Content="Choose…" Click="Location_Click" VerticalAlignment="Bottom" />
+                    </StackPanel>
+                    <Button x:Name="JoinButton" Content="Add this folder" Click="Join_Click" />
+                </StackPanel>
+                <TextBlock x:Name="SyncInfo" TextWrapping="Wrap" />
+            </StackPanel>
+        </ScrollViewer>
+
+        <!-- a running model download, on both pages -->
+        <StackPanel Grid.Row="3" Spacing="4">
+            <ProgressBar x:Name="DownloadBar" Minimum="0" Maximum="1" Visibility="Collapsed" />
+            <TextBlock x:Name="DownloadText" Opacity="0.7" FontSize="12" TextWrapping="Wrap" />
+        </StackPanel>
+
+        <Grid Grid.Row="4">
+            <Button x:Name="BackButton" Content="Back" HorizontalAlignment="Left" Click="Back_Click" Visibility="Collapsed" />
+            <StackPanel Orientation="Horizontal" Spacing="8" HorizontalAlignment="Right">
+                <Button x:Name="SkipButton" Content="Skip for now" Click="Skip_Click" />
+                <Button x:Name="PrimaryButton" Content="Download" Style="{StaticResource AccentButtonStyle}" Click="Primary_Click" />
+            </StackPanel>
+        </Grid>
+    </Grid>
+</Window>

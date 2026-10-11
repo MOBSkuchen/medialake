@@ -51,6 +51,13 @@ pub struct Status {
     pub quality: String,
     pub mode: String,
     pub by_status: Vec<(String, u64)>,
+    /// Whether search can be used: `ready`, `no_model` (local mode and the selected model is not
+    /// downloaded) or `off` (search is switched off). Every UI shows its "not set up" hint from this.
+    pub search: String,
+    /// The selected model is on this computer (or a remote server provides one), whether or not search is on.
+    pub model_ready: bool,
+    /// A model download is running (it keeps running when the window that started it is closed).
+    pub downloading: bool,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -747,7 +754,27 @@ impl Core {
                 ServerMode::Remote => "remote".into(),
             },
             by_status,
+            search: self.search_state().into(),
+            model_ready: self.model_ready(),
+            downloading: self.downloading.load(Ordering::SeqCst),
         }
+    }
+
+    /// `ready`, `no_model` or `off`; see [`Status::search`].
+    pub fn search_state(&self) -> &'static str {
+        if !self.config().search_enabled {
+            "off"
+        } else if self.model_ready() {
+            "ready"
+        } else {
+            "no_model"
+        }
+    }
+
+    /// A remote server brings its own model; locally the selected model and quality must be downloaded.
+    pub fn model_ready(&self) -> bool {
+        let c = self.config();
+        c.server_mode == ServerMode::Remote || crate::models::is_downloaded(&self.model_dir, c.model, c.quality)
     }
 
     pub async fn shutdown(&self) {

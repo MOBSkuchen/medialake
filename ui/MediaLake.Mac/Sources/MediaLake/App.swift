@@ -25,13 +25,12 @@ struct MediaLakeMain {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var main: MainWindowController!
     private var settings: SettingsWindowController?
-    private var setup: SetupWindowController?
+    private var welcome: WelcomeWindowController?
     private var statusItem: StatusItemController?
     private let sync = SyncModel()
     private let notifier = SyncNotifier()
-    private var firstRun: FirstRunWindowController?
-    private var searchEnabled = true
-    private var hotkeyText = "Alt+Space"
+    /// Empty = no global shortcut (nobody has to set one).
+    private var hotkeyText = ""
     private var testMode = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -58,12 +57,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         main = MainWindowController()
         main.model.onOpenSettings = { [weak self] in self?.showSettings() }
-        main.model.onNeedSetup = { [weak self] in self?.showSetup() }
-        main.model.onCloseSetup = { [weak self] in self?.setup?.close() }
-        main.model.applyHotkey = { [weak self] in self?.applyHotkey($0) }
+        main.model.onOpenWelcome = { [weak self] in self?.showWelcome(page: .search) }
         AppState.core?.onEvent = { [weak self] ev in
             self?.main.model.handle(event: ev)
             self?.settings?.model.handle(event: ev)
+            self?.welcome?.model.handle(event: ev)
             self?.sync.handle(event: ev)
             self?.notifyAboutSync(ev)
         }
@@ -72,19 +70,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         sync.onSummary = { [weak self] folders, conflicts in self?.updateSyncSummary(folders, conflicts) }
 
         if let c = AppState.core, let s = try? c.callObject("get_settings") {
-            if let h = s["hotkey"] as? String { hotkeyText = h }
-            searchEnabled = s["search_enabled"] as? Bool ?? true
+            hotkeyText = s["hotkey"] as? String ?? ""
         }
         // a Windows config can carry Win+Space, which parses as Cmd+Space: Spotlight's
-        if let who = HotkeySpec.parse(hotkeyText)?.reservedBy {
+        if !hotkeyText.isEmpty, let who = HotkeySpec.parse(hotkeyText)?.reservedBy {
             logLine("hotkey \(hotkeyText) is used by macOS for \(who); falling back to Alt+Space")
             hotkeyText = "Alt+Space"
         }
         Hotkey.onPressed = { [weak self] in self?.toggle() }
-        if let err = Hotkey.register(hotkeyText) { logLine("hotkey \(hotkeyText): \(err)") }
-        main.model.hotkeyText = hotkeyText
+        if !hotkeyText.isEmpty, let err = Hotkey.register(hotkeyText) { logLine("hotkey \(hotkeyText): \(err)") }
 
-        let item = StatusItemController(tooltip: "MediaLake  (\(HotkeySpec.display(of: hotkeyText)))")
+        let item = StatusItemController(tooltip: Self.tooltip(for: hotkeyText))
         item.onOpen = { [weak self] in self?.toggle() }
         item.onSettings = { [weak self] in self?.showSettings() }
         item.onQuit = { [weak self] in self?.quit() }
@@ -102,48 +98,60 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             Task { await runTest(selfTest: selfTest, shotPath: shot) }
         } else if AppState.core != nil {
             Task {
-                if FirstRun.needed && isFirstRun() && !background {
-                    // nothing is set up yet: ask what MediaLake is for before anything is downloaded
-                    showFirstRun()
+                await main.model.refreshSearchState()
+                // a fresh install (no config yet) and not started in the background: welcome the user.
+                // A background start leaves it for the next time the app is opened.
+                let done = (try? AppState.core?.callObject("get_settings"))?["welcome_done"] as? Bool ?? true
+                if !done {
+                    if !background { showWelcome(page: .search) }
                     return
                 }
-                FirstRun.markDone()
                 await continueStartup(background: background)
             }
         }
     }
 
-    /// The part of start-up that depends on search being on.
+    /// Start-up of an app that has been set up: open nothing unless there is nothing to see yet.
     private func continueStartup(background: Bool) async {
-        if searchEnabled {
-            // learn early whether the model is missing, so the hotkey opens the right window at once
-            await main.model.checkSetup()
-            if background { return }
-            if main.model.setupVisible { showSetup() } else if isFirstRun() { main.show() }
-        } else if !background {
+        await sync.refresh()
+        if background { return }
+        if main.model.searchState == "ready" {
+            if isFirstRun() { main.show() }
+        } else if sync.folders.isEmpty {
+            main.show()  // the search window explains what is missing
+        } else {
             showSettings(page: .sync)
         }
     }
 
-    private func showFirstRun() {
-        let w = FirstRunWindowController()
-        w.onChoice = { [weak self] choice in
-            guard let self else { return }
-            self.firstRun = nil
-            Task {
-                await FirstRun.apply(choice)
-                self.searchEnabled = choice.searchEnabled
-                await self.sync.refresh()
-                if choice.syncEnabled && !choice.searchEnabled {
-                    self.showSettings(page: .sync)
-                } else {
-                    await self.continueStartup(background: false)
-                    if choice.syncEnabled { self.showSettings(page: .sync) }
-                }
+    /// The welcome window (shortcut and model, then sync). `page` is where it opens.
+    private func showWelcome(page: WelcomeModel.Page) {
+        if welcome == nil {
+            let w = WelcomeWindowController(sync: sync)
+            w.model.applyHotkey = { [weak self] in self?.applyHotkey($0) }
+            w.model.onSearchChanged = { [weak self] in self?.searchChanged() }
+            w.onClosed = { [weak self] in
+                self?.welcome = nil
+                self?.searchChanged()
             }
+            welcome = w
         }
-        firstRun = w
-        w.show()
+        main.hide()
+        logLine("welcome window shown (\(page == .search ? "search" : "sync") page)")
+        welcome?.show(page: page)
+    }
+
+    /// Search was set up or switched off (by the welcome window): everything that shows it re-reads it.
+    private func searchChanged() {
+        Task {
+            await main.model.refreshSearchState()
+            // an open Settings window holds an older copy of the shortcut, model and search switch
+            await settings?.model.load()
+        }
+    }
+
+    static func tooltip(for hotkey: String) -> String {
+        hotkey.isEmpty ? "MediaLake" : "MediaLake  (\(HotkeySpec.display(of: hotkey)))"
     }
 
     // MARK: sync status
@@ -183,7 +191,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         // a second launch (LSMultipleInstancesProhibited) lands here
-        if searchEnabled { main.show() } else { showSettings(page: .sync) }
+        if let w = welcome {
+            w.window.makeKeyAndOrderFront(nil)
+        } else {
+            main.show()
+        }
         return false
     }
 
@@ -207,21 +219,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return ((s["dirs"] as? [Any])?.count ?? 0) == 0
     }
 
-    private func toggle() {
-        // with search off the shortcut leads to the part that is on
-        if searchEnabled { main.toggle() } else { showSettings(page: .sync) }
-    }
-
-    private func showSetup() {
-        if setup == nil { setup = SetupWindowController(model: main.model) }
-        main.hide()
-        setup?.show()
-    }
+    private func toggle() { main.toggle() }
 
     private func showSettings(page: SettingsModel.Page? = nil) {
         if settings == nil {
             let s = SettingsWindowController(sync: sync)
             s.model.applyHotkey = { [weak self] in self?.applyHotkey($0) }
+            s.model.openSearchSetup = { [weak self] in self?.showWelcome(page: .search) }
             s.model.requestQuit = { [weak self] in self?.quit() }
             s.model.uninstall = { [weak self] in self?.uninstall() }
             s.onClose = { [weak self] in self?.settings = nil }
@@ -232,12 +236,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let page { settings?.model.page = page }
     }
 
-    /// Registers the new hotkey; on success updates the tooltip and the first-run field.
+    /// Registers the new hotkey (empty = release it); on success updates the tooltip.
     private func applyHotkey(_ text: String) -> String? {
-        if let err = Hotkey.register(text) { return err }
+        if text.isEmpty {
+            Hotkey.unregister()
+        } else if let err = Hotkey.register(text) {
+            return err
+        }
         hotkeyText = text
-        statusItem?.setTooltip("MediaLake  (\(HotkeySpec.display(of: text)))")
-        main.model.hotkeyText = text
+        statusItem?.setTooltip(Self.tooltip(for: text))
         return nil
     }
 
@@ -388,14 +395,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             await sync.refresh()
         }
-        if let path = env["MEDIALAKE_TEST_FIRSTRUN"] {
-            let w = FirstRunWindowController()
-            w.window.appearance = NSAppearance(named: .aqua)
-            w.show()
-            try? await Task.sleep(nanoseconds: 800_000_000)
-            if let v = w.window.contentView { await saveScreenshot(of: v, to: path) }
-            w.window.close()
-        }
         main.model.query = query
         // the server starts on the first search, which can take a while: poll until results show up
         let waitMs = env["MEDIALAKE_TEST_WAIT"].flatMap { UInt64($0) } ?? 20000
@@ -410,11 +409,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             log.append("hotkey \(t) -> \(HotkeySpec.parse(t)?.display ?? "invalid")")
         }
         if let shotPath { await saveScreenshot(of: main.rootView, to: shotPath) }
-        if let path = env["MEDIALAKE_TEST_SETUP"] {
-            showSetup()
-            setup?.window.appearance = NSAppearance(named: .aqua)  // see the settings screenshot below
-            try? await Task.sleep(nanoseconds: 1_000_000_000)
-            if let v = setup?.rootView { await saveScreenshot(of: v, to: path) }
+        // MEDIALAKE_TEST_WELCOME=<folder>: renders the welcome window's pages there
+        if let dir = env["MEDIALAKE_TEST_WELCOME"] {
+            showWelcome(page: .search)
+            welcome?.window.appearance = NSAppearance(named: .aqua)
+            try? await Task.sleep(nanoseconds: 1_200_000_000)
+            if let v = welcome?.rootView { await saveScreenshot(of: v, to: dir + "/welcome-search.png") }
+            welcome?.model.previewDownload(0.42)
+            try? await Task.sleep(nanoseconds: 400_000_000)
+            if let v = welcome?.rootView { await saveScreenshot(of: v, to: dir + "/welcome-downloading.png") }
+            welcome?.model.page = .sync
+            try? await Task.sleep(nanoseconds: 400_000_000)
+            if let v = welcome?.rootView { await saveScreenshot(of: v, to: dir + "/welcome-sync.png") }
+            welcome?.window.close()
+        }
+        // MEDIALAKE_TEST_WELCOME_ACTION=skip|continue: presses that button on page 1 (a shortcut is staged
+        // first) and logs what ended up in the settings
+        if let action = env["MEDIALAKE_TEST_WELCOME_ACTION"] {
+            showWelcome(page: .search)
+            try? await Task.sleep(nanoseconds: 800_000_000)
+            if let m = welcome?.model {
+                await m.load()
+                m.shortcut = "Ctrl+Alt+K"
+                if action == "skip" { await m.skipSearch() } else { await m.download() }
+                // the download path ends with search switched on; give the follow-up calls a moment
+                let until = Date().addingTimeInterval(10)
+                while m.downloading && Date() < until { try? await Task.sleep(nanoseconds: 200_000_000) }
+                await m.finish()
+            }
+            welcome?.window.close()
+            try? await Task.sleep(nanoseconds: 500_000_000)
+            if let c = AppState.core, let s = try? await c.callAsync("get_settings"), let st = try? await c.callAsync("status") {
+                log.append("welcome \(action): hotkey=\(s["hotkey"] ?? "?") search_enabled=\(s["search_enabled"] ?? "?") " +
+                           "welcome_done=\(s["welcome_done"] ?? "?") model=\(s["model"] ?? "?") quality=\(s["quality"] ?? "?") " +
+                           "status.search=\(st["search"] ?? "?") model_ready=\(st["model_ready"] ?? "?")")
+            }
+            await main.model.refreshSearchState()
+            log.append("search window state: \(main.model.searchState)")
         }
         if let spec = env["MEDIALAKE_TEST_SETTINGS"] {
             let parts = spec.split(separator: "|", maxSplits: 1).map(String.init)

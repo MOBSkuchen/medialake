@@ -25,15 +25,16 @@
                     <TextBlock Text="General" Style="{StaticResource TitleTextBlockStyle}" />
 
                     <StackPanel Spacing="6">
-                        <TextBlock Text="Global shortcut" FontWeight="SemiBold" />
-                        <TextBlock Text="Press this shortcut anywhere to open the search window." Opacity="0.7" />
+                        <TextBlock Text="Global shortcut (optional)" FontWeight="SemiBold" />
+                        <TextBlock Text="Press this shortcut anywhere to open the search window. Without one, use the icon in the notification area." Opacity="0.7" />
                         <StackPanel Orientation="Horizontal" Spacing="12">
                             <Border x:Name="HotkeyBox" BorderThickness="1" CornerRadius="4" Padding="14,8" MinWidth="220" IsTabStop="True"
                                     BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}"
                                     Background="{ThemeResource ControlFillColorDefaultBrush}"
                                     KeyDown="HotkeyBox_KeyDown" GotFocus="HotkeyBox_GotFocus" LostFocus="HotkeyBox_LostFocus" Tapped="HotkeyBox_Tapped">
-                                <TextBlock x:Name="HotkeyText" Text="Ctrl+Alt+Space" />
+                                <TextBlock x:Name="HotkeyText" Text="Not set" />
                             </Border>
+                            <Button x:Name="HotkeyRemove" Content="Remove" Click="HotkeyRemove_Click" Visibility="Collapsed" VerticalAlignment="Center" />
                             <TextBlock x:Name="HotkeyHint" Text="Click, then press the new combination" VerticalAlignment="Center" Opacity="0.6" />
                         </StackPanel>
                         <TextBlock x:Name="HotkeyError" Foreground="{ThemeResource SystemFillColorCriticalBrush}" />
