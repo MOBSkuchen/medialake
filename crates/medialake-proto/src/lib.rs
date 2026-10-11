@@ -4,6 +4,7 @@ pub mod models;
 pub mod pairing;
 pub mod platform;
 pub mod pinning;
+pub mod sync;
 
 use bier_derive::{Deserialize, Serialize};
 use bierpc::serialize::{Deserialize, Serialize};
@@ -50,6 +51,9 @@ pub enum Action {
     Pair { token: String, client_name: String },
     /// Stop the server (local child mode only).
     Shutdown { auth: String },
+    /// File sync (see [`sync`]). An old server answers this variant with a decode error, which a member
+    /// reports as "this host does not support sync".
+    Sync { auth: String, device: String, req: sync::SyncRequest },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -71,6 +75,7 @@ pub enum Response {
     Paired { client_id: String, secret: String },
     Rejected(String),
     Ok,
+    Sync(sync::SyncResponse),
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

@@ -15,6 +15,7 @@ pub mod remote;
 pub mod search;
 pub mod store;
 pub mod supervisor;
+pub mod sync;
 pub mod vindex;
 pub mod watcher;
 

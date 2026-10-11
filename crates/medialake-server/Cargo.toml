@@ -12,6 +12,7 @@ bierpc.workspace = true
 bier_derive.workspace = true
 medialake-proto.workspace = true
 medialake-llama.workspace = true
+medialake-sync.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

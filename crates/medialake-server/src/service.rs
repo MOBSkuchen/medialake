@@ -6,8 +6,10 @@ use bierpc::error::RpcResult;
 use bierpc::rpc::RpcServerHandler;
 use medialake_proto::{Action, Embedding, PROTO_VERSION, Response, ServerInfo, TextKind, format_text};
 
+use medialake_sync::host::SyncHost;
+use medialake_sync::host::state::StateDir;
+
 use crate::engine::{Engine, Priority, Work};
-use crate::state::StateDir;
 
 /// Who may talk to this server.
 #[derive(Default)]
@@ -34,9 +36,12 @@ pub type PairingHook = Arc<dyn Fn(&str, &str) -> Option<(String, String)> + Send
 
 #[derive(Clone)]
 pub struct Service {
-    pub engine: Engine,
+    /// `None` on a sync-only host (`serve --no-embed`).
+    pub engine: Option<Engine>,
     pub auth: Arc<Auth>,
-    pub info: ServerInfo,
+    pub info: Option<ServerInfo>,
+    /// File sync (remote mode only).
+    pub sync: Option<Arc<SyncHost>>,
     /// Notified when a client asks to `Shutdown` (local mode).
     pub shutdown: Arc<tokio::sync::Notify>,
     /// Remote mode: pairing hook (`token, client_name -> (client_id, secret)`).
@@ -49,48 +54,55 @@ impl RpcServerHandler for Service {
 
     async fn handle(&self, action: Action) -> RpcResult<Response> {
         let deny = || Response::Rejected("authentication failed".into());
+        let no_embed = || Response::Rejected("embedding is not enabled on this server".into());
         Ok(match action {
             Action::Hello { proto_version, auth } => {
                 if !self.auth.check(&auth) {
                     deny()
                 } else if proto_version != PROTO_VERSION {
                     Response::Rejected(format!("protocol version {proto_version} not supported (server speaks {PROTO_VERSION})"))
+                } else if let Some(info) = &self.info {
+                    Response::Info(info.clone())
                 } else {
-                    Response::Info(self.info.clone())
+                    no_embed()
                 }
             }
             Action::EmbedText { auth, kind, items } => {
                 if !self.auth.check(&auth) {
                     return Ok(deny());
                 }
+                let Some(engine) = &self.engine else { return Ok(no_embed()) };
                 let prio = if kind == TextKind::Query { Priority::Query } else { Priority::Bulk };
                 let work = items.iter().map(|i| Work::Text(format_text(kind, i))).collect();
-                Response::Embeddings(self.engine.embed(prio, work).await)
+                Response::Embeddings(engine.embed(prio, work).await)
             }
             Action::EmbedImages { auth, images } => {
                 if !self.auth.check(&auth) {
                     return Ok(deny());
                 }
+                let Some(engine) = &self.engine else { return Ok(no_embed()) };
                 let work = images.into_iter().map(|i| Work::Images(vec![i])).collect();
-                Response::Embeddings(self.engine.embed(Priority::Bulk, work).await)
+                Response::Embeddings(engine.embed(Priority::Bulk, work).await)
             }
             Action::EmbedAudio { auth, segments } => {
                 if !self.auth.check(&auth) {
                     return Ok(deny());
                 }
-                if !self.info.supports_audio {
+                let (Some(engine), Some(info)) = (&self.engine, &self.info) else { return Ok(no_embed()) };
+                if !info.supports_audio {
                     let msg = "audio not supported by this model".to_string();
                     return Ok(Response::Embeddings(vec![Embedding::Failed(msg); segments.len()]));
                 }
                 let work = segments.into_iter().map(Work::Audio).collect();
-                Response::Embeddings(self.engine.embed(Priority::Bulk, work).await)
+                Response::Embeddings(engine.embed(Priority::Bulk, work).await)
             }
             Action::EmbedVideo { auth, clips } => {
                 if !self.auth.check(&auth) {
                     return Ok(deny());
                 }
+                let Some(engine) = &self.engine else { return Ok(no_embed()) };
                 let work = clips.into_iter().map(|c| Work::Images(c.frames)).collect();
-                Response::Embeddings(self.engine.embed(Priority::Bulk, work).await)
+                Response::Embeddings(engine.embed(Priority::Bulk, work).await)
             }
             Action::Pair { token, client_name } => match &self.pairing {
                 Some(p) => match p(&token, &client_name) {
@@ -106,6 +118,10 @@ impl RpcServerHandler for Service {
                 self.shutdown.notify_one();
                 Response::Ok
             }
+            Action::Sync { auth, device, req } => match &self.sync {
+                Some(host) => Response::Sync(host.handle(&auth, &device, req).await),
+                None => Response::Rejected("this server does not host syncs".into()),
+            },
         })
     }
 }

@@ -23,6 +23,7 @@ tracing-appender = "0.2"
 medialake-proto = { path = "crates/medialake-proto" }
 medialake-llama = { path = "crates/medialake-llama" }
 medialake-core = { path = "crates/medialake-core" }
+medialake-sync = { path = "crates/medialake-sync" }
 
 # crates.io llama-cpp-sys-2 vendors a llama.cpp without the gemma-embedding2 arch; use llama-cpp-rs
 # main with its llama.cpp submodule moved to b11535 (see vendor/README.md).

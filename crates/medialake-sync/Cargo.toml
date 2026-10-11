@@ -1,0 +1,36 @@
+[package]
+name = "medialake-sync"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "medialake_sync"
+
+[[bin]]
+name = "medialake-sync"
+path = "src/bin/cli.rs"
+
+[dependencies]
+bierpc.workspace = true
+bier_derive.workspace = true
+medialake-proto.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+sha2.workspace = true
+rcgen.workspace = true
+rusqlite = { version = "0.32", features = ["bundled"] }
+blake3 = "1"
+walkdir = "2"
+notify = "7"
+getrandom = "0.3"
+clap = { version = "4", features = ["derive", "env"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"

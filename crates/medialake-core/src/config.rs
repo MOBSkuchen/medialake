@@ -31,9 +31,117 @@ pub struct RemoteCreds {
     pub secret_protected: String,
 }
 
+/// A host this device is paired with for sync. The secret is protected like `RemoteCreds::secret_protected`.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+pub struct SyncHostCfg {
+    pub id: String,
+    pub name: String,
+    pub address: String,
+    pub fingerprint: String,
+    pub client_id: String,
+    pub secret_protected: String,
+}
+
+/// A sync this device is a member of.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(default)]
+pub struct SyncFolderCfg {
+    pub sync_id: String,
+    pub host_id: String,
+    pub name: String,
+    pub path: PathBuf,
+    /// `auto` = Cloud Files / mount where available; `mirror` = a plain folder with full copies.
+    pub frontend: String,
+    /// `server_wins` or `ask`
+    pub conflict: String,
+    /// `rw` or `ro`, as granted by the host when joining.
+    pub access: String,
+    pub cache_limit_gb: u64,
+    pub index_for_search: bool,
+    pub paused: bool,
+}
+
+impl Default for SyncFolderCfg {
+    fn default() -> Self {
+        SyncFolderCfg {
+            sync_id: String::new(),
+            host_id: String::new(),
+            name: String::new(),
+            path: PathBuf::new(),
+            frontend: "auto".into(),
+            conflict: "server_wins".into(),
+            access: "rw".into(),
+            cache_limit_gb: 10,
+            index_for_search: true,
+            paused: false,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(default)]
+pub struct SyncHostingCfg {
+    pub bind: String,
+    /// Empty = this computer's name.
+    pub public_addr: String,
+}
+
+impl Default for SyncHostingCfg {
+    fn default() -> Self {
+        SyncHostingCfg { bind: "0.0.0.0:47900".into(), public_addr: String::new() }
+    }
+}
+
+/// File sync (§9). Off by default: an existing install behaves exactly as before.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(default)]
+pub struct SyncConfig {
+    pub enabled: bool,
+    /// Shown in conflict names and on the host. Empty = this computer's name.
+    pub device_name: String,
+    pub debounce_ms: u64,
+    /// 0 = unlimited. (Stored; enforcement is part of the polish phase.)
+    pub upload_limit_kbps: u64,
+    pub download_limit_kbps: u64,
+    pub hosts: Vec<SyncHostCfg>,
+    pub folders: Vec<SyncFolderCfg>,
+    /// Folders this device hosts for others.
+    pub hosted: Vec<medialake_sync::host::config::HostedConfig>,
+    pub hosting: SyncHostingCfg,
+}
+
+impl Default for SyncConfig {
+    fn default() -> Self {
+        SyncConfig {
+            enabled: false,
+            device_name: String::new(),
+            debounce_ms: 2_000,
+            upload_limit_kbps: 0,
+            download_limit_kbps: 0,
+            hosts: vec![],
+            folders: vec![],
+            hosted: vec![],
+            hosting: SyncHostingCfg::default(),
+        }
+    }
+}
+
+impl SyncConfig {
+    pub fn device(&self) -> String {
+        if self.device_name.trim().is_empty() {
+            medialake_proto::platform::host_name("MediaLake device")
+        } else {
+            self.device_name.clone()
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(default)]
 pub struct Config {
+    /// `false` = no model, no indexer, no watcher, no search; the app is only a sync client / host.
+    pub search_enabled: bool,
+    pub sync: SyncConfig,
     pub hotkey: String,
     pub quality: Quality,
     pub server_mode: ServerMode,
@@ -62,6 +170,8 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Config {
+            search_enabled: true,
+            sync: SyncConfig::default(),
             hotkey: if cfg!(target_os = "macos") { "Alt+Space" } else { "Ctrl+Alt+Space" }.into(),
             quality: Quality::Normal,
             server_mode: ServerMode::Local,

@@ -15,4 +15,12 @@ pub enum Event {
     Error { message: String },
     /// Indexing of the whole queue finished.
     Idle { files: u64, chunks: u64 },
+    /// A joined sync changed state: `idle`, `syncing`, `paused`, `conflict`, `held` (deletes waiting
+    /// for confirmation) or `error`.
+    SyncState { sync_id: String, name: String, state: String, detail: String },
+    /// Transfers of the last round.
+    SyncProgress { sync_id: String, downloaded: u64, uploaded: u64, pushed: u64 },
+    /// A conflict is waiting for a decision (policy "ask").
+    SyncConflict { sync_id: String, name: String, path: String },
+    SyncError { sync_id: String, message: String },
 }
