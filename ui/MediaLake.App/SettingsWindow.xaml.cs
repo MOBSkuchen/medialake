@@ -74,7 +74,7 @@ public sealed partial class SettingsWindow : Window
             {
                 var label = tag switch { "heavy" => "Heavy: most precise", "light" => "Light: smallest and fastest", _ => "Normal: recommended" };
                 var size = info.size >= 1L << 30 ? $"{info.size / 1073741824.0:0.0} GB" : $"{info.size / 1048576.0:0} MB";
-                ci.Content = $"{label}  Â·  {size}" + (info.downloaded ? "  Â·  downloaded" : "");
+                ci.Content = $"{label}  ·  {size}" + (info.downloaded ? " (downloaded)" : "");
             }
         }
         _loading = true;
