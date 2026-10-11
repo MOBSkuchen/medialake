@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<installer-gui-script minSpecVersion="2">
+    <title>MediaLake</title>
+    <welcome file="welcome.html"/>
+    <license file="license.txt" mime-type="text/plain"/>
+    <conclusion file="conclusion.html"/>
+    <!-- "Install for me only" (~/Applications, no admin password) next to the all-users install -->
+    <domains enable_anywhere="false" enable_currentUserHome="true" enable_localSystem="true"/>
+    <options customize="never" require-scripts="false" hostArchitectures="arm64"/>
+    <os-version min="14.0"/>
+    <pkg-ref id="com.sonvogel.medialake"/>
+    <choices-outline>
+        <line choice="default">
+            <line choice="com.sonvogel.medialake"/>
+        </line>
+    </choices-outline>
+    <choice id="default"/>
+    <choice id="com.sonvogel.medialake" visible="false">
+        <pkg-ref id="com.sonvogel.medialake"/>
+    </choice>
+    <pkg-ref id="com.sonvogel.medialake" onConclusion="none">MediaLake.pkg</pkg-ref>
+</installer-gui-script>

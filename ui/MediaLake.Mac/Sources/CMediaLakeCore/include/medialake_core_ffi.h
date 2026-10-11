@@ -8,8 +8,6 @@
 
 typedef struct Handle Handle;
 
-typedef struct Option_EventCallback Option_EventCallback;
-
 char *sn_version(void);
 
 char *sn_last_error(void);
@@ -33,7 +31,7 @@ void sn_shutdown(struct Handle *h);
  * # Safety
  * `h` must be a live handle.
  */
-void sn_set_event_callback(struct Handle *h, struct Option_EventCallback cb);
+void sn_set_event_callback(struct Handle *h, void (*cb)(const char*));
 
 /**
  * Synchronous call; run it on a background thread. Returns `{"ok":...}` or `{"error":"..."}`.

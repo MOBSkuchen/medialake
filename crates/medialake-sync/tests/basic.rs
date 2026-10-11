@@ -391,6 +391,9 @@ impl medialake_sync::member::transport::Transport for Switch {
     fn download(&self, p: &str, r: u64, part: &std::path::Path) -> anyhow::Result<medialake_sync::member::transport::Fetch> {
         delegate!(self, download(p, r, part))
     }
+    fn read_range(&self, p: &str, r: u64, o: u64, l: u64) -> anyhow::Result<medialake_sync::member::transport::RangeFetch> {
+        delegate!(self, read_range(p, r, o, l))
+    }
     fn upload(&self, h: &str, s: &std::path::Path, n: u64) -> anyhow::Result<medialake_sync::member::transport::Upload> {
         delegate!(self, upload(h, s, n))
     }

@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use medialake_proto::TextKind;
 use medialake_proto::TextItem;
-use medialake_proto::models::Quality;
+use medialake_proto::models::{Model, Quality};
 use serde::Serialize;
 use tokio::sync::{broadcast, watch};
 use tokio::task::JoinHandle;
@@ -47,6 +47,7 @@ pub struct Status {
     pub server_state: String,
     pub server_detail: String,
     pub backend: String,
+    pub model: String,
     pub quality: String,
     pub mode: String,
     pub by_status: Vec<(String, u64)>,
@@ -55,6 +56,7 @@ pub struct Status {
 #[derive(Serialize, Clone, Debug)]
 pub struct PairResult {
     pub address: String,
+    pub model: String,
     pub quality: String,
     pub backend: String,
     pub reindex: bool,
@@ -101,20 +103,17 @@ impl Core {
         let store = Store::open(&paths.db_file)?;
 
         // changing model or quality invalidates every vector
-        let quality = cfg.quality.as_str();
-        match store.meta("quality") {
-            Some(q) if q != quality => {
-                tracing::warn!("quality changed {q} -> {quality}: clearing the index");
-                store.clear_all()?;
-                store.set_meta("quality", quality)?;
-                store.set_meta("index_clean", "0")?;
-            }
-            None => store.set_meta("quality", quality)?,
-            _ => {}
+        let (model, quality) = (cfg.model.as_str(), cfg.quality.as_str());
+        let (old_model, old_quality) = (store.meta("model_id"), store.meta("quality"));
+        if old_model.as_deref().is_some_and(|m| m != model) || old_quality.as_deref().is_some_and(|q| q != quality) {
+            tracing::warn!("model/quality changed {old_model:?}/{old_quality:?} -> {model}/{quality}: clearing the index");
+            store.clear_all()?;
+            store.set_meta("index_clean", "0")?;
         }
-        store.set_meta("model_id", medialake_proto::models::MODEL_ID)?;
+        store.set_meta("model_id", model)?;
+        store.set_meta("quality", quality)?;
 
-        let vindex = Arc::new(VectorIndex::open(&paths.index_file, &store).map_err(anyhow::Error::msg)?);
+        let vindex = Arc::new(VectorIndex::open(&paths.index_file, &store, cfg.model.dims()).map_err(anyhow::Error::msg)?);
         let store = Arc::new(Mutex::new(store));
         let (events, _) = broadcast::channel(256);
 
@@ -127,6 +126,7 @@ impl Core {
         // inactive placeholder channel until the first backend is attached
         let (_tx, idle_rx) = watch::channel(ServerState::Idle);
         let client = EmbedClient::new(idle_rx.clone(), None);
+        client.expect_model(cfg.model);
         let cfg = Arc::new(RwLock::new(cfg));
 
         let indexer = Indexer::new(store.clone(), vindex.clone(), client.clone(), cfg.clone(), events.clone());
@@ -210,6 +210,7 @@ impl Core {
             },
             model_dir: self.model_dir.clone(),
             log_dir: Some(self.paths.logs_dir.clone()),
+            model: cfg.model,
             quality: cfg.quality,
             gpu_layers: self.opts.gpu_layers,
             idle_shutdown: Duration::from_secs(cfg.idle_shutdown_minutes as u64 * 60),
@@ -273,11 +274,16 @@ impl Core {
     pub async fn pair_remote(&self, code: &str) -> Result<PairResult, String> {
         let name = medialake_proto::platform::host_name("MediaLake client");
         let paired = crate::remote::pair(code, &name).await?;
+        let Some(server_model) = Model::parse(&paired.info.model_id) else {
+            crate::remote::discard(&paired.creds.secret_protected);
+            return Err(format!("the server runs a model this version does not know: {}", paired.info.model_id));
+        };
         let server_quality = Quality::parse(&paired.info.quality);
         let mut reindex = false;
         {
             let mut c = self.cfg.write().unwrap();
             c.server_mode = ServerMode::Remote;
+            c.set_model(server_model);
             if let Some(old) = c.remote.replace(paired.creds.clone()) {
                 crate::remote::discard(&old.secret_protected);
             }
@@ -288,12 +294,19 @@ impl Core {
             }
         }
         self.save_config().map_err(|e| e.to_string())?;
+        self.client.expect_model(server_model);
         let conn = RemoteConn::from_creds(&paired.creds)?;
         self.attach_remote(conn);
-        if let Some(q) = server_quality {
-            reindex = self.ensure_index_quality(q).await;
+        if server_quality.is_some() {
+            reindex = self.ensure_index_current().await;
         }
-        Ok(PairResult { address: paired.creds.address, quality: paired.info.quality, backend: paired.info.backend, reindex })
+        Ok(PairResult {
+            address: paired.creds.address,
+            model: paired.info.model_id,
+            quality: paired.info.quality,
+            backend: paired.info.backend,
+            reindex,
+        })
     }
 
     /// Deletes the stored remote credential (Keychain item on macOS) and the paired server from the
@@ -317,14 +330,17 @@ impl Core {
         }
         self.save_config().map_err(|e| e.to_string())?;
         self.attach_local();
-        let q = self.config().quality;
-        self.ensure_index_quality(q).await;
+        self.ensure_index_current().await;
         Ok(())
     }
 
-    /// The index may only contain vectors of the active quality; rebuilds when it does not.
-    async fn ensure_index_quality(&self, q: Quality) -> bool {
-        let differs = self.store.lock().unwrap().meta("quality").as_deref() != Some(q.as_str());
+    /// The index may only contain vectors of the active model and quality; rebuilds when it does not.
+    async fn ensure_index_current(&self) -> bool {
+        let cfg = self.config();
+        let differs = {
+            let st = self.store.lock().unwrap();
+            st.meta("model_id").as_deref() != Some(cfg.model.as_str()) || st.meta("quality").as_deref() != Some(cfg.quality.as_str())
+        };
         if differs {
             self.reindex_all().await;
         }
@@ -412,6 +428,7 @@ impl Core {
                     Ok(w) => {
                         w.set_dirs(&self.cfg.read().unwrap().dirs);
                         *self.watcher.lock().unwrap() = Some(w);
+                        self.refresh_mount_watch();
                     }
                     Err(e) => {
                         let _ = self.events.send(Event::Error { message: format!("Cannot watch folders: {e}") });
@@ -461,6 +478,10 @@ impl Core {
         new.sync.hosts = old.sync.hosts.clone();
         new.sync.folders = old.sync.folders.clone();
         new.sync.hosted = old.sync.hosted.clone();
+        // a remote server dictates the model; locally the score mapping follows the model
+        let wanted = if new.server_mode == ServerMode::Local { new.model } else { old.model };
+        new.model = old.model;
+        new.set_model(wanted);
         *self.cfg.write().unwrap() = new.clone();
         self.save_config()?;
         self.apply_sync_settings(&old, &new).await;
@@ -472,10 +493,15 @@ impl Core {
             return Ok(false);
         }
         let mut reindex = false;
-        if old.quality != new.quality && new.server_mode == ServerMode::Local {
+        if (old.model != new.model || old.quality != new.quality) && new.server_mode == ServerMode::Local {
+            self.client.expect_model(new.model);
             let sup = self.active.lock().unwrap().supervisor.clone();
             if let Some(s) = sup {
-                s.reconfigure(|c| c.quality = new.quality).await;
+                s.reconfigure(|c| {
+                    c.model = new.model;
+                    c.quality = new.quality;
+                })
+                .await;
             }
             self.reindex_all().await;
             reindex = true;
@@ -520,10 +546,13 @@ impl Core {
     /// Drops every vector and indexes everything again.
     pub async fn reindex_all(&self) {
         {
+            let cfg = self.config();
             let st = self.store.lock().unwrap();
             let _ = st.clear_all();
-            let _ = st.set_meta("quality", self.config().quality.as_str());
+            let _ = st.set_meta("model_id", cfg.model.as_str());
+            let _ = st.set_meta("quality", cfg.quality.as_str());
             let _ = st.set_meta("index_clean", "0");
+            self.vindex.set_dims(cfg.model.dims());
             let _ = self.vindex.rebuild(&st);
         }
         self.indexer.reconcile().await;
@@ -531,8 +560,8 @@ impl Core {
 
     // ---------- models ----------
 
-    pub fn models_status(&self) -> Vec<crate::models::QualityStatus> {
-        crate::models::status(&self.model_dir)
+    pub fn models_status(&self, model: Model) -> Vec<crate::models::QualityStatus> {
+        crate::models::status(&self.model_dir, model)
     }
 
     pub fn model_dir(&self) -> &std::path::Path {
@@ -543,9 +572,9 @@ impl Core {
         self.download_cancel.store(true, Ordering::Relaxed);
     }
 
-    /// Downloads the files of a quality tier (no-op when present). Wakes the server afterwards.
-    pub async fn download_quality(&self, q: Quality) -> Result<(), String> {
-        if crate::models::is_downloaded(&self.model_dir, q) {
+    /// Downloads the files of a model's quality tier (no-op when present). Wakes the server afterwards.
+    pub async fn download_quality(&self, model: Model, q: Quality) -> Result<(), String> {
+        if crate::models::is_downloaded(&self.model_dir, model, q) {
             return Ok(());
         }
         if self.downloading.swap(true, Ordering::SeqCst) {
@@ -555,7 +584,7 @@ impl Core {
         let dir = self.model_dir.clone();
         let cancel = self.download_cancel.clone();
         let ev = self.events.clone();
-        let set = medialake_proto::models::model_set(q);
+        let set = medialake_proto::models::model_set(model, q);
         let r = tokio::task::spawn_blocking(move || crate::models::download_blocking(&dir, set, cancel, ev))
             .await
             .map_err(|e| e.to_string())?;
@@ -589,6 +618,8 @@ impl Core {
             .map_err(|e| format!("{e:#}"))?;
         *self.sync.lock().unwrap() = Some(m.clone());
         m.start().await;
+        self.indexer.set_gate(Some(m.clone()));
+        self.refresh_mount_watch();
         // folders of joined syncs are indexed like any other folder
         if self.config().search_enabled {
             let folders = self.config().sync.folders;
@@ -608,9 +639,11 @@ impl Core {
                 }
             } else {
                 let s = self.sync.lock().unwrap().take();
+                self.indexer.set_gate(None);
                 if let Some(s) = s {
                     s.stop().await;
                 }
+                self.refresh_mount_watch();
             }
         } else if old.sync.upload_limit_kbps != new.sync.upload_limit_kbps || old.sync.download_limit_kbps != new.sync.download_limit_kbps {
             if let Ok(s) = self.sync() {
@@ -650,9 +683,22 @@ impl Core {
         Ok(result)
     }
 
+    /// Tells the file watcher which cache trees stand behind mounted sync volumes (FSEvents does not
+    /// report changes inside an NFS mount).
+    fn refresh_mount_watch(&self) {
+        #[cfg(target_os = "macos")]
+        {
+            let pairs = self.sync().map(|m| m.mount_trees()).unwrap_or_default();
+            if let Some(w) = self.watcher.lock().unwrap().as_ref() {
+                w.set_mounts(&pairs);
+            }
+        }
+    }
+
     pub async fn sync_join(&self, host_id: &str, sync_id: &str, path: &std::path::Path, frontend: &str, conflict: &str) -> Result<crate::config::SyncFolderCfg, String> {
         let m = self.sync()?;
         let f = m.join(host_id, sync_id, path, frontend, conflict).await?;
+        self.refresh_mount_watch();
         if f.index_for_search && self.config().search_enabled {
             let _ = self.add_dir(f.path.clone(), true).await;
         }
@@ -663,6 +709,7 @@ impl Core {
         let m = self.sync()?;
         let path = self.config().sync.folders.iter().find(|f| f.sync_id == sync_id || f.name == sync_id).map(|f| f.path.clone());
         m.leave(sync_id, keep_files).await?;
+        self.refresh_mount_watch();
         if let Some(p) = path {
             if self.config().dirs.iter().any(|d| d.path == p) {
                 let _ = self.remove_dir(&p).await;
@@ -693,6 +740,7 @@ impl Core {
                 _ => String::new(),
             },
             backend: info.as_ref().map(|i| i.backend.clone()).unwrap_or_default(),
+            model: self.config().model.as_str().into(),
             quality: self.config().quality.as_str().into(),
             mode: match self.mode() {
                 ServerMode::Local => "local".into(),

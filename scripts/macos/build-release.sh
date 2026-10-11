@@ -1,9 +1,6 @@
 #!/usr/bin/env bash
 # Builds everything and stages dist/app/MediaLake.app for the installer:
-#   scripts/macos/build-release.sh [--version 0.1.0] [--installer]
-#
-# NOT YET RUNNABLE: written against the layout in plan2.md. It needs ui/MediaLake.Mac and installer/macos,
-# which do not exist yet, and it has never been run on a Mac.
+#   scripts/macos/build-release.sh [--version 0.2.0] [--installer]
 #
 # Signing (all optional; without them the app is ad-hoc signed and Gatekeeper warns on other machines):
 #   MEDIALAKE_SIGN_ID            "Developer ID Application: ..."  signs the app and the nested server
@@ -13,7 +10,7 @@ set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$root"
 
-version="0.1.0"
+version="0.2.0"
 installer=0
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -43,6 +40,9 @@ cp "$ui/Resources/Info.plist" "$app/Contents/Info.plist"
 cp "$ui/Resources/AppIcon.icns" "$app/Contents/Resources/AppIcon.icns"
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $version" -c "Set :CFBundleVersion $version" "$app/Contents/Info.plist"
 
+# Extended attributes (provenance, quarantine) become ._ files in the pkg and break strict signatures.
+xattr -cr "$app"
+
 # Nested code first, then the bundle. The hardened runtime is required for notarisation.
 sign_id="${MEDIALAKE_SIGN_ID:--}"
 sign=(codesign --force --options runtime --sign "$sign_id")
@@ -58,7 +58,10 @@ if [ "$installer" = 1 ]; then
     pkgbuild --root dist/app --component-plist installer/macos/component.plist \
         --identifier com.sonvogel.medialake --version "$version" --install-location /Applications \
         --scripts installer/macos/scripts "$work/MediaLake.pkg"
-    product=(productbuild --distribution installer/macos/Distribution.xml --package-path "$work" --resources installer/macos/resources)
+    # the licence page shows the repository's LICENSE
+    cp -R installer/macos/resources "$work/resources"
+    cp LICENSE "$work/resources/license.txt"
+    product=(productbuild --distribution installer/macos/Distribution.xml --package-path "$work" --resources "$work/resources")
     if [ -n "${MEDIALAKE_INSTALLER_SIGN_ID:-}" ]; then product+=(--sign "$MEDIALAKE_INSTALLER_SIGN_ID" --timestamp); fi
     "${product[@]}" "$pkg"
     rm -rf "$work"

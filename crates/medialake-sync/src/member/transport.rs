@@ -33,6 +33,15 @@ pub enum Fetch {
     NotFound,
 }
 
+/// Answer to a ranged read (on-demand frontends).
+#[derive(Debug, PartialEq, Eq)]
+pub enum RangeFetch {
+    /// Up to `len` bytes; shorter (or empty) at the end of the file.
+    Data(Vec<u8>),
+    Stale,
+    NotFound,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum Upload {
     Done,
@@ -45,6 +54,8 @@ pub trait Transport: Send + Sync {
     fn commit(&self, changes: &[Change]) -> Result<Vec<ChangeResult>>;
     /// Appends the content of `path` at `rev` to `part`, resuming at its current length.
     fn download(&self, path: &str, rev: u64, part: &Path) -> Result<Fetch>;
+    /// `len` bytes of `path` at `rev`, starting at `offset` (no resuming, nothing written to disk).
+    fn read_range(&self, path: &str, rev: u64, offset: u64, len: u64) -> Result<RangeFetch>;
     fn upload(&self, hash: &str, src: &Path, size: u64) -> Result<Upload>;
     fn versions(&self, path: &str) -> Result<Vec<VersionInfo>>;
     fn snapshots(&self) -> Result<Vec<SnapshotInfo>>;
@@ -89,6 +100,25 @@ impl Transport for LocalTransport {
                 let mut w = std::fs::OpenOptions::new().create(true).append(true).open(part)?;
                 std::io::copy(&mut r, &mut w)?;
                 Ok(Fetch::Done)
+            }
+        }
+    }
+
+    fn read_range(&self, path: &str, rev: u64, offset: u64, len: u64) -> Result<RangeFetch> {
+        use std::io::Read;
+        match self.host.download_source(path, rev) {
+            DownloadSource::NotFound => Ok(RangeFetch::NotFound),
+            DownloadSource::Stale => {
+                self.host.scan_paths(&[path.to_string()])?;
+                Ok(RangeFetch::Stale)
+            }
+            DownloadSource::File { path: src, size } => {
+                let want = len.min(size.saturating_sub(offset));
+                let mut r = std::fs::File::open(src)?;
+                r.seek(SeekFrom::Start(offset))?;
+                let mut buf = Vec::with_capacity(want as usize);
+                r.take(want).read_to_end(&mut buf)?;
+                Ok(RangeFetch::Data(buf))
             }
         }
     }
@@ -484,6 +514,55 @@ impl Transport for RemoteTransport {
                     (other, _) => bail!("download failed: {other:?}"),
                 };
                 Ok((out, reuse))
+            })
+            .await
+        })
+    }
+
+    fn read_range(&self, path: &str, rev: u64, offset: u64, len: u64) -> Result<RangeFetch> {
+        if len == 0 {
+            return Ok(RangeFetch::Data(vec![]));
+        }
+        let c = self.client.clone();
+        let down = c.down.clone();
+        self.block(async move {
+            c.stream(async |rpc: &mut Rpc| {
+                let mut out: Vec<u8> = Vec::with_capacity(len.min(8 << 20) as usize);
+                let mut status = 255u8;
+                let resp: StreamResponse = rpc
+                    .call_persistent(
+                        StreamAction::Download { auth: c.creds.auth(), sync: self.sync.clone(), path: path.to_string(), rev, offset, len },
+                        async |s: &mut BufStream<ClientStream>| {
+                            let mut st = [0u8; 1];
+                            s.read_exact(&mut st).await?;
+                            status = st[0];
+                            if status != DL_OK {
+                                return Ok(());
+                            }
+                            let _total = read_u64(s).await?;
+                            let mut buf = Vec::new();
+                            loop {
+                                let n = read_frame(s, &mut buf).await?;
+                                if n == 0 {
+                                    break;
+                                }
+                                out.extend_from_slice(&buf);
+                                down.throttle(n).await;
+                            }
+                            Ok(())
+                        },
+                    )
+                    .await
+                    .map_err(|e| anyhow!("download failed: {e:?}"))?;
+                let reuse = resp == StreamResponse::Done;
+                let r = match (resp, status) {
+                    (StreamResponse::Done, DL_OK) => RangeFetch::Data(std::mem::take(&mut out)),
+                    (StreamResponse::Stale, _) | (_, DL_STALE) => RangeFetch::Stale,
+                    (StreamResponse::NotFound, _) | (_, DL_NOT_FOUND) => RangeFetch::NotFound,
+                    (StreamResponse::Denied(m), _) => bail!("access denied: {m}"),
+                    (other, _) => bail!("download failed: {other:?}"),
+                };
+                Ok((r, reuse))
             })
             .await
         })

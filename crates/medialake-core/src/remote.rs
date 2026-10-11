@@ -242,3 +242,19 @@ impl Backend for RemoteBackend {
         }
     }
 }
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keychain_round_trip() {
+        let secret: Vec<u8> = (0..32u8).collect();
+        let reference = protect(&secret).expect("store in the keychain");
+        assert!(reference.starts_with("keychain:"));
+        assert!(!reference.contains(&hex(&secret)), "the config must not hold the secret");
+        assert_eq!(unprotect(&reference).expect("read back"), secret);
+        discard(&reference);
+        assert!(unprotect(&reference).is_err(), "discard must delete the item");
+    }
+}

@@ -1,18 +1,23 @@
-# File sync: implementation status (backend)
+# File sync: implementation status
 
-Implements the Rust side of `post-plan3.md`: phases **S0–S5** and the backend half of **X2**. No UI, no
-Cloud Files, no macOS mount (A*, W*, X1's platform part are untouched). Everything below runs and is tested
-on the Mac, with no model loaded. Wire format: `sync-protocol.md`.
+Implements `post-plan3.md`: the engine and host (**S0–S5**), the backend half of **X2**, and the macOS
+side (**A0–A2**, with the macOS half of **X1**). Not started: Windows Cloud Files and its UI (W0–W2).
+Everything below runs and is tested on a Mac, with no model loaded. Wire format: `sync-protocol.md`; the
+mount decision and measurements: `a0-macos-mount.md`.
 
 | Phase | State | Where |
 |---|---|---|
-| S0 spike | Done: one-way throughput **~800 MiB/s** (1 GiB, loopback TLS, release); a **5 GiB upload cut at 40 %** resumes at the byte the host held (3 GiB re-sent, 10 s); the 60-minute idle notification-stream test (`SYNC_IDLE_MINUTES=60`) was started but its result is not recorded here; a 2-minute run is the default. Not measured: a real LAN | `tests/network.rs` (`--ignored`: `throughput_localhost`, `cut_connection_resumes_large_upload`, `idle_notification_stream_survives`) |
+| S0 spike | Done: one-way throughput **~800 MiB/s** (1 GiB, loopback TLS, release); a **5 GiB upload cut at 40 %** resumes at the byte the host held (3 GiB re-sent, 10 s); the notification stream **survived 60 minutes idle** and delivered (`SYNC_IDLE_MINUTES=60`, one run, loopback); a 2-minute run is the default. Not measured: a real LAN | `tests/network.rs` (`--ignored`: `throughput_localhost`, `cut_connection_resumes_large_upload`, `idle_notification_stream_survives`) |
 | S1 protocol + host | Done | `medialake-proto/src/sync.rs`, `medialake-sync/src/host/` |
 | S2 member + mirror | Done | `medialake-sync/src/member/`, bin `medialake-sync` |
 | S3 conflicts | Done, with the randomized convergence test | `tests/convergence.rs` |
 | S4 backups | Done | `host/hosted.rs` (blob store, both strategies, prune, gc, restore) |
 | S5 core + FFI | Done | `medialake-core/src/sync.rs`, `config.rs`, `core.rs`, `medialake-ffi/src/dispatch.rs` |
 | X2 backend | Done: bandwidth limits, Verify, error states, docs | see below |
+| A0 spike: macOS mount | Done: built-in NFSv3 loopback chosen; macFUSE / FUSE-T not installed here, so not measured | `a0-macos-mount.md`, `crates/medialake-mount/spike/` |
+| A1 mount frontend | Done: browse offline, load on open (block-wise), upload on save, evict under the limit, pin, crash cleanup, fallback to a mirror. Finder / Office checks by hand are not done (see below) | `crates/medialake-mount/`, `medialake-core/src/sync.rs` |
+| A2 macOS UI + installer | Done: Sync page, status item, notifications, first-run choice, uninstall. Verified by building and by driving the real app binary; not clicked through by a person. A pkg was built, not notarised | `ui/MediaLake.Mac/Sources/MediaLake/Sync*.swift`, `installer/macos/` |
+| X1 search integration (macOS) | Done in code: indexing never downloads, name-only entries are upgraded once fetched. Needs a model to exercise end to end, which was not run | `indexer.rs` (`ContentGate`), `watcher.rs`, `sync.rs` (`would_download`) |
 
 ## Try it
 
@@ -81,20 +86,35 @@ runs inside the app when `[[sync.hosted]]` has entries.
 7. **Conflict names use UTC** (`name (conflict, <device>, 2026-10-11 14-03).ext`).
 8. **Bandwidth limits are in kilobits per second** and enforced client-side (one limiter per host for
    uploads, one for downloads). The host does not throttle.
-9. **`frontend = "auto"` resolves to the mirror** until the platform frontends exist. `sync_pin` /
-   `sync_unpin` return an error for mirrors.
-10. **Search integration (X1)**: joined folders with `index_for_search` are added as indexed directories.
-    The "indexer never triggers a download" rule has nothing to guard with a mirror (every file is local);
-    it belongs with the Cloud Files / mount frontends.
-11. The CLI keeps host secrets in `hosts.json` (mode 0600); the app uses the Keychain / DPAPI like the
+9. **`frontend = "auto"`** means the mount on macOS and the mirror elsewhere, decided once per sync and
+   then remembered (`<state dir>/frontend`): a sync never changes where its files are by itself. Syncs that
+   predate mounts stay mirrors. A mount that cannot start (folder not empty, mount refused) runs as a mirror
+   with a notice. `sync_pin` / `sync_unpin` error for mirrors.
+10. **Search integration (X1)**: joined folders with `index_for_search` are indexed through the mount point.
+    The watcher watches the cache tree behind it (FSEvents is silent inside NFS), and the indexer asks the sync
+    manager before reading: a file that would first be downloaded is indexed by name only (`status =
+    deferred`) and re-processed when it has been fetched.
+11. **A cache is only trusted with the engine state it was filled under** (see `a0-macos-mount.md`); an
+    orphaned cache is set aside, never read as local edits.
+12. **No per-file badges in Finder** (a Finder Sync extension needs the same signing as File Provider):
+    "keep on this Mac" / "free up space" live in the app's folder browser, as planned.
+13. The CLI keeps host secrets in `hosts.json` (mode 0600); the app uses the Keychain / DPAPI like the
     embedding credentials.
 
 ## Still open
 
-- **Platform frontends and UI** (A0–A2, W0–W2): the point of the mount / Cloud Files work. The engine and
-  `Frontend` trait are ready for them.
-- **Windows**: the mirror uses plain `std::fs`; `\\?\` long paths are not added, and nothing was run there.
-  Linux should work as is.
+- **Windows** (W0–W2): Cloud Files frontend and WinUI page. The `Frontend` trait now has what an on-demand
+  frontend needs (`lazy`, `meta_path`, `place_placeholder`, `content_hash`, `note_content`, ranged
+  `Transport::read_range`), so it is a frontend plus UI. The mirror uses plain `std::fs`; `\\?\` long paths
+  are not added, and nothing was run on Windows. Linux should work as is for the mirror.
+- **By-hand checks on a Mac** (A1's acceptance list): Finder copy in and out, Quick Look and column-view
+  previews (does browsing read more than the first block?), TextEdit / Pages / Preview / an Office app saving
+  on the volume, Spotlight staying out, macOS 14 and 15, Intel. The Cocoa save patterns that can be scripted
+  (`saves.swift`: atomic write, `replaceItemAt`, xattrs, truncate, locks) pass on the mount.
+- **Signing and notarisation** of the app and pkg need the developer identity; the build script supports
+  them through environment variables and was run ad hoc only.
+- **One mount per sync**, no shared `~/MediaLake` volume: a sync's location is chosen per sync.
+- **Partial writes** to a file that is not on this Mac fetch the whole file first (the sync is whole-file).
 - **A real LAN / Wi-Fi run** of the S0 numbers (only loopback was measured).
 - **Block-level delta transfer, end-to-end encryption, relay** are out of scope (§13).
 
@@ -112,6 +132,12 @@ runs inside the app when `[[sync.hosted]]` has entries.
   connections, bandwidth limit, compression; ignored soak tests for throughput, a cut 5 GiB transfer and
   an hour-long idle stream.
 - `medialake-core/tests/sync.rs`: two cores (one hosting from the app, one joining with an invite code),
-  search toggling at runtime, sync enabling at runtime, error-state mapping, config compatibility.
+  search toggling at runtime, sync enabling at runtime, error-state mapping, config compatibility; on macOS a
+  mounted sync (placeholders, load on open, pin, write-through, leave keeping the downloaded files) and the
+  fallback to a mirror.
+- `medialake-mount/tests/mount.rs` (macOS, really mounts): browsing fetches nothing, a read fetches a block,
+  writes / rename-over / delete / junk files, host changes replace cached content, eviction and pins,
+  read-only, conflicts keep both, offline, parallel readers, `touch` does not download, a Cocoa process's
+  save patterns, stale-mount cleanup and the process registry.
 
 Only macOS (arm64) was exercised.

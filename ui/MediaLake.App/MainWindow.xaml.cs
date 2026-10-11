@@ -95,6 +95,7 @@ public sealed partial class MainWindow : Window
 
     private const int CollapsedHeight = 188; // title + input + status
     private const int ExpandedHeight = 580;
+    private const int SetupHeight = 400; // first run: title + download panel only
     private const int WindowWidth = 760;
 
     private readonly nint _hwnd;
@@ -131,7 +132,7 @@ public sealed partial class MainWindow : Window
 
         Activated += (_, e) =>
         {
-            if (e.WindowActivationState == WindowActivationState.Deactivated && _everShown && !KeepOpen && !_downloading) Hide();
+            if (e.WindowActivationState == WindowActivationState.Deactivated && _everShown && !KeepOpen) Hide(); // a running download continues
         };
         Closed += (_, e) => { e.Handled = true; Hide(); };
         RefreshStatus();
@@ -144,7 +145,7 @@ public sealed partial class MainWindow : Window
 
     // ---------- show / hide / size ----------
 
-    private bool WantsExpanded => _setupVisible || QueryBox.Text.Trim().Length > 0;
+    private int TargetHeight => _setupVisible ? SetupHeight : QueryBox.Text.Trim().Length > 0 ? ExpandedHeight : CollapsedHeight;
 
     public void ShowSearch()
     {
@@ -152,7 +153,7 @@ public sealed partial class MainWindow : Window
         var area = DisplayArea.GetFromPoint(new PointInt32(cur.X, cur.Y), DisplayAreaFallback.Nearest);
         var wa = area.WorkArea;
         var scale = GetScale();
-        _targetHeight = WantsExpanded ? ExpandedHeight : CollapsedHeight;
+        _targetHeight = TargetHeight;
         _curHeight = _targetHeight;
         var pw = (int)(WindowWidth * scale);
         var ph = (int)(_curHeight * scale);
@@ -175,7 +176,7 @@ public sealed partial class MainWindow : Window
     /// <summary>Grows the window while typing / shrinks it back when the query is cleared (animated).</summary>
     private void UpdateExpansion()
     {
-        var target = WantsExpanded ? ExpandedHeight : CollapsedHeight;
+        var target = TargetHeight;
         if (target == _targetHeight) return;
         _targetHeight = target;
         if (_anim == null)
@@ -311,6 +312,9 @@ public sealed partial class MainWindow : Window
     {
         _setupVisible = visible;
         SetupPanel.Visibility = visible ? Visibility.Visible : Visibility.Collapsed;
+        // first run: only the download is offered, no search box and no settings
+        QueryBox.Visibility = SettingsButton.Visibility = visible ? Visibility.Collapsed : Visibility.Visible;
+        if (visible) LoadingBar.Visibility = Visibility.Collapsed;
         if (visible)
         {
             ResultsList.Visibility = Visibility.Collapsed;
@@ -416,6 +420,14 @@ public sealed partial class MainWindow : Window
             ShellActions.ShowInExplorer(path);
             Hide();
         }
+    }
+
+    private void SetupHide_Click(object sender, RoutedEventArgs e) => Hide();
+
+    private void Escape_Invoked(KeyboardAccelerator sender, KeyboardAcceleratorInvokedEventArgs args)
+    {
+        Hide();
+        args.Handled = true;
     }
 
     private void Settings_Click(object sender, RoutedEventArgs e) => ((App)Application.Current).ShowSettings();

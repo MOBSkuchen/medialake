@@ -6,8 +6,9 @@ use std::path::Path;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
-use medialake_llama::{Embedder, Input};
-use medialake_proto::Embedding;
+use medialake_llama::{Embedder, Input, Params, Pooling};
+use medialake_proto::models::Model;
+use medialake_proto::{Embedding, TextItem, TextKind, format_text, media_prompt};
 use tokio::sync::oneshot;
 
 pub enum Work {
@@ -46,11 +47,24 @@ pub struct Engine {
     pub supports_audio: bool,
 }
 
+/// The llama.cpp settings that go with a model of the manifest.
+pub fn llama_params(model: Model) -> Params {
+    let (media_prefix, media_suffix) = media_prompt(model);
+    let pooling = match model.pooling() {
+        medialake_proto::models::Pooling::Mean => Pooling::Mean,
+        medialake_proto::models::Pooling::Last => Pooling::Last,
+    };
+    Params { pooling, media_prefix, media_suffix }
+}
+
 impl Engine {
     /// Loads the model (blocking) and starts the worker thread.
-    pub fn start(model: &Path, mmproj: &Path, gpu_layers: i32, verbose: bool) -> Result<Engine, String> {
-        let mut embedder = Embedder::load(model, mmproj, gpu_layers, verbose)?;
-        warm_up(&mut embedder);
+    pub fn start(model_id: Model, model: &Path, mmproj: &Path, gpu_layers: i32, verbose: bool) -> Result<Engine, String> {
+        let mut embedder = Embedder::load(model, mmproj, gpu_layers, verbose, llama_params(model_id))?;
+        if embedder.dims() != model_id.dims() {
+            return Err(format!("{} yields {}-dim vectors, expected {} for {}", model.display(), embedder.dims(), model_id.dims(), model_id.as_str()));
+        }
+        warm_up(&mut embedder, model_id);
         let audio_sample_rate = embedder.audio_sample_rate();
         let supports_audio = embedder.supports_audio();
         let shared = Arc::new(Shared { q: Mutex::new(Queues::default()), cv: Condvar::new() });
@@ -156,9 +170,10 @@ fn tiny_bmp() -> Vec<u8> {
     b
 }
 
-fn warm_up(e: &mut Embedder) {
+fn warm_up(e: &mut Embedder, model: Model) {
     let t = Instant::now();
-    let _ = e.embed(&Input::Text("title: none | text: warm-up"));
+    let text = format_text(model, TextKind::Document, &TextItem { title: String::new(), text: "warm-up".into() });
+    let _ = e.embed(&Input::Text(&text));
     let bmp = tiny_bmp();
     let _ = e.embed(&Input::Images(&[&bmp]));
     if e.supports_audio() {

@@ -200,6 +200,9 @@ impl Engine {
     // ---------------- local state ----------------
 
     fn file_hash(&self, rel: &str, size: u64, mtime: i64) -> Result<String> {
+        if let Some(h) = self.fe.content_hash(rel) {
+            return Ok(h);
+        }
         if let Some(c) = self.db.local_cache(rel) {
             if c.size == size && c.mtime == mtime {
                 return Ok(c.hash);
@@ -211,7 +214,7 @@ impl Engine {
     }
 
     fn local_state(&self, rel: &str) -> Result<Option<Local>> {
-        let abs = self.fe.local_path(rel);
+        let abs = self.fe.meta_path(rel);
         let m = match std::fs::symlink_metadata(&abs) {
             Ok(m) => m,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -436,6 +439,7 @@ impl Engine {
         if let Some(l) = local {
             if l.kind == EntryKind::File {
                 self.db.set_local_cache(&e.path, l.size, l.mtime, &l.hash)?;
+                self.fe.note_content(&e.path, &e.hash, e.rev, l.size, l.mtime);
             }
         }
         Ok(())
@@ -466,12 +470,17 @@ impl Engine {
 
     /// Downloads, verifies and places a file, replacing a clean local one, and records the base.
     fn install_file(&self, e: &Entry, rep: &mut Report) -> Result<()> {
-        let staged = self.fetch(e)?;
-        self.fe.place_file(&e.path, &staged, e.mtime, e.exec)?;
-        let abs = self.fe.local_path(&e.path);
+        // on-demand frontends take the metadata only; the content comes when something reads it
+        let placeholder = self.fe.lazy() && e.size > 0 && self.fe.place_placeholder(&e.path, e.size, e.mtime, e.exec, &e.hash, e.rev)?;
+        if !placeholder {
+            let staged = self.fetch(e)?;
+            self.fe.place_file(&e.path, &staged, e.mtime, e.exec)?;
+        }
+        let abs = self.fe.meta_path(&e.path);
         let m = std::fs::metadata(&abs)?;
         self.db.set_local_cache(&e.path, m.len(), mtime_ms(&m), &e.hash)?;
         self.db.set_base(&Base::from_entry(e))?;
+        self.fe.note_content(&e.path, &e.hash, e.rev, m.len(), mtime_ms(&m));
         self.fe.set_status(&e.path, EntryStatus::InSync);
         rep.downloaded += 1;
         Ok(())
@@ -512,7 +521,7 @@ impl Engine {
         let t = now_secs();
         for n in 0..1000 {
             let c = conflict_name(path, &self.cfg.device, t + n * 60);
-            if !self.fe.local_path(&c).exists() && self.db.base(&c).is_none() {
+            if !self.fe.meta_path(&c).exists() && self.db.base(&c).is_none() {
                 return Ok(c);
             }
         }
@@ -587,6 +596,7 @@ impl Engine {
                     // the base hash must differ from the local content so that it is pushed
                     if let Some(l) = &local {
                         if l.kind == EntryKind::File && l.hash == b.hash {
+                            self.fe.note_content(path, &b.hash, b.rev, l.size, l.mtime);
                             self.db.clear_conflict(path)?;
                             return self.db.set_base(&b);
                         }
@@ -791,6 +801,7 @@ impl Engine {
                     Change::Put { path, hash, size, mtime, exec, .. } => {
                         self.db.set_base(&Base { path: path.clone(), kind: EntryKind::File, rev, hash: hash.clone(), size: *size, mtime: *mtime, exec: *exec })?;
                         self.db.set_local_cache(path, *size, *mtime, hash)?;
+                        self.fe.note_content(path, hash, rev, *size, *mtime);
                         self.fe.set_status(path, EntryStatus::InSync);
                     }
                     Change::Mkdir { path } => {
@@ -803,6 +814,7 @@ impl Engine {
                         let moved = self.db.base(from);
                         self.db.drop_base(from)?;
                         if let (Some(b), Some(l)) = (moved, self.local_state(to)?) {
+                            self.fe.note_content(to, &l.hash, rev, l.size, l.mtime);
                             self.db.set_base(&Base { path: to.clone(), rev, mtime: l.mtime, exec: l.exec, ..b })?;
                             self.db.set_local_cache(to, l.size, l.mtime, &l.hash)?;
                         }

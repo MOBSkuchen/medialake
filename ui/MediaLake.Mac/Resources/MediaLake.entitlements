@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Not sandboxed (the app reads folders the user picks and starts the bundled server), so there is
+         nothing to grant here beyond the hardened runtime's defaults. -->
+</dict>
+</plist>

@@ -33,6 +33,11 @@ struct Queue {
     active: HashSet<String>,
 }
 
+/// Answers, for files inside a sync volume, whether reading them would first download them.
+pub trait ContentGate: Send + Sync {
+    fn would_download(&self, path: &Path) -> bool;
+}
+
 pub struct Indexer {
     pub(crate) store: Arc<Mutex<Store>>,
     pub(crate) vindex: Arc<VectorIndex>,
@@ -49,6 +54,7 @@ pub struct Indexer {
     current: Mutex<Option<String>>,
     /// When the current batch started (for the time estimate).
     batch_start: Mutex<Option<std::time::Instant>>,
+    gate: RwLock<Option<Arc<dyn ContentGate>>>,
 }
 
 fn key(p: &Path) -> String {
@@ -110,7 +116,18 @@ impl Indexer {
             events,
             current: Mutex::new(None),
             batch_start: Mutex::new(None),
+            gate: RwLock::new(None),
         })
+    }
+
+    /// Indexing never downloads: files the gate says are not on this device are indexed by name only
+    /// and get their content when something else has fetched them.
+    pub fn set_gate(&self, gate: Option<Arc<dyn ContentGate>>) {
+        *self.gate.write().unwrap() = gate;
+    }
+
+    fn dehydrated(&self, path: &Path) -> bool {
+        self.gate.read().unwrap().as_ref().is_some_and(|g| g.would_download(path))
     }
 
     pub fn start_workers(self: &Arc<Self>, n: usize) {
@@ -323,8 +340,12 @@ impl Indexer {
         let old_name = existing_chunks.iter().find(|c| c.kind == "name");
         let need_name = old_name.map(|c| c.chunk_hash != name_hash).unwrap_or(true);
 
+        // a file of a sync volume that has not been downloaded: name only, for now
+        let dehydrated = self.dehydrated(path);
         if let Some(f) = &existing {
-            if f.size == size && f.mtime == mtime && f.modality == modality.as_str() && f.status != "error" && !need_name {
+            let unchanged = f.size == size && f.mtime == mtime && f.modality == modality.as_str() && !need_name;
+            let settled = if f.status == "deferred" { dehydrated } else { f.status != "error" };
+            if unchanged && settled {
                 return Ok(Outcome::Skipped);
             }
         }
@@ -332,7 +353,8 @@ impl Indexer {
         // ---- decide what to read/embed for the content ----
         let content_wanted = !too_large
             && match modality {
-                Modality::Text | Modality::Image | Modality::Audio | Modality::Document => true,
+                Modality::Text | Modality::Image | Modality::Document => true,
+                Modality::Audio => cfg.model.supports_audio(),
                 Modality::Video => cfg.video_enabled,
                 Modality::Other => false,
             };
@@ -341,6 +363,8 @@ impl Indexer {
         let (content, err_note): (Content, Option<String>) = if !content_wanted {
             let why = if too_large { "too large" } else { "unsupported" };
             (Content::NameOnly(why), None)
+        } else if dehydrated {
+            (Content::NameOnly("not downloaded"), None)
         } else {
             let p = path.to_path_buf();
             let max = cfg.max_file_bytes;
@@ -399,7 +423,11 @@ impl Indexer {
             Content::NameOnly(why) => {
                 // content that cannot be (or is no longer) embedded: drop stale content vectors
                 drop_ids.extend(existing_chunks.iter().filter(|c| c.kind != "name").map(|c| c.id));
-                status = if *why == "error" { "error".into() } else { "name_only".into() };
+                status = match *why {
+                    "error" => "error".into(),
+                    "not downloaded" => "deferred".into(),
+                    _ => "name_only".into(),
+                };
                 if had_content {
                     embedded_size = 0;
                     content_hash = None;
@@ -639,6 +667,14 @@ impl Indexer {
                 seen_db.iter().map(|(k, v)| (k.to_lowercase(), v.clone())).collect();
             let mut on_disk: HashSet<String> = HashSet::new();
             let mut queued = 0u64;
+            // the folder of a sync volume that is not mounted right now is an empty directory
+            let unavailable: Vec<String> = cfg
+                .dirs
+                .iter()
+                .filter(|d| cfg.sync.folders.iter().any(|f| f.path == d.path))
+                .filter(|d| std::fs::read_dir(&d.path).map(|mut r| r.next().is_none()).unwrap_or(true))
+                .map(|d| d.path.to_string_lossy().to_lowercase())
+                .collect();
             for d in &cfg.dirs {
                 let mut w = walkdir::WalkDir::new(&d.path).follow_links(false);
                 if !d.recursive {
@@ -669,7 +705,11 @@ impl Indexer {
             // anything in the store that is no longer reachable
             let mut removed = 0u64;
             for p in seen_db.keys() {
-                if !on_disk.contains(&p.to_lowercase()) {
+                let lp = p.to_lowercase();
+                if unavailable.iter().any(|u| lp.starts_with(u.as_str())) {
+                    continue;
+                }
+                if !on_disk.contains(&lp) {
                     me.remove_path(Path::new(p));
                     removed += 1;
                 }

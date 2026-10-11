@@ -376,10 +376,22 @@ pub fn is_within(path: &str, dir: &str) -> bool {
     dir.is_empty() || path == dir || (path.len() > dir.len() && path.starts_with(dir) && path.as_bytes()[dir.len()] == b'/')
 }
 
-const IGNORED_NAMES: &[&str] = &[".medialake-sync", ".DS_Store", "Thumbs.db", "desktop.ini"];
+const IGNORED_NAMES: &[&str] = &[
+    ".medialake-sync",
+    ".DS_Store",
+    "Thumbs.db",
+    "desktop.ini",
+    // macOS volume housekeeping, which a mounted sync sees at its root
+    ".TemporaryItems",
+    ".Trashes",
+    ".fseventsd",
+    ".Spotlight-V100",
+    ".DocumentRevisions-V100",
+    ".apdisk",
+];
 
 /// Built-in ignore rules (`.medialake-sync/`, `.DS_Store`, `._*`, `Thumbs.db`, `desktop.ini`, `~$*`,
-/// `*.tmp`, `*.part`, `.~lock.*`) applied to every component, plus `extra` glob patterns (`*`, `?`)
+/// `*.tmp`, `*.part`, `.~lock.*`, macOS volume folders such as `.TemporaryItems`) applied to every component, plus `extra` glob patterns (`*`, `?`)
 /// matched against each component and, for patterns containing `/`, against the whole path.
 pub fn is_ignored(path: &str, extra: &[String]) -> bool {
     for comp in path.split('/') {

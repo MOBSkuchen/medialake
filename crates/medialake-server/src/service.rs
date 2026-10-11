@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use bierpc::error::RpcResult;
 use bierpc::rpc::RpcServerHandler;
+use medialake_proto::models::Model;
 use medialake_proto::{Action, Embedding, PROTO_VERSION, Response, ServerInfo, TextKind, format_text};
 
 use medialake_sync::host::SyncHost;
@@ -38,6 +39,8 @@ pub type PairingHook = Arc<dyn Fn(&str, &str) -> Option<(String, String)> + Send
 pub struct Service {
     /// `None` on a sync-only host (`serve --no-embed`).
     pub engine: Option<Engine>,
+    /// Decides the prompt format of text inputs.
+    pub model: Model,
     pub auth: Arc<Auth>,
     pub info: Option<ServerInfo>,
     /// File sync (remote mode only).
@@ -73,7 +76,7 @@ impl RpcServerHandler for Service {
                 }
                 let Some(engine) = &self.engine else { return Ok(no_embed()) };
                 let prio = if kind == TextKind::Query { Priority::Query } else { Priority::Bulk };
-                let work = items.iter().map(|i| Work::Text(format_text(kind, i))).collect();
+                let work = items.iter().map(|i| Work::Text(format_text(self.model, kind, i))).collect();
                 Response::Embeddings(engine.embed(prio, work).await)
             }
             Action::EmbedImages { auth, images } => {

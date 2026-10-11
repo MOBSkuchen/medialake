@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bierpc::rpc::{ClientConfig, RpcClient};
+use medialake_proto::models::Model;
 use medialake_proto::{Action, Embedding, MAX_MESSAGE_BYTES, PROTO_VERSION, Response, ServerInfo, TextItem, TextKind, VideoFrames};
 use tokio::sync::{Mutex, watch};
 
@@ -28,6 +29,7 @@ pub struct EmbedClient {
     query: Mutex<Slot>,
     bulk: Mutex<Slot>,
     info: std::sync::Mutex<Option<ServerInfo>>,
+    expected: std::sync::Mutex<Option<Model>>,
 }
 
 #[derive(Debug, Clone)]
@@ -57,7 +59,25 @@ impl EmbedClient {
             query: Mutex::new(Slot { conn: None, generation: 0 }),
             bulk: Mutex::new(Slot { conn: None, generation: 0 }),
             info: std::sync::Mutex::new(None),
+            expected: std::sync::Mutex::new(None),
         })
+    }
+
+    /// The model the index is built with: a server running anything else is refused.
+    pub fn expect_model(&self, model: Model) {
+        *self.expected.lock().unwrap() = Some(model);
+    }
+
+    fn check_model(&self, info: &ServerInfo) -> Result<(), ClientError> {
+        match *self.expected.lock().unwrap() {
+            Some(m) if info.model_id != m.as_str() || info.dims as usize != m.dims() => Err(ClientError::Rejected(format!(
+                "the server runs {} ({} dimensions) but the index is built with {}",
+                info.model_id,
+                info.dims,
+                m.as_str()
+            ))),
+            _ => Ok(()),
+        }
     }
 
     pub fn server_info(&self) -> Option<ServerInfo> {
@@ -132,6 +152,7 @@ impl EmbedClient {
             if g.conn.is_none() || g.generation != target.generation || g.conn.as_ref().is_some_and(|c| c.is_poisoned()) {
                 match Self::connect(&target).await {
                     Ok((c, info)) => {
+                        self.check_model(&info)?;
                         *self.info.lock().unwrap() = Some(info);
                         g.conn = Some(c);
                         g.generation = target.generation;

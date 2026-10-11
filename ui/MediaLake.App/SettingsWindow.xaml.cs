@@ -24,7 +24,10 @@ public sealed partial class SettingsWindow : Window
     private JsonObject _cfg = new();
     private bool _loading = true;
     private CancellationTokenSource? _saveDelay;
+    private string _model = "embeddinggemma-2";
     private string _quality = "normal";
+    /// Download state of the quality tiers: of every model, and of the selected one.
+    private readonly Dictionary<string, Dictionary<string, (bool downloaded, long size)>> _allModels = new();
     private Dictionary<string, (bool downloaded, long size)> _models = new();
     private readonly System.Collections.ObjectModel.ObservableCollection<DirItem> _dirs = [];
     private bool _downloading;
@@ -58,25 +61,28 @@ public sealed partial class SettingsWindow : Window
         {
             _cfg = JsonNode.Parse((await core.CallAsync("get_settings")).GetRawText())!.AsObject();
             var models = await core.CallAsync("models");
-            _models = models.GetProperty("qualities").EnumerateArray().ToDictionary(
-                q => q.GetProperty("quality").GetString()!,
-                q => (q.GetProperty("downloaded").GetBoolean(), q.GetProperty("size").GetInt64()));
+            _loading = true;
+            _allModels.Clear();
+            ModelCombo.Items.Clear();
+            foreach (var e in models.GetProperty("models").EnumerateArray())
+            {
+                var id = e.GetProperty("id").GetString()!;
+                _allModels[id] = e.GetProperty("qualities").EnumerateArray().ToDictionary(
+                    q => q.GetProperty("quality").GetString()!,
+                    q => (q.GetProperty("downloaded").GetBoolean(), q.GetProperty("size").GetInt64()));
+                var media = e.GetProperty("supports_audio").GetBoolean() ? "text, images, audio, video" : "text, images, video";
+                ModelCombo.Items.Add(new ComboBoxItem { Content = $"{e.GetProperty("name").GetString()} ({media})", Tag = id });
+            }
+            _model = (string?)_cfg["model"] ?? "embeddinggemma-2";
+            _models = _allModels.TryGetValue(_model, out var cur) ? cur : new();
         }
         catch (Exception ex)
         {
             HotkeyError.Text = ex.Message;
             return;
         }
-        // size hints in the quality list
-        foreach (var o in QualityCombo.Items)
-        {
-            if (o is ComboBoxItem { Tag: string tag } ci && _models.TryGetValue(tag, out var info))
-            {
-                var label = tag switch { "heavy" => "Heavy: most precise", "light" => "Light: smallest and fastest", _ => "Normal: recommended" };
-                var size = info.size >= 1L << 30 ? $"{info.size / 1073741824.0:0.0} GB" : $"{info.size / 1048576.0:0} MB";
-                ci.Content = $"{label}  Â·  {size}" + (info.downloaded ? "  Â·  downloaded" : "");
-            }
-        }
+        RefreshQualityLabels();
+        SelectModelItem();
         _loading = true;
         HotkeyText.Text = (string?)_cfg["hotkey"] ?? "Ctrl+Alt+Space";
         AutostartSwitch.IsOn = Registry.CurrentUser.OpenSubKey(RunKey)?.GetValue(RunValue) != null;
@@ -341,12 +347,38 @@ public sealed partial class SettingsWindow : Window
         finally { ConnectButton.IsEnabled = true; }
     }
 
+    /// Size hints in the quality list (they differ per model).
+    private void RefreshQualityLabels()
+    {
+        foreach (var o in QualityCombo.Items)
+        {
+            if (o is ComboBoxItem { Tag: string tag } ci && _models.TryGetValue(tag, out var info))
+            {
+                var label = tag switch { "heavy" => "Heavy: most precise", "light" => "Light: smallest and fastest", _ => "Normal: recommended" };
+                var size = info.size >= 1L << 30 ? $"{info.size / 1073741824.0:0.0} GB" : $"{info.size / 1048576.0:0} MB";
+                ci.Content = $"{label}  Â·  {size}" + (info.downloaded ? "  Â·  downloaded" : "");
+            }
+        }
+    }
+
+    private void SelectModelItem()
+    {
+        foreach (var o in ModelCombo.Items)
+        {
+            if (o is ComboBoxItem { Tag: string id } ci && id == _model)
+            {
+                ModelCombo.SelectedItem = ci;
+                break;
+            }
+        }
+    }
+
     private void RefreshQualityInfo()
     {
         if (_models.TryGetValue(_quality, out var m))
         {
             QualityInfo.Text = (m.downloaded ? "Downloaded" : $"Not downloaded yet ({m.size / 1048576:N0} MB). MediaLake cannot index or search until the model is present")
-                + ". Changing the quality re-indexes everything.";
+                + ". Changing the model or the quality re-indexes everything.";
             DownloadNow.Visibility = m.downloaded || _downloading ? Visibility.Collapsed : Visibility.Visible;
         }
     }
@@ -358,10 +390,10 @@ public sealed partial class SettingsWindow : Window
         DownloadNow.Visibility = Visibility.Collapsed;
         DownloadBar.Value = 0;
         DownloadBar.Visibility = DownloadText.Visibility = CancelDownload.Visibility = Visibility.Visible;
-        QualityCombo.IsEnabled = false;
+        QualityCombo.IsEnabled = ModelCombo.IsEnabled = false;
         try
         {
-            await App.Core!.CallAsync("download_model", new { quality = tag });
+            await App.Core!.CallAsync("download_model", new { model = _model, quality = tag });
             _models[tag] = (true, _models[tag].size);
         }
         catch (Exception ex) { QualityInfo.Text = ex.Message; }
@@ -369,7 +401,8 @@ public sealed partial class SettingsWindow : Window
         {
             _downloading = false;
             DownloadBar.Visibility = DownloadText.Visibility = CancelDownload.Visibility = Visibility.Collapsed;
-            QualityCombo.IsEnabled = true;
+            QualityCombo.IsEnabled = ModelCombo.IsEnabled = true;
+            RefreshQualityLabels();
             RefreshQualityInfo();
         }
     }
@@ -379,14 +412,30 @@ public sealed partial class SettingsWindow : Window
         if (_loading || _downloading) return;
         var tag = (QualityCombo.SelectedItem as ComboBoxItem)?.Tag as string;
         if (tag == null || tag == _quality) return;
+        await SwitchAsync(_model, tag);
+    }
 
-        var needsDownload = _models.TryGetValue(tag, out var m) && !m.downloaded;
+    private async void Model_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (_loading || _downloading) return;
+        var id = (ModelCombo.SelectedItem as ComboBoxItem)?.Tag as string;
+        if (id == null || id == _model) return;
+        await SwitchAsync(id, _quality);
+    }
+
+    /// Switches model and/or quality after a confirmation (and a download when the files are missing).
+    private async Task SwitchAsync(string model, string tag)
+    {
+        var modelChanged = model != _model;
+        var tiers = _allModels.TryGetValue(model, out var t) ? t : new();
+        var needsDownload = tiers.TryGetValue(tag, out var m) && !m.downloaded;
+        var name = (ModelCombo.SelectedItem as ComboBoxItem)?.Content as string ?? model;
         var msg = needsDownload
-            ? $"\"{tag}\" needs a download of {m.size / 1048576:N0} MB. Afterwards the whole index is rebuilt with the new model."
-            : "The whole index is rebuilt with the new quality. Searching keeps working while this happens.";
+            ? $"This needs a download of {m.size / 1048576:N0} MB ({tag} quality). Afterwards the whole index is rebuilt with the new model."
+            : $"The whole index is rebuilt with the new {(modelChanged ? "model" : "quality")}. Searching keeps working while this happens.";
         var dlg = new ContentDialog
         {
-            Title = $"Switch to {tag} quality?",
+            Title = modelChanged ? $"Switch to {name}?" : $"Switch to {tag} quality?",
             Content = msg,
             PrimaryButtonText = needsDownload ? "Download and switch" : "Switch",
             CloseButtonText = "Cancel",
@@ -403,11 +452,11 @@ public sealed partial class SettingsWindow : Window
             _downloading = true;
             DownloadBar.Value = 0;
             DownloadBar.Visibility = DownloadText.Visibility = CancelDownload.Visibility = Visibility.Visible;
-            QualityCombo.IsEnabled = false;
+            QualityCombo.IsEnabled = ModelCombo.IsEnabled = false;
             try
             {
-                await App.Core!.CallAsync("download_model", new { quality = tag });
-                _models[tag] = (true, m.size);
+                await App.Core!.CallAsync("download_model", new { model, quality = tag });
+                tiers[tag] = (true, m.size);
             }
             catch (Exception ex)
             {
@@ -419,19 +468,30 @@ public sealed partial class SettingsWindow : Window
             {
                 _downloading = false;
                 DownloadBar.Visibility = DownloadText.Visibility = CancelDownload.Visibility = Visibility.Collapsed;
-                QualityCombo.IsEnabled = true;
+                QualityCombo.IsEnabled = ModelCombo.IsEnabled = true;
             }
         }
+        _model = model;
         _quality = tag;
+        _models = tiers;
+        _cfg["model"] = model;
         _cfg["quality"] = tag;
+        RefreshQualityLabels();
         RefreshQualityInfo();
         await SaveAsync();
+        if (modelChanged)
+        {
+            // the score mapping follows the model
+            try { _cfg = JsonNode.Parse((await App.Core!.CallAsync("get_settings")).GetRawText())!.AsObject(); }
+            catch (Exception ex) { QualityInfo.Text = ex.Message; }
+        }
     }
 
     private void RevertQuality()
     {
         _loading = true;
         QualityCombo.SelectedIndex = _quality switch { "heavy" => 0, "light" => 2, _ => 1 };
+        SelectModelItem();
         _loading = false;
         RefreshQualityInfo();
     }

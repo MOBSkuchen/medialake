@@ -19,6 +19,8 @@ use medialake_sync::member::engine::{Choice, ConflictPolicy, Report};
 use medialake_sync::member::frontend::{Frontend, Mirror};
 use medialake_sync::member::transport::{HostClient, HostCreds, Transport, pair_ex};
 use medialake_sync::member::{MemberConfig, MemberStore, RunningSync};
+#[cfg(target_os = "macos")]
+use medialake_mount::{MountConfig, MountSession, Store as MountStore, mountctl};
 use serde::Serialize;
 use tokio::runtime::Handle;
 use tokio::sync::broadcast;
@@ -37,8 +39,16 @@ pub struct SyncStatus {
     pub host_name: String,
     pub access: String,
     pub conflict_policy: String,
-    /// The frontend actually in use. Only `mirror` exists until the platform frontends land.
+    /// The frontend actually in use: `mount` (files appear at full size and load when opened) or
+    /// `mirror` (a plain folder with full copies).
     pub frontend: String,
+    /// Something the user should know that is not an error (the mount fell back to a folder …).
+    pub notice: String,
+    /// Bytes of file content held on this device by a mount (0 for a mirror), and its limit.
+    pub cached_bytes: u64,
+    pub cache_limit_bytes: u64,
+    /// Files changed here that the host has not received yet.
+    pub unsynced_files: u64,
     pub paused: bool,
     /// `starting`, `idle`, `syncing`, `paused`, `conflict`, `held`, or an error state: `offline` (host
     /// unreachable), `denied` (access revoked), `disk_full`, `error` (anything else).
@@ -98,8 +108,11 @@ pub struct BrowseItem {
     pub is_dir: bool,
     pub size: u64,
     pub mtime: i64,
-    /// `local` for a mirror: every file is a full copy.
+    /// `local` for a mirror (every file is a full copy). For a mount: `cloud`, `partial`, `cached`,
+    /// `dirty`, `local` or `dir`.
     pub state: String,
+    pub pinned: bool,
+    pub cached_bytes: u64,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -153,10 +166,22 @@ pub struct SyncManager {
     status: Arc<Mutex<HashMap<String, SyncStatus>>>,
     hosting: tokio::sync::Mutex<Option<Hosting>>,
     hosting_error: Mutex<String>,
+    #[cfg(target_os = "macos")]
+    mounts: tokio::sync::Mutex<HashMap<String, MountSession>>,
+    #[cfg(target_os = "macos")]
+    stores: Mutex<HashMap<String, Arc<MountStore>>>,
+    #[cfg(target_os = "macos")]
+    registry: mountctl::Registry,
 }
 
 /// Maps an engine / transport error message to the state the UI shows (§12 X2: host unreachable,
 /// disk full, revoked access). The engine retries with backoff in every one of these states.
+impl crate::indexer::ContentGate for SyncManager {
+    fn would_download(&self, path: &Path) -> bool {
+        SyncManager::would_download(self, path)
+    }
+}
+
 pub fn classify_error(msg: &str) -> &'static str {
     let m = msg.to_lowercase();
     if m.contains("no space left") || m.contains("not enough space") || m.contains("disk full") || m.contains("quota exceeded") {
@@ -193,6 +218,8 @@ impl SyncManager {
     pub fn new(cfg: Arc<RwLock<Config>>, config_file: PathBuf, root: PathBuf, events: broadcast::Sender<Event>) -> anyhow::Result<Arc<SyncManager>> {
         let store = MemberStore::open(&root.join("sync"))?;
         Ok(Arc::new(SyncManager {
+            #[cfg(target_os = "macos")]
+            registry: mountctl::Registry::new(root.join("sync").join("mounts.json")),
             cfg,
             config_file,
             root,
@@ -204,6 +231,10 @@ impl SyncManager {
             status: Arc::new(Mutex::new(HashMap::new())),
             hosting: tokio::sync::Mutex::new(None),
             hosting_error: Mutex::new(String::new()),
+            #[cfg(target_os = "macos")]
+            mounts: tokio::sync::Mutex::new(HashMap::new()),
+            #[cfg(target_os = "macos")]
+            stores: Mutex::new(HashMap::new()),
         }))
     }
 
@@ -289,13 +320,23 @@ impl SyncManager {
 
     /// Starts every joined sync that is not paused, and hosting if folders are shared.
     pub async fn start(self: &Arc<Self>) {
+        // a crash or force-quit leaves mounts whose server is gone: remove them before mounting again
+        #[cfg(target_os = "macos")]
+        {
+            let reg = mountctl::Registry::new(self.root.join("sync").join("mounts.json"));
+            let gone = tokio::task::spawn_blocking(move || reg.cleanup_dead()).await.unwrap_or_default();
+            for p in gone {
+                tracing::info!("removed a stale mount at {}", p.display());
+            }
+        }
         let folders = self.cfg.read().unwrap().sync.folders.clone();
         for f in folders {
             self.init_status(&f);
-            if !f.paused {
-                if let Err(e) = self.start_folder(&f) {
-                    self.fail(&f, e);
-                }
+            // a paused sync keeps its volume (files stay reachable); only the engine is off
+            if f.paused {
+                self.ensure_volume_only(&f).await;
+            } else if let Err(e) = self.start_folder(&f).await {
+                self.fail(&f, e);
             }
         }
         if let Err(e) = self.ensure_hosting().await {
@@ -308,6 +349,13 @@ impl SyncManager {
     pub async fn stop(&self) {
         let runs: Vec<RunningSync> = self.running.lock().unwrap().drain().map(|(_, r)| r).collect();
         let _ = tokio::task::spawn_blocking(move || drop(runs)).await;
+        #[cfg(target_os = "macos")]
+        {
+            let ids: Vec<String> = self.mounts.lock().await.keys().cloned().collect();
+            for id in ids {
+                self.teardown_mount(&id).await;
+            }
+        }
         if let Some(h) = self.hosting.lock().await.take() {
             h.server.abort();
             h.background.abort();
@@ -316,7 +364,9 @@ impl SyncManager {
 
     fn init_status(&self, f: &SyncFolderCfg) {
         let host_name = self.cfg.read().unwrap().sync.hosts.iter().find(|h| h.id == f.host_id).map(|h| h.name.clone()).unwrap_or_default();
-        let pending = MemberDb::open(&self.store.state_dir(&f.sync_id).join("state.db")).map(|d| d.conflicts().len()).unwrap_or(0);
+        // opening a missing database would create it, and "has a state database" means "has run before"
+        let db = self.store.state_dir(&f.sync_id).join("state.db");
+        let pending = if db.exists() { MemberDb::open(&db).map(|d| d.conflicts().len()).unwrap_or(0) } else { 0 };
         let mut m = self.status.lock().unwrap();
         let s = m.entry(f.sync_id.clone()).or_default();
         s.sync_id = f.sync_id.clone();
@@ -326,7 +376,9 @@ impl SyncManager {
         s.host_name = host_name;
         s.access = f.access.clone();
         s.conflict_policy = f.conflict.clone();
-        s.frontend = "mirror".into();
+        if s.frontend.is_empty() {
+            s.frontend = self.resolved_frontend(f).into();
+        }
         s.paused = f.paused;
         s.pending_conflicts = pending;
         s.state = if f.paused { "paused".into() } else { "starting".into() };
@@ -344,14 +396,180 @@ impl SyncManager {
         self.emit(Event::SyncError { sync_id: f.sync_id.clone(), message: msg });
     }
 
-    fn start_folder(&self, f: &SyncFolderCfg) -> Result<(), String> {
+    /// What `frontend = "auto"` means for this sync: what it ran with before (so a sync never changes
+    /// where its files are by itself), a mirror for syncs that predate mounts, else the platform's best.
+    fn resolved_frontend(&self, f: &SyncFolderCfg) -> &'static str {
+        match f.frontend.as_str() {
+            "mirror" => "mirror",
+            "mount" => "mount",
+            _ => {
+                let dir = self.store.state_dir(&f.sync_id);
+                match std::fs::read_to_string(dir.join("frontend")).ok().as_deref().map(str::trim) {
+                    Some("mount") => "mount",
+                    Some("mirror") => "mirror",
+                    _ if dir.join("state.db").exists() => "mirror",
+                    _ if cfg!(target_os = "macos") => "mount",
+                    _ => "mirror",
+                }
+            }
+        }
+    }
+
+    /// Remembers which frontend a sync ran with. A different one starts from a clean engine state: the
+    /// files are somewhere else now, and "everything vanished" must not be read as "everything deleted".
+    fn note_frontend(&self, sync_id: &str, kind: &str) {
+        let dir = self.store.state_dir(sync_id);
+        let _ = std::fs::create_dir_all(&dir);
+        let file = dir.join("frontend");
+        let before = std::fs::read_to_string(&file).ok().map(|s| s.trim().to_string());
+        let changed = match &before {
+            Some(b) => b != kind,
+            None => dir.join("state.db").exists() && kind != "mirror",
+        };
+        if changed {
+            for n in ["state.db", "state.db-wal", "state.db-shm"] {
+                let _ = std::fs::remove_file(dir.join(n));
+            }
+            let _ = std::fs::remove_dir_all(dir.join("tmp"));
+        }
+        if before.as_deref() != Some(kind) {
+            let _ = std::fs::write(&file, kind);
+        }
+    }
+
+    async fn frontend_for(&self, f: &SyncFolderCfg, tr: Arc<dyn Transport>) -> (Arc<dyn Frontend>, &'static str, String) {
+        let kind = self.resolved_frontend(f);
+        let _ = &tr;
+        #[cfg(target_os = "macos")]
+        if kind == "mount" {
+            return match self.ensure_mount(f, tr).await {
+                Ok((fe, note)) => (fe, "mount", note.unwrap_or_default()),
+                Err(e) => {
+                    tracing::warn!("mount of {} failed: {e}", f.name);
+                    (Arc::new(Mirror::new(&f.path)), "mirror", format!("Could not mount {}: {e}. It is shown as a normal folder instead.", f.path.display()))
+                }
+            };
+        }
+        #[cfg(not(target_os = "macos"))]
+        if kind == "mount" {
+            return (Arc::new(Mirror::new(&f.path)), "mirror", "Mounting is only available on macOS; showing a normal folder.".into());
+        }
+        (Arc::new(Mirror::new(&f.path)), "mirror", String::new())
+    }
+
+    /// The volume of a paused sync stays up.
+    async fn ensure_volume_only(&self, f: &SyncFolderCfg) {
+        #[cfg(target_os = "macos")]
+        if self.resolved_frontend(f) == "mount" {
+            if let Ok(client) = self.client(&f.host_id) {
+                let tr: Arc<dyn Transport> = Arc::new(client.transport(&f.sync_id));
+                let _ = self.ensure_mount(f, tr).await;
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = f;
+    }
+
+    /// A cache is only trusted together with the engine state it was filled under. If the state database
+    /// is gone (reset, reinstall, a new device with an old cache folder) the engine would read every
+    /// cached file as a local addition and push stale content, so the old tree is set aside instead.
+    /// Returns where it went, if it did.
+    #[cfg(target_os = "macos")]
+    fn prepare_cache(&self, sync_id: &str) -> Option<PathBuf> {
+        let state = self.store.state_dir(sync_id);
+        let cache = self.cache_dir(sync_id);
+        let read = |p: PathBuf| std::fs::read_to_string(p).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        let (want, have) = (read(state.join("cache-id")), read(cache.join("owner")));
+        if state.join("state.db").exists() && want.is_some() && want == have {
+            return None;
+        }
+        let mut aside = None;
+        let tree = cache.join("tree");
+        let has_files = std::fs::read_dir(&tree).map(|mut r| r.next().is_some()).unwrap_or(false);
+        if has_files {
+            let dest = cache.join(format!("set-aside-{}", medialake_sync::util::now_secs()));
+            if std::fs::create_dir_all(&dest).is_ok() && std::fs::rename(&tree, dest.join("tree")).is_ok() {
+                aside = Some(dest);
+            } else {
+                let _ = std::fs::remove_dir_all(&tree);
+            }
+        }
+        for n in ["index.db", "index.db-wal", "index.db-shm"] {
+            let _ = std::fs::remove_file(cache.join(n));
+        }
+        let id = medialake_sync::util::random_id();
+        let _ = std::fs::create_dir_all(&state);
+        let _ = std::fs::create_dir_all(&cache);
+        let _ = std::fs::write(state.join("cache-id"), &id);
+        let _ = std::fs::write(cache.join("owner"), &id);
+        aside
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn ensure_mount(&self, f: &SyncFolderCfg, tr: Arc<dyn Transport>) -> Result<(Arc<dyn Frontend>, Option<String>), String> {
+        let mut mounts = self.mounts.lock().await;
+        if let Some(s) = mounts.get(&f.sync_id) {
+            return Ok((s.frontend(), None));
+        }
+        let aside = self.prepare_cache(&f.sync_id);
+        let cfg = MountConfig {
+            sync_id: f.sync_id.clone(),
+            name: f.name.clone(),
+            point: f.path.clone(),
+            cache_dir: self.cache_dir(&f.sync_id),
+            read_only: f.access != "rw",
+            limit_bytes: f.cache_limit_gb.saturating_mul(1 << 30),
+        };
+        let session = MountSession::start(cfg, tr).await.map_err(|e| format!("{e:#}"))?;
+        self.registry.record(&f.path);
+        let events = self.events.clone();
+        let sync_id = f.sync_id.clone();
+        session.store().set_problem_handler(Some(Arc::new(move |m| {
+            let _ = events.send(Event::SyncError { sync_id: sync_id.clone(), message: m });
+        })));
+        self.stores.lock().unwrap().insert(f.sync_id.clone(), session.store().clone());
+        let fe: Arc<dyn Frontend> = session.frontend();
+        mounts.insert(f.sync_id.clone(), session);
+        let note = aside.map(|d| format!("Files left over from an earlier session were set aside in {}.", d.display()));
+        Ok((fe, note))
+    }
+
+    #[cfg(target_os = "macos")]
+    fn cache_dir(&self, sync_id: &str) -> PathBuf {
+        // the system's cache folder for a normal install; a custom data folder (tests, MEDIALAKE_HOME)
+        // keeps its cache with it
+        let base = if self.root == medialake_proto::platform::data_dir() { medialake_proto::platform::cache_dir() } else { self.root.join("cache") };
+        base.join("sync").join(sync_id)
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn teardown_mount(&self, sync_id: &str) -> Option<PathBuf> {
+        let session = self.mounts.lock().await.remove(sync_id)?;
+        self.stores.lock().unwrap().remove(sync_id);
+        let point = session.point().to_path_buf();
+        session.stop().await;
+        self.registry.forget(&point);
+        Some(point)
+    }
+
+    async fn start_folder(&self, f: &SyncFolderCfg) -> Result<(), String> {
         if self.running.lock().unwrap().contains_key(&f.sync_id) {
             return Ok(());
         }
         let client = self.client(&f.host_id)?;
         let m = to_member(f);
-        let engine = self.store.engine(&m, &client, &self.device()).map_err(|e| format!("{e:#}"))?;
-        let fe: Arc<dyn Frontend> = Arc::new(Mirror::new(&f.path));
+        let tr: Arc<dyn Transport> = Arc::new(client.transport(&f.sync_id));
+        self.note_frontend(&f.sync_id, self.resolved_frontend(f));
+        let (fe, kind, notice) = self.frontend_for(f, tr.clone()).await;
+        self.note_frontend(&f.sync_id, kind);
+        {
+            let mut st = self.status.lock().unwrap();
+            if let Some(s) = st.get_mut(&f.sync_id) {
+                s.frontend = kind.into();
+                s.notice = notice;
+            }
+        }
+        let engine = self.store.engine_with(&m, &self.device(), fe.clone(), tr).map_err(|e| format!("{e:#}"))?;
         let cb = self.report_callback(f);
         let rs = RunningSync::start(engine, fe, &client, &f.sync_id, cb);
         self.running.lock().unwrap().insert(f.sync_id.clone(), rs);
@@ -424,6 +642,7 @@ impl SyncManager {
         }
     }
 
+    /// Stops the engine (the volume of a mount stays).
     async fn stop_folder(&self, sync_id: &str) {
         let rs = self.running.lock().unwrap().remove(sync_id);
         if let Some(rs) = rs {
@@ -516,6 +735,8 @@ impl SyncManager {
         let frontend = match frontend {
             "" | "auto" => "auto",
             "mirror" => "mirror",
+            "mount" if cfg!(target_os = "macos") => "mount",
+            "mount" => return Err("mounting is only available on macOS".into()),
             other => return Err(format!("unknown frontend {other:?}")),
         };
         let client = self.client(host_id)?;
@@ -545,13 +766,28 @@ impl SyncManager {
         };
         self.update(|c| c.sync.folders.push(f.clone()))?;
         self.init_status(&f);
-        self.start_folder(&f)?;
+        self.start_folder(&f).await?;
         Ok(f)
     }
 
     pub async fn leave(&self, sync_id: &str, keep_files: bool) -> Result<(), String> {
         let f = self.folder(sync_id)?;
         self.stop_folder(&f.sync_id).await;
+        // a mount goes away; what was downloaded is kept as plain files if asked for
+        #[cfg(target_os = "macos")]
+        {
+            let store = self.stores.lock().unwrap().get(&f.sync_id).cloned();
+            if self.teardown_mount(&f.sync_id).await.is_some() {
+                if let Some(store) = store {
+                    if keep_files {
+                        let (dest, s2) = (f.path.clone(), store.clone());
+                        let r = tokio::task::spawn_blocking(move || s2.export_to(&dest)).await.map_err(|e| e.to_string())?;
+                        r.map_err(|e| format!("keeping the downloaded files: {e:#}"))?;
+                    }
+                }
+                let _ = std::fs::remove_dir_all(self.cache_dir(&f.sync_id));
+            }
+        }
         self.update(|c| c.sync.folders.retain(|x| x.sync_id != f.sync_id))?;
         self.status.lock().unwrap().remove(&f.sync_id);
         let _ = std::fs::remove_dir_all(self.store.state_dir(&f.sync_id));
@@ -570,6 +806,15 @@ impl SyncManager {
                 return Err("conflict policy must be server_wins or ask".into());
             }
         }
+        if let Some(p) = patch["frontend"].as_str() {
+            if !matches!(p, "auto" | "mirror" | "mount") {
+                return Err("frontend must be auto, mirror or mount".into());
+            }
+            if p != f.frontend {
+                return Err("changing how a sync is shown means leaving and joining it again".into());
+            }
+        }
+        let engine_change = patch["conflict"].as_str().is_some_and(|p| p != f.conflict) || patch["paused"].as_bool().is_some_and(|p| p != f.paused);
         let updated = self.update(|c| {
             let x = c.sync.folders.iter_mut().find(|x| x.sync_id == id).unwrap();
             if let Some(p) = patch["conflict"].as_str() {
@@ -587,10 +832,18 @@ impl SyncManager {
             x.clone()
         })?;
         self.init_status(&updated);
+        #[cfg(target_os = "macos")]
+        if let Some(s) = self.stores.lock().unwrap().get(&id) {
+            s.set_limit(updated.cache_limit_gb.saturating_mul(1 << 30));
+            s.enforce_limit();
+        }
+        if !engine_change {
+            return Ok(updated);
+        }
         // a changed policy or pause state needs a fresh engine
         self.stop_folder(&id).await;
         if !updated.paused {
-            self.start_folder(&updated)?;
+            self.start_folder(&updated).await?;
         } else {
             self.emit(Event::SyncState { sync_id: id, name: updated.name.clone(), state: "paused".into(), detail: String::new() });
         }
@@ -620,7 +873,21 @@ impl SyncManager {
     pub fn status(&self) -> Vec<SyncStatus> {
         let folders = self.cfg.read().unwrap().sync.folders.clone();
         let m = self.status.lock().unwrap();
-        folders.iter().filter_map(|f| m.get(&f.sync_id).cloned()).collect()
+        #[allow(unused_mut)]
+        let mut out: Vec<SyncStatus> = folders.iter().filter_map(|f| m.get(&f.sync_id).cloned()).collect();
+        #[cfg(target_os = "macos")]
+        {
+            let stores = self.stores.lock().unwrap();
+            for s in out.iter_mut() {
+                if let Some(st) = stores.get(&s.sync_id) {
+                    let n = st.stats();
+                    s.cached_bytes = n.cached_bytes;
+                    s.cache_limit_bytes = n.limit_bytes;
+                    s.unsynced_files = n.dirty_files;
+                }
+            }
+        }
+        out
     }
 
     // ---------------- conflicts ----------------
@@ -675,12 +942,29 @@ impl SyncManager {
 
     // ---------------- files ----------------
 
-    /// Entries of a folder of a mirror (every file is a full copy on this device).
+    /// Entries of a folder, with what each one costs on this device (mount) or `local` (mirror).
     pub fn browse(&self, sync_id: &str, rel: &str) -> Result<Vec<BrowseItem>, String> {
         let f = self.folder(sync_id)?;
         let rel = rel.trim_matches('/');
         if !rel.is_empty() {
             normalize_path(rel).map_err(|e| e.to_string())?;
+        }
+        #[cfg(target_os = "macos")]
+        if let Some(store) = self.stores.lock().unwrap().get(&f.sync_id).cloned() {
+            let items = store.browse(rel).map_err(|e| format!("{e:#}"))?;
+            return Ok(items
+                .into_iter()
+                .map(|i| BrowseItem {
+                    name: i.name,
+                    path: i.path,
+                    is_dir: i.is_dir,
+                    size: i.size,
+                    mtime: i.mtime,
+                    state: i.state.into(),
+                    pinned: i.pinned,
+                    cached_bytes: i.cached_bytes,
+                })
+                .collect());
         }
         let dir = if rel.is_empty() { f.path.clone() } else { f.path.join(rel) };
         let mut out = vec![];
@@ -698,10 +982,94 @@ impl SyncManager {
                 size: if m.is_dir() { 0 } else { m.len() },
                 mtime: medialake_sync::util::mtime_ms(&m),
                 state: "local".into(),
+                pinned: false,
+                cached_bytes: if m.is_dir() { 0 } else { m.len() },
             });
         }
         out.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())));
         Ok(out)
+    }
+
+    /// "Keep on this device": fetches `rel` (a file, a folder, or `""` for everything) now and keeps it
+    /// out of cache eviction. Mounts only.
+    pub fn pin(&self, sync_id: &str, rel: &str) -> Result<(), String> {
+        let f = self.folder(sync_id)?;
+        let rel = rel.trim_matches('/');
+        if !rel.is_empty() {
+            normalize_path(rel).map_err(|e| e.to_string())?;
+        }
+        #[cfg(target_os = "macos")]
+        if let Some(store) = self.stores.lock().unwrap().get(&f.sync_id).cloned() {
+            return store.pin(rel).map_err(|e| format!("{e:#}"));
+        }
+        let _ = f;
+        Err("this sync is a plain folder: every file is always kept on this device".into())
+    }
+
+    /// "Free up space": the content may be removed from the cache again (it stays listed).
+    pub fn unpin(&self, sync_id: &str, rel: &str, evict_now: bool) -> Result<(), String> {
+        let f = self.folder(sync_id)?;
+        let rel = rel.trim_matches('/');
+        #[cfg(target_os = "macos")]
+        if let Some(store) = self.stores.lock().unwrap().get(&f.sync_id).cloned() {
+            store.unpin(rel).map_err(|e| format!("{e:#}"))?;
+            if evict_now {
+                let rel = rel.to_string();
+                std::thread::spawn(move || {
+                    // a folder: every file below it; a file: itself
+                    let mut stack = vec![rel];
+                    while let Some(p) = stack.pop() {
+                        match store.browse(&p) {
+                            Ok(items) => {
+                                for i in items {
+                                    if i.is_dir {
+                                        stack.push(i.path);
+                                    } else {
+                                        let _ = store.evict(&i.path);
+                                    }
+                                }
+                            }
+                            Err(_) => {
+                                let _ = store.evict(&p);
+                            }
+                        }
+                    }
+                });
+            }
+            return Ok(());
+        }
+        let _ = (f, evict_now);
+        Err("this sync is a plain folder: every file is always kept on this device".into())
+    }
+
+    /// (cache tree, mount point) of every mounted sync: the local tree is what can be watched.
+    #[cfg(target_os = "macos")]
+    pub fn mount_trees(&self) -> Vec<(PathBuf, PathBuf)> {
+        let folders = self.cfg.read().unwrap().sync.folders.clone();
+        let stores = self.stores.lock().unwrap();
+        folders.iter().filter_map(|f| stores.get(&f.sync_id).map(|s| (s.tree().to_path_buf(), f.path.clone()))).collect()
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub fn mount_trees(&self) -> Vec<(PathBuf, PathBuf)> {
+        vec![]
+    }
+
+    /// True if reading `path` (somewhere inside a mounted sync) would have to download it. The search
+    /// indexer asks so that indexing never downloads anything.
+    pub fn would_download(&self, path: &Path) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            let folders = self.cfg.read().unwrap().sync.folders.clone();
+            let stores = self.stores.lock().unwrap();
+            for f in folders {
+                if let (Some(store), Ok(rel)) = (stores.get(&f.sync_id), path.strip_prefix(&f.path)) {
+                    return rel.to_str().is_some_and(|r| store.is_dehydrated(r));
+                }
+            }
+        }
+        let _ = path;
+        false
     }
 
     // ---------------- history (on the host) ----------------

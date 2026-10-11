@@ -25,10 +25,14 @@ Local file, data, media search based on embeddings.
   *members* mirror it and push their own changes. Same listener, certificate and pairing as embedding; pairing
   codes carry per-sync read-write / read-only grants.
 - Conflicts never discard a version; backups (time snapshots or last N versions, content-addressed) live on the host.
-- The engine is platform-free; a frontend (plain mirror folder today, Cloud Files / mount later) only shows the result.
+- The engine is platform-free; a frontend only shows the result: a plain mirror folder (everywhere), or on macOS a
+  mounted volume whose files load when opened (an NFSv3 server inside the app, mounted by the system; nothing to
+  install). Windows Cloud Files is the planned equivalent.
+- Searching a synced folder never downloads it: files that are not on this device are indexed by name and get their
+  content embedding once something else has fetched them.
 
 ## UI
-Client UI uses the native toolkit of each platform: WinUI on Windows, SwiftUI/AppKit on macOS (planned, see `plan2.md`).
+Client UI uses the native toolkit of each platform: WinUI on Windows, SwiftUI/AppKit on macOS (see `plan2.md`).
 Both hosts load the same rust client; only the UI differs.
 The app is opened by using a keyboard shortcut (defined during installation).
 
@@ -41,10 +45,13 @@ Very much like Spotlight on Mac - but only for files.
 At the top left is a large, fat text "MediaLake" and at the right is a settings button.
 
 ### Settings menu
-Contains 3 parts:
-1. General: Only keyboard shortcut currently
+Contains 4 parts:
+1. General: keyboard shortcut, start at login, search on/off
 2. Model: Options for local and also remote. Remote prompts for an input code. More on that later. Also add a dropdown for the model to use and a confidence threshold slider.
 3. Index: Select (also recursively) and deselect directories to index. Also add 2 sliders for index timeout after modification and for modification size (in bytes)
+4. Sync: joined folders (state, pause, conflict policy, "keep on this Mac" browser, history, leave), conflicts, sharing
+   folders from this computer (invite a device, per-device access), bandwidth limits. The first start asks whether
+   MediaLake is for search, sync, or both.
 
 ## Installer
 The installer program installs the client+server combo, as well as downloading the default model and prompting the user for a keyboard shortcut.

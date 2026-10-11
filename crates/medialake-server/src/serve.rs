@@ -7,6 +7,7 @@ use std::sync::Arc;
 use anyhow::{Context, bail};
 use bierpc::rpc::{RpcServer, ServerConfig};
 use medialake_proto::MAX_MESSAGE_BYTES;
+use medialake_proto::models::Model;
 use medialake_proto::pairing::PairingCode;
 use medialake_proto::pinning;
 use medialake_proto::sync::Access;
@@ -102,12 +103,12 @@ pub async fn serve(common: &Common, a: ServeArgs) -> anyhow::Result<()> {
     } else {
         true // start_engine reports which file is missing
     };
-    let (engine, info) = if embed {
-        let (engine, quality) = start_engine(common)?;
-        let info = server_info(&engine, quality);
-        (Some(engine), Some(info))
+    let (engine, info, model) = if embed {
+        let (engine, set) = start_engine(common)?;
+        let info = server_info(&engine, &set);
+        (Some(engine), Some(info), set.model_id)
     } else {
-        (None, None)
+        (None, None, Model::parse(&common.model).unwrap_or_default())
     };
 
     let tls = pinning::server_tls(ident.cert_der.clone(), ident.key_der.clone()).map_err(anyhow::Error::msg)?;
@@ -118,6 +119,7 @@ pub async fn serve(common: &Common, a: ServeArgs) -> anyhow::Result<()> {
     let background = sync.start_background();
     let svc = Service {
         engine: engine.clone(),
+        model,
         auth: Arc::new(Auth { local_token: None, remote: Some(state.clone()) }),
         info,
         sync: Some(sync.clone()),

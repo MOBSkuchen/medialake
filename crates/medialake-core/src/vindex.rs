@@ -3,8 +3,8 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-use medialake_proto::DIMS;
 use usearch::{Index, IndexOptions, MetricKind, ScalarKind};
 
 use crate::store::Store;
@@ -12,11 +12,13 @@ use crate::store::Store;
 pub struct VectorIndex {
     index: Mutex<Index>,
     path: PathBuf,
+    /// Vector length of the active model.
+    dims: AtomicUsize,
 }
 
-fn new_index() -> Result<Index, String> {
+fn new_index(dims: usize) -> Result<Index, String> {
     let options = IndexOptions {
-        dimensions: DIMS,
+        dimensions: dims,
         metric: MetricKind::Cos,
         quantization: ScalarKind::F16,
         connectivity: 0,
@@ -29,31 +31,37 @@ fn new_index() -> Result<Index, String> {
 
 impl VectorIndex {
     /// Loads the index file if it matches the database, otherwise rebuilds it from SQLite.
-    pub fn open(path: &Path, store: &Store) -> Result<VectorIndex, String> {
+    pub fn open(path: &Path, store: &Store, dims: usize) -> Result<VectorIndex, String> {
         let (_, chunks) = store.counts().map_err(|e| e.to_string())?;
         let clean = store.meta("index_clean").as_deref() == Some("1");
         if clean && path.exists() {
-            if let Ok(idx) = new_index() {
-                if idx.load(path.to_str().unwrap()).is_ok() && idx.size() as u64 == chunks {
+            if let Ok(idx) = new_index(dims) {
+                if idx.load(path.to_str().unwrap()).is_ok() && idx.dimensions() == dims && idx.size() as u64 == chunks {
                     tracing::info!("loaded vector index ({} vectors)", idx.size());
-                    return Ok(VectorIndex { index: Mutex::new(idx), path: path.to_path_buf() });
+                    return Ok(VectorIndex { index: Mutex::new(idx), path: path.to_path_buf(), dims: AtomicUsize::new(dims) });
                 }
             }
             tracing::warn!("vector index file inconsistent, rebuilding");
         }
-        let v = VectorIndex { index: Mutex::new(new_index()?), path: path.to_path_buf() };
+        let v = VectorIndex { index: Mutex::new(new_index(dims)?), path: path.to_path_buf(), dims: AtomicUsize::new(dims) };
         v.rebuild(store)?;
         Ok(v)
     }
 
+    /// Vector length used from the next [`VectorIndex::rebuild`] on (the model changed).
+    pub fn set_dims(&self, dims: usize) {
+        self.dims.store(dims, Ordering::Relaxed);
+    }
+
     pub fn rebuild(&self, store: &Store) -> Result<(), String> {
-        let fresh = new_index()?;
+        let dims = self.dims.load(Ordering::Relaxed);
+        let fresh = new_index(dims)?;
         let (_, n) = store.counts().map_err(|e| e.to_string())?;
         fresh.reserve((n as usize).max(1024) * 5 / 4).map_err(|e| e.to_string())?;
         let mut err = None;
         store
             .for_each_vector(|id, v| {
-                if v.len() == DIMS {
+                if v.len() == dims {
                     if let Err(e) = fresh.add(id as u64, &v) {
                         err = Some(e.to_string());
                     }
@@ -70,6 +78,9 @@ impl VectorIndex {
 
     pub fn add(&self, id: i64, v: &[f32]) -> Result<(), String> {
         let idx = self.index.lock().unwrap();
+        if v.len() != idx.dimensions() {
+            return Err(format!("vector has {} dimensions, the index {}", v.len(), idx.dimensions()));
+        }
         if idx.size() + 1 > idx.capacity() {
             idx.reserve((idx.capacity() * 2).max(4096)).map_err(|e| e.to_string())?;
         }
@@ -83,7 +94,7 @@ impl VectorIndex {
     /// Returns `(chunk id, cosine similarity)`, best first.
     pub fn search(&self, q: &[f32], k: usize) -> Vec<(i64, f32)> {
         let idx = self.index.lock().unwrap();
-        if idx.size() == 0 {
+        if idx.size() == 0 || q.len() != idx.dimensions() {
             return vec![];
         }
         match idx.search(q, k) {

@@ -109,3 +109,53 @@ async fn watcher_and_reembed_rules() {
     core.shutdown().await;
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+/// plan2 §3.2: renames arrive unpaired from FSEvents. A pure rename or move must keep the content
+/// vectors; a move out of the index removes the file; a directory rename moves everything below it.
+#[tokio::test]
+#[ignore]
+async fn renames_and_moves() {
+    let tmp = std::env::temp_dir().join(format!("medialake-e2e-mv-{}", std::process::id()));
+    let (home, a, b, outside) = (tmp.join("home"), tmp.join("a"), tmp.join("b"), tmp.join("outside"));
+    for d in [&a, &b, &outside] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    let sub = a.join("project");
+    std::fs::create_dir_all(&sub).unwrap();
+    let one = a.join("one.txt");
+    let inner = sub.join("inner.txt");
+    std::fs::write(&one, big_text("one", 120)).unwrap();
+    std::fs::write(&inner, big_text("inner", 120)).unwrap();
+
+    let core = start(&home, |_| {}).await;
+    core.add_dir(a.clone(), true).await.unwrap();
+    core.add_dir(b.clone(), true).await.unwrap();
+    settle(&core).await;
+    let content = |v: Vec<(String, Vec<u8>)>| v.into_iter().filter(|(k, _)| k == "text").collect::<Vec<_>>();
+    let one_content = content(chunk_ids(&core, &one));
+    let inner_content = content(chunk_ids(&core, &inner));
+    assert!(!one_content.is_empty() && !inner_content.is_empty());
+
+    // between two indexed roots
+    let one_b = b.join("one.txt");
+    std::fs::rename(&one, &one_b).unwrap();
+    settle(&core).await;
+    assert!(chunk_ids(&core, &one).is_empty());
+    assert_eq!(content(chunk_ids(&core, &one_b)), one_content, "move between roots must keep content vectors");
+
+    // a directory with files in it
+    let sub2 = a.join("renamed-project");
+    std::fs::rename(&sub, &sub2).unwrap();
+    settle(&core).await;
+    assert!(chunk_ids(&core, &inner).is_empty());
+    assert_eq!(content(chunk_ids(&core, &sub2.join("inner.txt"))), inner_content, "directory rename must keep content vectors");
+
+    // out of the index
+    std::fs::rename(&one_b, outside.join("one.txt")).unwrap();
+    settle(&core).await;
+    assert!(chunk_ids(&core, &one_b).is_empty());
+    assert!(chunk_ids(&core, &outside.join("one.txt")).is_empty());
+
+    core.shutdown().await;
+    let _ = std::fs::remove_dir_all(&tmp);
+}

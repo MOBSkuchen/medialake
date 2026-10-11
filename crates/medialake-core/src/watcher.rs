@@ -18,20 +18,50 @@ use medialake_sync::watch::{FsChange as Change, normalize};
 pub struct FileWatcher {
     watcher: std::sync::Mutex<RecommendedWatcher>,
     watched: std::sync::Mutex<Vec<IndexedDir>>,
+    /// (canonical root, root as configured), for roots that sit behind a symlink such as `/tmp`, `/var`
+    /// or a symlinked home folder. FSEvents reports resolved paths, the index uses the configured ones.
+    #[cfg(target_os = "macos")]
+    aliases: Arc<std::sync::Mutex<Vec<(PathBuf, PathBuf)>>>,
+    /// Mounted sync volumes: (cache tree, mount point). FSEvents does not report changes inside an NFS
+    /// mount, so the local tree behind it is watched and its paths are mapped to the mount point.
+    #[cfg(target_os = "macos")]
+    mounts: Arc<std::sync::Mutex<Vec<(PathBuf, PathBuf)>>>,
 }
 
 impl FileWatcher {
     pub fn start(indexer: Arc<Indexer>, cfg: Arc<RwLock<Config>>) -> notify::Result<Arc<FileWatcher>> {
         let (tx, mut rx) = mpsc::unbounded_channel::<Change>();
+        #[cfg(target_os = "macos")]
+        let aliases: Arc<std::sync::Mutex<Vec<(PathBuf, PathBuf)>>> = Default::default();
+        #[cfg(target_os = "macos")]
+        let event_aliases = aliases.clone();
+        #[cfg(target_os = "macos")]
+        let mounts: Arc<std::sync::Mutex<Vec<(PathBuf, PathBuf)>>> = Default::default();
+        #[cfg(target_os = "macos")]
+        let event_mounts = mounts.clone();
         let watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-            let Ok(ev) = res else { return };
+            #[allow(unused_mut)]
+            let Ok(mut ev) = res else { return };
             tracing::debug!("fs event {:?} {:?}", ev.kind, ev.paths);
+            #[cfg(target_os = "macos")]
+            {
+                let a = event_aliases.lock().unwrap();
+                let m = event_mounts.lock().unwrap();
+                ev.paths = std::mem::take(&mut ev.paths).into_iter().map(|p| unalias(&a, unalias(&m, p))).collect();
+            }
             // rename pairing and the FSEvents special case live in medialake-sync, shared with sync
             for ch in normalize(ev) {
                 let _ = tx.send(ch);
             }
         })?;
-        let fw = Arc::new(FileWatcher { watcher: std::sync::Mutex::new(watcher), watched: std::sync::Mutex::new(vec![]) });
+        let fw = Arc::new(FileWatcher {
+            watcher: std::sync::Mutex::new(watcher),
+            watched: std::sync::Mutex::new(vec![]),
+            #[cfg(target_os = "macos")]
+            aliases,
+            #[cfg(target_os = "macos")]
+            mounts,
+        });
 
         // debouncer: path -> due time; ticks every 250 ms
         tokio::spawn(async move {
@@ -95,6 +125,24 @@ impl FileWatcher {
         Ok(fw)
     }
 
+    /// Replaces the set of mounted sync volumes whose cache trees stand in for the mount points.
+    #[cfg(target_os = "macos")]
+    pub fn set_mounts(&self, pairs: &[(PathBuf, PathBuf)]) {
+        let mut w = self.watcher.lock().unwrap();
+        let mut cur = self.mounts.lock().unwrap();
+        for (tree, _) in cur.iter() {
+            let _ = w.unwatch(tree);
+        }
+        cur.clear();
+        for (tree, point) in pairs {
+            let canon = tree.canonicalize().unwrap_or_else(|_| tree.clone());
+            match w.watch(&canon, RecursiveMode::Recursive) {
+                Ok(()) => cur.push((canon, point.clone())),
+                Err(e) => tracing::warn!("cannot watch {}: {e}", tree.display()),
+            }
+        }
+    }
+
     /// Replaces the set of watched roots.
     pub fn set_dirs(&self, dirs: &[IndexedDir]) {
         let mut w = self.watcher.lock().unwrap();
@@ -103,6 +151,18 @@ impl FileWatcher {
             let _ = w.unwatch(&d.path);
         }
         cur.clear();
+        #[cfg(target_os = "macos")]
+        {
+            let mut a = self.aliases.lock().unwrap();
+            a.clear();
+            for d in dirs {
+                if let Ok(canon) = d.path.canonicalize() {
+                    if canon != d.path {
+                        a.push((canon, d.path.clone()));
+                    }
+                }
+            }
+        }
         for d in dirs {
             let mode = if d.recursive { RecursiveMode::Recursive } else { RecursiveMode::NonRecursive };
             match w.watch(Path::new(&d.path), mode) {
@@ -111,4 +171,15 @@ impl FileWatcher {
             }
         }
     }
+}
+
+/// Rewrites a path below a resolved root back to the root as configured.
+#[cfg(target_os = "macos")]
+fn unalias(aliases: &[(PathBuf, PathBuf)], p: PathBuf) -> PathBuf {
+    for (canon, root) in aliases {
+        if let Ok(rest) = p.strip_prefix(canon) {
+            return root.join(rest);
+        }
+    }
+    p
 }

@@ -212,3 +212,132 @@ async fn sync_can_be_enabled_at_runtime_and_limits_apply() {
     assert!(core.sync().is_err());
     core.shutdown().await;
 }
+
+/// A hosts a folder; B pairs. Returns (A, B, shared dir, home of B's folders, the temp dir guard).
+#[cfg(target_os = "macos")]
+async fn host_and_member(files: &[(&str, Vec<u8>)]) -> (std::sync::Arc<Core>, std::sync::Arc<Core>, std::path::PathBuf, std::path::PathBuf, tempfile::TempDir, String) {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().canonicalize().unwrap();
+    let (home_a, home_b) = (base.join("home-a"), base.join("home-b"));
+    let shared = base.join("shared");
+    std::fs::create_dir_all(&shared).unwrap();
+    for (rel, bytes) in files {
+        let p = shared.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, bytes).unwrap();
+    }
+    write_config(
+        &home_a,
+        &format!(
+            "search_enabled = false\n[sync]\nenabled = true\ndevice_name = \"Device A\"\n[sync.hosting]\nbind = \"127.0.0.1:0\"\n[[sync.hosted]]\nid = \"fedcba9876543210fedcba9876543210\"\nname = \"Docs\"\nroot = \"{}\"\nbackup = {{ strategy = \"none\" }}\n",
+            shared.display()
+        ),
+    );
+    write_config(&home_b, "search_enabled = false\n[sync]\nenabled = true\ndevice_name = \"Device B\"\n");
+    let opts = StartOptions { no_watch: true, ..Default::default() };
+    let a = Core::start(Paths::new(&home_a), opts.clone()).await.unwrap();
+    let b = Core::start(Paths::new(&home_b), opts).await.unwrap();
+    let code = a.sync().unwrap().invite(&[("Docs".into(), "rw".into())]).await.unwrap();
+    let paired = b.sync_pair(&code).await.unwrap();
+    (a, b, shared, base, tmp, paired.host_id)
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mounted_sync_loads_on_demand_pins_and_leaves() {
+    let big: Vec<u8> = (0..3 * 1024 * 1024 + 11).map(|i| ((i * 7) % 251) as u8).collect();
+    let (a, b, shared, base, _tmp, host_id) = host_and_member(&[("hello.txt", b"hello".to_vec()), ("big.bin", big.clone()), ("docs/a.md", b"# a".to_vec())]).await;
+    let point = base.join("volume");
+    let f = b.sync_join(&host_id, "Docs", &point, "mount", "server_wins").await.unwrap();
+    assert_eq!(f.frontend, "mount");
+    let m = b.sync().unwrap();
+
+    until("placeholders appear", Duration::from_secs(30), || {
+        m.browse("Docs", "").map(|i| i.len() == 3).unwrap_or(false)
+    })
+    .await;
+    let st = m.status();
+    assert_eq!(st[0].frontend, "mount", "{:?}", st[0]);
+    assert_eq!(st[0].notice, "");
+    // nothing downloaded yet: sizes are there, content is not
+    let items = m.browse("Docs", "").unwrap();
+    let big_item = items.iter().find(|i| i.name == "big.bin").unwrap();
+    assert_eq!(big_item.size, big.len() as u64);
+    assert_eq!(big_item.state, "cloud");
+    assert_eq!(m.status()[0].cached_bytes, 0);
+
+    // opening one file loads it (and only it)
+    assert_eq!(std::fs::read_to_string(point.join("hello.txt")).unwrap(), "hello");
+    let items = m.browse("Docs", "").unwrap();
+    assert_eq!(items.iter().find(|i| i.name == "hello.txt").unwrap().state, "cached");
+    assert_eq!(items.iter().find(|i| i.name == "big.bin").unwrap().state, "cloud");
+
+    // keep the whole sync on this device
+    m.pin("Docs", "").unwrap();
+    until("pinned files arrive", Duration::from_secs(30), || {
+        let top = m.browse("Docs", "").unwrap();
+        let inner = m.browse("Docs", "docs").unwrap();
+        top.iter().filter(|i| !i.is_dir).all(|i| i.state == "cached") && inner.iter().all(|i| i.state == "cached")
+    })
+    .await;
+    assert!(m.status()[0].cached_bytes >= big.len() as u64);
+
+    // a file written into the volume reaches the host
+    std::fs::write(point.join("from-b.txt"), "written through the mount").unwrap();
+    until("upload", Duration::from_secs(30), || shared.join("from-b.txt").exists()).await;
+    assert_eq!(std::fs::read_to_string(shared.join("from-b.txt")).unwrap(), "written through the mount");
+
+    // leaving keeps what was downloaded as ordinary files and removes the volume
+    b.sync_leave("Docs", true).await.unwrap();
+    assert!(!medialake_mount::mountctl::mount_at(&point).is_some_and(|m| m.is_ours()));
+    assert_eq!(std::fs::read(point.join("big.bin")).unwrap(), big);
+    assert_eq!(std::fs::read_to_string(point.join("docs/a.md")).unwrap(), "# a");
+    assert!(b.sync().unwrap().status().is_empty());
+    a.shutdown().await;
+    b.shutdown().await;
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_folder_that_cannot_be_mounted_becomes_a_mirror() {
+    let (a, b, _shared, base, _tmp, host_id) = host_and_member(&[("hello.txt", b"hello".to_vec())]).await;
+    let point = base.join("occupied");
+    std::fs::create_dir_all(&point).unwrap();
+    std::fs::write(point.join("mine.txt"), "already here").unwrap();
+    let f = b.sync_join(&host_id, "Docs", &point, "auto", "server_wins").await.unwrap();
+    let m = b.sync().unwrap();
+    until("downloaded as a mirror", Duration::from_secs(30), || point.join("hello.txt").exists()).await;
+    let st = &m.status()[0];
+    assert_eq!(st.frontend, "mirror", "{st:?}");
+    assert!(st.notice.contains("not empty"), "notice={:?} full={st:?}", st.notice);
+    assert_eq!(std::fs::read_to_string(point.join("mine.txt")).unwrap(), "already here");
+    assert_eq!(f.frontend, "auto");
+    a.shutdown().await;
+    b.shutdown().await;
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cache_that_does_not_belong_to_the_engine_state_is_set_aside() {
+    let (a, b, shared, base, _tmp, host_id) = host_and_member(&[("photo.jpg", b"the host's photo".to_vec())]).await;
+    // a leftover cache of this sync (an earlier install, a deleted state database), with a stale file
+    let stale = base.join("home-b/cache/sync/fedcba9876543210fedcba9876543210/tree");
+    std::fs::create_dir_all(&stale).unwrap();
+    std::fs::write(stale.join("photo.jpg"), "stale content from before").unwrap();
+    std::fs::write(stale.join("deleted-on-host.txt"), "must not come back").unwrap();
+
+    let point = base.join("volume");
+    b.sync_join(&host_id, "Docs", &point, "mount", "server_wins").await.unwrap();
+    let m = b.sync().unwrap();
+    until("synced", Duration::from_secs(30), || point.join("photo.jpg").exists()).await;
+    assert_eq!(std::fs::read_to_string(point.join("photo.jpg")).unwrap(), "the host's photo");
+    assert!(!point.join("deleted-on-host.txt").exists());
+    // nothing stale reached the host
+    assert!(!shared.join("deleted-on-host.txt").exists());
+    assert_eq!(std::fs::read_to_string(shared.join("photo.jpg")).unwrap(), "the host's photo");
+    let st = &m.status()[0];
+    assert!(st.notice.contains("set aside"), "{st:?}");
+    assert_eq!(st.pending_conflicts, 0);
+    a.shutdown().await;
+    b.shutdown().await;
+}

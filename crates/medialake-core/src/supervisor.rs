@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::Duration;
 
 use bierpc::rpc::ClientTlsConfig;
-use medialake_proto::models::Quality;
+use medialake_proto::models::{Model, Quality};
 use medialake_proto::{READY_PREFIX, ServerInfo};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
@@ -80,6 +80,7 @@ pub struct SupervisorConfig {
     pub fallback_exe: Option<PathBuf>,
     pub model_dir: PathBuf,
     pub log_dir: Option<PathBuf>,
+    pub model: Model,
     pub quality: Quality,
     pub gpu_layers: Option<i32>,
     /// 0 = never stop for idleness.
@@ -247,10 +248,10 @@ impl Supervisor {
     }
 
     async fn spawn(&self, cfg: &SupervisorConfig) -> Result<(Child, ConnTarget), String> {
-        let set = medialake_proto::models::model_set(cfg.quality);
+        let set = medialake_proto::models::model_set(cfg.model, cfg.quality);
         for f in [&set.model, &set.mmproj] {
             if !cfg.model_dir.join(f.file_name).exists() {
-                return Err(format!("model file {} is missing (quality {})", f.file_name, cfg.quality.as_str()));
+                return Err(format!("model file {} is missing ({}, quality {})", f.file_name, cfg.model.display_name(), cfg.quality.as_str()));
             }
         }
         if !cfg.exe.exists() {
@@ -263,6 +264,8 @@ impl Supervisor {
             .arg("0")
             .arg("--model-dir")
             .arg(&cfg.model_dir)
+            .arg("--model")
+            .arg(cfg.model.as_str())
             .arg("--quality")
             .arg(cfg.quality.as_str());
         if let Some(g) = cfg.gpu_layers {
@@ -329,13 +332,15 @@ enum Exit {
     Crashed(String),
 }
 
-/// Windows Job Object: the child is killed when the client process goes away.
+/// Windows Job Object: the child is killed when the client process goes away. Elsewhere nothing is
+/// needed: the server exits when its stdin closes (the pipe closes with the client) and the child is
+/// `kill_on_drop`.
 mod job {
-    use std::sync::OnceLock;
     use tokio::process::Child;
 
     #[cfg(windows)]
     pub fn assign(child: &Child) {
+        use std::sync::OnceLock;
         use windows_sys::Win32::System::JobObjects::*;
 
         static JOB: OnceLock<isize> = OnceLock::new();

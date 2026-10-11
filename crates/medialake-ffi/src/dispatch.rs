@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 use medialake_core::Core;
 use medialake_core::config::Config;
+use medialake_proto::models::{Model, Quality};
 use serde_json::{Value, json};
 
 pub async fn call(core: &std::sync::Arc<Core>, method: &str, args: Value) -> Result<Value, String> {
@@ -48,10 +49,31 @@ pub async fn call(core: &std::sync::Arc<Core>, method: &str, args: Value) -> Res
             core.forget_remote()?;
             Ok(json!({}))
         }
-        "models" => Ok(json!({ "qualities": core.models_status(), "dir": core.model_dir() })),
+        // `qualities`: the tiers of the configured model; `models`: every supported model with its tiers
+        "models" => {
+            let current = core.config().model;
+            let models: Vec<Value> = Model::ALL
+                .iter()
+                .map(|m| {
+                    json!({
+                        "id": m.as_str(),
+                        "name": m.display_name(),
+                        "dims": m.dims(),
+                        "supports_audio": m.supports_audio(),
+                        "qualities": core.models_status(*m),
+                    })
+                })
+                .collect();
+            Ok(json!({ "model": current.as_str(), "qualities": core.models_status(current), "models": models, "dir": core.model_dir() }))
+        }
+        // `model` defaults to the configured one
         "download_model" => {
-            let q = args["quality"].as_str().and_then(medialake_proto::models::Quality::parse).ok_or("bad quality")?;
-            core.download_quality(q).await?;
+            let q = args["quality"].as_str().and_then(Quality::parse).ok_or("bad quality")?;
+            let m = match args["model"].as_str() {
+                Some(s) => Model::parse(s).ok_or("bad model")?,
+                None => core.config().model,
+            };
+            core.download_quality(m, q).await?;
             Ok(json!({}))
         }
         "cancel_download" => {
@@ -135,7 +157,14 @@ async fn sync_call(core: &std::sync::Arc<Core>, method: &str, args: Value) -> Re
                 }
                 // files
                 "sync_browse" => Ok(json!({ "items": m.browse(arg(&args, "sync_id")?, args["path"].as_str().unwrap_or(""))? })),
-                "sync_pin" | "sync_unpin" => Err("this sync is a plain folder: every file is always kept on this device".into()),
+                "sync_pin" => {
+                    m.pin(arg(&args, "sync_id")?, args["path"].as_str().unwrap_or(""))?;
+                    Ok(json!({}))
+                }
+                "sync_unpin" => {
+                    m.unpin(arg(&args, "sync_id")?, args["path"].as_str().unwrap_or(""), args["evict"].as_bool().unwrap_or(true))?;
+                    Ok(json!({}))
+                }
                 // conflicts
                 "sync_conflicts" => Ok(json!({ "conflicts": m.conflicts() })),
                 "sync_resolve" => {

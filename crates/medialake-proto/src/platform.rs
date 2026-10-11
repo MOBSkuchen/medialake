@@ -16,6 +16,27 @@ pub fn data_dir() -> PathBuf {
     base.unwrap_or_else(std::env::temp_dir).join("MediaLake")
 }
 
+/// Where disposable, regenerable data goes: `~/Library/Caches/MediaLake` on macOS,
+/// `%LOCALAPPDATA%\\MediaLake\\Cache` on Windows, `$XDG_CACHE_HOME` / `~/.cache` elsewhere.
+pub fn cache_dir() -> PathBuf {
+    #[cfg(windows)]
+    {
+        data_dir().join("Cache")
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Library").join("Caches")).unwrap_or_else(std::env::temp_dir).join("MediaLake")
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        std::env::var_os("XDG_CACHE_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
+            .unwrap_or_else(std::env::temp_dir)
+            .join("MediaLake")
+    }
+}
+
 /// The machine name: `COMPUTERNAME` when set (Windows), else `gethostname`, else `fallback`.
 pub fn host_name(fallback: &str) -> String {
     if let Ok(n) = std::env::var("COMPUTERNAME") {

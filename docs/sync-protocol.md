@@ -49,6 +49,10 @@ compress while it pays off and stop after three frames that do not shrink by 10 
 file no longer matches that `rev` the host answers `Stale` and rescans the path; an older revision still in
 the blob store is served from there.
 
+A member that shows files on demand (the macOS mount) uses the same call for ranges: `offset` and `len` of
+the blocks a read touches (1 MiB blocks, up to 32 per request), each on a pooled connection like any other
+download and subject to the same bandwidth limit. Nothing was added to the protocol for it.
+
 ## Member behaviour (what the host relies on)
 
 1. **Pull** `Changes` from the cursor; per entry compare with the base and the local file (§5 of the plan);

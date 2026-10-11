@@ -35,6 +35,30 @@ pub trait Frontend: Send + Sync {
     fn scan(&self, prefix: &str, ignore: &[String]) -> Result<Vec<LocalItem>>;
     /// Where the content of `rel` can be read (hydrating it first on on-demand frontends).
     fn local_path(&self, rel: &str) -> PathBuf;
+    /// Where the metadata of `rel` (size, mtime, existence) can be read, without hydrating anything.
+    /// On-demand frontends keep a full-size sparse file there.
+    fn meta_path(&self, rel: &str) -> PathBuf {
+        self.local_path(rel)
+    }
+    /// True for frontends that show files without their content and fetch it when it is read.
+    fn lazy(&self) -> bool {
+        false
+    }
+    /// The content hash of `rel` if the frontend knows it without reading the file: its content is
+    /// untouched since [`Frontend::note_content`] / `place_placeholder` recorded it.
+    fn content_hash(&self, _rel: &str) -> Option<String> {
+        None
+    }
+    /// `rel` now holds content `hash` (host revision `rev`): after an install, a successful push, or
+    /// when both sides turned out equal. `size` / `mtime` are what the engine saw; a frontend that
+    /// tracks local writes must only treat the file as clean if it still has them.
+    fn note_content(&self, _rel: &str, _hash: &str, _rev: u64, _size: u64, _mtime: i64) {}
+    /// On-demand frontends: records the host's file at `rel` without its content (a placeholder with
+    /// `size` and `mtime`). Returns false if the content is wanted now (pinned): the engine then
+    /// downloads it and calls `place_file`.
+    fn place_placeholder(&self, _rel: &str, _size: u64, _mtime: i64, _exec: bool, _hash: &str, _rev: u64) -> Result<bool> {
+        Ok(false)
+    }
     /// Puts a downloaded file at `rel` atomically and applies mtime and the executable bit.
     fn place_file(&self, rel: &str, staged: &Path, mtime: i64, exec: bool) -> Result<()>;
     fn make_dir(&self, rel: &str) -> Result<()>;

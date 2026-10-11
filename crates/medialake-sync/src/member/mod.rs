@@ -143,6 +143,20 @@ impl MemberStore {
         };
         Engine::new(cfg, Arc::new(Mirror::new(&m.path)), Arc::new(client.transport(&m.sync_id)))
     }
+
+    /// Like [`MemberStore::engine`], with the frontend and transport chosen by the caller (a mount
+    /// shares its transport with the engine).
+    pub fn engine_with(&self, m: &MemberConfig, device: &str, fe: Arc<dyn Frontend>, tr: Arc<dyn transport::Transport>) -> Result<Engine> {
+        let cfg = EngineConfig {
+            device: device.to_string(),
+            policy: ConflictPolicy::parse(&m.conflict).unwrap_or(ConflictPolicy::ServerWins),
+            access: Access::parse(&m.access).unwrap_or(Access::ReadOnly),
+            state_dir: self.state_dir(&m.sync_id),
+            settle_ms: 1000,
+            ignore: vec![],
+        };
+        Engine::new(cfg, fe, tr)
+    }
 }
 
 /// A joined sync running on its own thread: engine, local watcher and host notifications.
