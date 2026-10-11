@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
+exclude = ["vendor"]
 
 [workspace.package]
 version = "0.1.0"
@@ -8,8 +9,8 @@ edition = "2024"
 license = "MIT"
 
 [workspace.dependencies]
-bierpc = { path = "../rpc/bierpc" }
-bier_derive = { path = "../rpc/bier_derive" }
+bierpc = { path = "../bierpc/bierpc" }
+bier_derive = { path = "../bierpc/bier_derive" }
 tokio = { version = "1.49", features = ["full"] }
 sha2 = "0.10"
 rcgen = "0.14"

@@ -309,7 +309,7 @@ The Windows scripts only moved; their repo-root lookup went up one level. `build
 ## 8. Phases / Milestones
 
 Prerequisite: both repositories on the Mac. `medialake` has no git remote yet, and `bierpc` /
-`bier_derive` are path dependencies on the sibling `../../rpc`, including the two fixes from `poc/README.md`.
+`bier_derive` are path dependencies on the sibling `../bierpc`, including the two fixes from `poc/README.md`.
 
 | # | Phase | Done when |
 |---|---|---|

@@ -21,7 +21,7 @@ Windows is the supported platform. A macOS port is planned in `docs/plan2.md`; t
 | `scripts/windows` | `dev-env.sh`, `setup-vendor.ps1`, `build-release.ps1`, `make-icon.ps1` |
 | `scripts/macos` | `dev-env.sh`, `setup-vendor.sh`, `build-release.sh`, `make-icon.sh` |
 
-`bierpc` / `bier_derive` are path dependencies on the sibling repo `../rpc` (it needs the two uncommitted
+`bierpc` / `bier_derive` are path dependencies on the sibling repo `../bierpc` (it needs the two uncommitted
 fixes described in `poc/README.md`).
 
 ## Build (Windows)
@@ -47,7 +47,7 @@ cd ui/MediaLake.App && dotnet build -c Release -p:Platform=x64
 
 ## Build (macOS, planned)
 
-See `docs/plan2.md`. Prerequisites: Rust, Xcode, CMake (`brew install cmake`), and the sibling `../rpc` checkout.
+See `docs/plan2.md`. Prerequisites: Rust, Xcode, CMake (`brew install cmake`), and the sibling `../bierpc` checkout.
 None of the macOS scripts has been run on a Mac yet. `setup-vendor.sh` is a direct port of the Windows one;
 `build-release.sh` and `make-icon.sh` are written for the planned layout and need `ui/MediaLake.Mac` and
 `installer/macos` first.

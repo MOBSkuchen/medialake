@@ -64,7 +64,7 @@ medialake/
 └─ docs/
 ```
 
-`bierpc` and `bier_derive` are **path dependencies on the local repo** `../../rpc` (`C:\Users\jaspe\RustroverProjects\rpc`).
+`bierpc` and `bier_derive` are **path dependencies on the local repo** `../bierpc` (`C:\Users\jaspe\RustroverProjects\rpc`).
 
 ## 3. Components
 
@@ -196,8 +196,8 @@ Based on the current code in `rpc/` (latest commits add rustls TLS and I/O timeo
   - Single calls are raised to a sane limit (e.g. 16 MB) via `ClientConfig`/`ServerConfig`.
   - Video and large audio use `call_persistent`: the session writes length-prefixed chunks directly to the stream, and the server's `PersistentRpcServerHandler` reads them and returns the embeddings.
 - **Timeouts:** connect/handshake/idle/request timeouts come from bierpc's config. The client reconnects when a connection is `poisoned`.
-- **bierpc: `RpcServer::local_addr()`** ✅ added (uncommitted in `../../rpc`). It reports the OS-assigned port when binding to port 0, which the supervisor needs for `--port 0`.
-- **bier_derive fix** ✅ (uncommitted in `../../rpc`): named fields of enum variants now generate `<#ty>::deserialize`, so generic field types such as `texts: Vec<String>` compile.
+- **bierpc: `RpcServer::local_addr()`** ✅ added (uncommitted in `../bierpc`). It reports the OS-assigned port when binding to port 0, which the supervisor needs for `--port 0`.
+- **bier_derive fix** ✅ (uncommitted in `../bierpc`): named fields of enum variants now generate `<#ty>::deserialize`, so generic field types such as `texts: Vec<String>` compile.
 - **Not needed:** a bulk bytes fast path. A 2 MB `Vec<u8>` takes 22 ms in a single call, and large payloads stream at more than 100 MB/s via persistent calls (spike 0c).
 
 ## 5. Model Management
