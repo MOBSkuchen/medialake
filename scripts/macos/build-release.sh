@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Builds everything and stages dist/app/MediaLake.app for the installer:
-#   scripts/macos/build-release.sh [--version 0.2.0] [--installer]
+#   scripts/macos/build-release.sh [--version 0.2.1] [--installer]
 #
 # Signing (all optional; without them the app is ad-hoc signed and Gatekeeper warns on other machines):
 #   MEDIALAKE_SIGN_ID            "Developer ID Application: ..."  signs the app and the nested server
@@ -10,7 +10,7 @@ set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$root"
 
-version="0.2.0"
+version="0.2.1"
 installer=0
 while [ $# -gt 0 ]; do
     case "$1" in

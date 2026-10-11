@@ -113,10 +113,15 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         "download" => {
+            // download <quality> [model]; the model defaults to the configured one
             let q = args.first().and_then(|a| medialake_proto::models::Quality::parse(a)).unwrap_or_else(|| usage());
+            let m = match args.get(1) {
+                Some(a) => medialake_proto::models::Model::parse(a).unwrap_or_else(|| usage()),
+                None => core.config().model,
+            };
             let mut rx = core.subscribe();
             let c = core.clone();
-            let h = tokio::spawn(async move { c.download_quality(q).await });
+            let h = tokio::spawn(async move { c.download_quality(m, q).await });
             let printer = tokio::spawn(async move {
                 while let Ok(ev) = rx.recv().await {
                     if let medialake_core::events::Event::Download { done, total, .. } = ev {
@@ -126,7 +131,7 @@ async fn main() -> anyhow::Result<()> {
             });
             let r = h.await?;
             printer.abort();
-            println!("\ndownload result: {r:?}; present: {}", medialake_core::models::is_downloaded(core.model_dir(), q));
+            println!("\ndownload result: {r:?}; present: {}", medialake_core::models::is_downloaded(core.model_dir(), m, q));
         }
         _ => usage(),
     }

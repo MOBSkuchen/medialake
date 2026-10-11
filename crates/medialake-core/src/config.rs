@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
-use medialake_proto::models::Quality;
+use medialake_proto::models::{Model, Quality};
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -35,6 +35,8 @@ pub struct RemoteCreds {
 #[serde(default)]
 pub struct Config {
     pub hotkey: String,
+    /// The embedding model; changing it (or the quality) re-indexes everything.
+    pub model: Model,
     pub quality: Quality,
     pub server_mode: ServerMode,
     pub remote: Option<RemoteCreds>,
@@ -61,8 +63,11 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
+        let model = Model::default();
+        let cal = model.calibration();
         Config {
             hotkey: if cfg!(target_os = "macos") { "Alt+Space" } else { "Ctrl+Alt+Space" }.into(),
+            model,
             quality: Quality::Normal,
             server_mode: ServerMode::Local,
             remote: None,
@@ -74,14 +79,24 @@ impl Default for Config {
             video_enabled: false,
             max_results: 20,
             idle_shutdown_minutes: 30,
-            score_floor: 0.58,
-            score_ceiling: 0.74,
-            relative_cut: 0.06,
+            score_floor: cal.score_floor,
+            score_ceiling: cal.score_ceiling,
+            relative_cut: cal.relative_cut,
         }
     }
 }
 
 impl Config {
+    /// Switches to `model`. The score mapping follows unless it was tuned away from the old model's defaults.
+    pub fn set_model(&mut self, model: Model) {
+        let old = self.model.calibration();
+        if (self.score_floor, self.score_ceiling, self.relative_cut) == (old.score_floor, old.score_ceiling, old.relative_cut) {
+            let new = model.calibration();
+            (self.score_floor, self.score_ceiling, self.relative_cut) = (new.score_floor, new.score_ceiling, new.relative_cut);
+        }
+        self.model = model;
+    }
+
     pub fn load(path: &Path) -> anyhow::Result<Config> {
         match std::fs::read_to_string(path) {
             Ok(s) => toml::from_str(&s).with_context(|| format!("parsing {}", path.display())),

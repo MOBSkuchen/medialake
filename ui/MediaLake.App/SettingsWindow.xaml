@@ -62,9 +62,7 @@
                     </RadioButtons>
 
                     <StackPanel x:Name="LocalPanel" Spacing="14">
-                        <ComboBox x:Name="ModelCombo" Header="Model" MinWidth="320">
-                            <ComboBoxItem Content="EmbeddingGemma 2 (text, images, audio, video)" IsSelected="True" />
-                        </ComboBox>
+                        <ComboBox x:Name="ModelCombo" Header="Model" MinWidth="320" SelectionChanged="Model_SelectionChanged" />
                         <StackPanel Spacing="6">
                             <ComboBox x:Name="QualityCombo" Header="Quality" MinWidth="320" SelectionChanged="Quality_SelectionChanged">
                                 <ComboBoxItem Content="Heavy: most precise, largest" Tag="heavy" />

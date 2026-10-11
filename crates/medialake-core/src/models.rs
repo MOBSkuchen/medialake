@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use medialake_proto::models::{ModelFile, ModelSet, Quality, model_set};
+use medialake_proto::models::{Model, ModelFile, ModelSet, Quality, model_set};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tokio::sync::broadcast;
@@ -25,19 +25,20 @@ pub fn file_present(dir: &Path, f: &ModelFile) -> bool {
     std::fs::metadata(dir.join(f.file_name)).map(|m| m.len() == f.size).unwrap_or(false)
 }
 
-pub fn is_downloaded(dir: &Path, q: Quality) -> bool {
-    let s = model_set(q);
+pub fn is_downloaded(dir: &Path, m: Model, q: Quality) -> bool {
+    let s = model_set(m, q);
     file_present(dir, &s.model) && file_present(dir, &s.mmproj)
 }
 
-pub fn status(dir: &Path) -> Vec<QualityStatus> {
+/// The quality tiers of one model.
+pub fn status(dir: &Path, m: Model) -> Vec<QualityStatus> {
     Quality::ALL
         .iter()
         .map(|q| {
-            let s = model_set(*q);
+            let s = model_set(m, *q);
             QualityStatus {
                 quality: q.as_str().into(),
-                downloaded: is_downloaded(dir, *q),
+                downloaded: is_downloaded(dir, m, *q),
                 size: s.total_size(),
                 files: vec![s.model.file_name.into(), s.mmproj.file_name.into()],
             }

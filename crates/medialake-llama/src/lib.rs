@@ -1,4 +1,5 @@
-//! Thin safe wrapper over the raw llama.cpp / libmtmd C API for EmbeddingGemma 2.
+//! Thin safe wrapper over the raw llama.cpp / libmtmd C API for multimodal embedding models
+//! (EmbeddingGemma 2, Qwen3-VL-Embedding).
 //!
 //! Text tokens and media embeddings must go through ONE decode call (one `llama_batch_ext`): mean
 //! pooling only covers a single decode, so `mtmd_helper_eval_chunks` (which decodes chunk by chunk)
@@ -11,7 +12,23 @@ use std::ptr;
 use llama_cpp_sys_2 as sys;
 
 pub const N_CTX: u32 = 8192;
-pub const DIMS: usize = 768;
+const LAST_POOLING_UBATCH: u32 = 1024;
+
+/// How the token states become the sequence embedding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pooling {
+    Mean,
+    Last,
+}
+
+/// Model-specific settings.
+#[derive(Debug, Clone)]
+pub struct Params {
+    pub pooling: Pooling,
+    /// Prompt text placed before / after the media markers of an image or audio input.
+    pub media_prefix: String,
+    pub media_suffix: String,
+}
 
 pub type Result<T> = std::result::Result<T, String>;
 
@@ -28,6 +45,10 @@ pub struct Embedder {
     model: *mut sys::llama_model,
     ctx: *mut sys::llama_context,
     mtmd: *mut sys::mtmd_context,
+    /// M-RoPE models (Qwen-VL) give media rows 2D positions.
+    mrope: bool,
+    media_prefix: String,
+    media_suffix: String,
 }
 
 // The raw handles are only ever used from one thread at a time (the owner holds the Embedder).
@@ -43,7 +64,7 @@ unsafe extern "C" fn stderr_log(_level: sys::ggml_log_level, text: *const c_char
 
 impl Embedder {
     /// `gpu_layers`: 0 = CPU only, any other value offloads everything (the backend must support it).
-    pub fn load(model_path: &Path, mmproj_path: &Path, gpu_layers: i32, verbose: bool) -> Result<Self> {
+    pub fn load(model_path: &Path, mmproj_path: &Path, gpu_layers: i32, verbose: bool, params: Params) -> Result<Self> {
         unsafe {
             sys::llama_backend_init();
             let log: sys::ggml_log_callback = Some(if verbose { stderr_log } else { quiet_log });
@@ -61,9 +82,18 @@ impl Embedder {
             let mut cp = sys::llama_context_default_params();
             cp.n_ctx = N_CTX;
             cp.n_batch = N_CTX;
-            cp.n_ubatch = N_CTX; // non-causal model: the whole sequence in one ubatch
+            // Mean pooling (non-causal encoder) needs the whole sequence in one ubatch. A causal
+            // last-token model can go through the KV cache in steps, which keeps the compute
+            // buffers small (8192 at once takes several GB for Qwen3-VL).
+            cp.n_ubatch = match params.pooling {
+                Pooling::Mean => N_CTX,
+                Pooling::Last => LAST_POOLING_UBATCH,
+            };
             cp.embeddings = true;
-            cp.pooling_type = sys::LLAMA_POOLING_TYPE_MEAN;
+            cp.pooling_type = match params.pooling {
+                Pooling::Mean => sys::LLAMA_POOLING_TYPE_MEAN,
+                Pooling::Last => sys::LLAMA_POOLING_TYPE_LAST,
+            };
             let ctx = sys::llama_init_from_model(model, cp);
             if ctx.is_null() {
                 sys::llama_model_free(model);
@@ -80,7 +110,8 @@ impl Embedder {
                 sys::llama_model_free(model);
                 return Err(format!("failed to load projector {}", mmproj_path.display()));
             }
-            Ok(Self { model, ctx, mtmd })
+            let mrope = sys::mtmd_decode_use_mrope(mtmd);
+            Ok(Self { model, ctx, mtmd, mrope, media_prefix: params.media_prefix, media_suffix: params.media_suffix })
         }
     }
 
@@ -93,7 +124,12 @@ impl Embedder {
         unsafe { sys::mtmd_support_audio(self.mtmd) }
     }
 
-    /// Embeds one input and returns the L2-normalised 768-dim vector.
+    /// Length of the vectors returned by [`Embedder::embed`].
+    pub fn dims(&self) -> usize {
+        unsafe { sys::llama_model_n_embd_out(self.model) as usize }
+    }
+
+    /// Embeds one input and returns the L2-normalised vector ([`Embedder::dims`] long).
     pub fn embed(&mut self, input: &Input) -> Result<Vec<f32>> {
         unsafe {
             let marker = CStr::from_ptr(sys::mtmd_default_marker()).to_str().unwrap().to_owned();
@@ -104,6 +140,10 @@ impl Embedder {
             }
             result
         }
+    }
+
+    fn media_text(&self, markers: &str) -> CString {
+        CString::new(format!("{}{markers}{}", self.media_prefix, self.media_suffix).replace('\0', " ")).unwrap()
     }
 
     unsafe fn embed_inner(&mut self, input: &Input, marker: &str, bitmaps: &mut Vec<*mut sys::mtmd_bitmap>) -> Result<Vec<f32>> {
@@ -123,7 +163,7 @@ impl Embedder {
                         }
                         bitmaps.push(b);
                     }
-                    CString::new(marker.repeat(imgs.len())).unwrap()
+                    self.media_text(&marker.repeat(imgs.len()))
                 }
                 Input::Audio(samples) => {
                     if samples.is_empty() {
@@ -134,7 +174,7 @@ impl Embedder {
                         return Err("cannot create audio bitmap".into());
                     }
                     bitmaps.push(b);
-                    CString::new(marker).unwrap()
+                    self.media_text(marker)
                 }
             };
             let it = sys::mtmd_input_text { text: text.as_ptr(), text_len: text.as_bytes().len(), add_special: true, parse_special: true };
@@ -168,7 +208,8 @@ impl Embedder {
                             err = Some("batch full".into());
                             break 'chunks;
                         }
-                        finish_entry(batch, idx, &mut pos);
+                        finish_entry(batch, idx, [pos; 4]);
+                        pos += 1;
                     }
                 } else {
                     if sys::mtmd_encode_chunk(self.mtmd, chunk) != 0 {
@@ -179,6 +220,7 @@ impl Embedder {
                     let out = sys::mtmd_get_output_embd(self.mtmd);
                     media_bufs.push(std::slice::from_raw_parts(out, n * n_embd_inp).to_vec());
                     let buf = media_bufs.last().unwrap();
+                    let image = if self.mrope { sys::mtmd_input_chunk_get_tokens_image(chunk) } else { ptr::null() };
                     for i in 0..n {
                         let row = sys::llama_embd { data: buf.as_ptr().add(i * n_embd_inp), n_rows: 1, n_embd: n_embd_inp };
                         let idx = sys::llama_batch_ext_add_embd(batch, 0, row);
@@ -186,8 +228,17 @@ impl Embedder {
                             err = Some(format!("batch full / bad embedding ({idx})"));
                             break 'chunks;
                         }
-                        finish_entry(batch, idx, &mut pos);
+                        let p = if image.is_null() {
+                            [pos + i as sys::llama_pos; 4]
+                        } else {
+                            // same section order as mtmd's decode_embd_batch: t, y, x, z
+                            let d = sys::mtmd_image_tokens_get_decoder_pos(image, pos, i);
+                            [d.t as sys::llama_pos, d.y as sys::llama_pos, d.x as sys::llama_pos, d.z as sys::llama_pos]
+                        };
+                        finish_entry(batch, idx, p);
                     }
+                    // an M-RoPE image only advances the sequence by max(rows, columns)
+                    pos += sys::mtmd_input_chunk_get_n_pos(chunk);
                 }
             }
 
@@ -224,14 +275,12 @@ impl Embedder {
     }
 }
 
-unsafe fn finish_entry(batch: *mut sys::llama_batch_ext, idx: i32, pos: &mut sys::llama_pos) {
+/// `pos`: one value per M-RoPE section (all equal for text and for models without M-RoPE).
+unsafe fn finish_entry(batch: *mut sys::llama_batch_ext, idx: i32, pos: [sys::llama_pos; 4]) {
     unsafe {
-        // Gemma is not M-RoPE: one position per entry, same value in every section
-        let p = [*pos; 4];
-        sys::llama_batch_ext_set_pos(batch, idx, p.as_ptr());
+        sys::llama_batch_ext_set_pos(batch, idx, pos.as_ptr());
         sys::llama_batch_ext_set_output_embd(batch, idx, true);
     }
-    *pos += 1;
 }
 
 fn cstr(p: &Path) -> Result<CString> {

@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use bierpc::error::RpcResult;
 use bierpc::rpc::RpcServerHandler;
+use medialake_proto::models::Model;
 use medialake_proto::{Action, Embedding, PROTO_VERSION, Response, ServerInfo, TextKind, format_text};
 
 use crate::engine::{Engine, Priority, Work};
@@ -35,6 +36,8 @@ pub type PairingHook = Arc<dyn Fn(&str, &str) -> Option<(String, String)> + Send
 #[derive(Clone)]
 pub struct Service {
     pub engine: Engine,
+    /// Decides the prompt format of text inputs.
+    pub model: Model,
     pub auth: Arc<Auth>,
     pub info: ServerInfo,
     /// Notified when a client asks to `Shutdown` (local mode).
@@ -64,7 +67,7 @@ impl RpcServerHandler for Service {
                     return Ok(deny());
                 }
                 let prio = if kind == TextKind::Query { Priority::Query } else { Priority::Bulk };
-                let work = items.iter().map(|i| Work::Text(format_text(kind, i))).collect();
+                let work = items.iter().map(|i| Work::Text(format_text(self.model, kind, i))).collect();
                 Response::Embeddings(self.engine.embed(prio, work).await)
             }
             Action::EmbedImages { auth, images } => {
