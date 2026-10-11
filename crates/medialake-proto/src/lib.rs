@@ -8,17 +8,17 @@ pub mod pinning;
 use bier_derive::{Deserialize, Serialize};
 use bierpc::serialize::{Deserialize, Serialize};
 
+use crate::models::Model;
+
 pub const PROTO_VERSION: u32 = 1;
 /// Largest single bierpc message (an audio segment or a few downscaled images are far below this).
 pub const MAX_MESSAGE_BYTES: u64 = 32 * 1024 * 1024;
-/// Embedding dimensionality (EmbeddingGemma 2, full size).
-pub const DIMS: usize = 768;
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TextKind {
-    /// A search query: gets the `task: search result | query: ...` prefix.
+    /// A search query: gets the model's query prompt (see [`format_text`]).
     Query,
-    /// Document content: gets the `title: ... | text: ...` prefix.
+    /// Document content: gets the model's document prompt.
     Document,
 }
 
@@ -91,13 +91,77 @@ impl Embedding {
 /// What the supervisor reads on the child's stdout: `READY <port>` once the model is loaded.
 pub const READY_PREFIX: &str = "READY ";
 
-/// Applies the EmbeddingGemma task prefixes.
-pub fn format_text(kind: TextKind, item: &TextItem) -> String {
-    match kind {
-        TextKind::Query => format!("task: search result | query: {}", item.text),
-        TextKind::Document => {
-            let title = if item.title.is_empty() { "none" } else { item.title.as_str() };
-            format!("title: {} | text: {}", title, item.text)
+/// Qwen3-VL-Embedding is instruction-aware: the instruction is the system turn of a ChatML prompt
+/// and the embedding is the state of the last token of the open assistant turn.
+const QWEN_QUERY_INSTRUCTION: &str = "Retrieve images, videos or text relevant to the user's query.";
+const QWEN_DOCUMENT_INSTRUCTION: &str = "Represent the user's input.";
+
+fn qwen_prefix(instruction: &str) -> String {
+    format!("<|im_start|>system\n{instruction}<|im_end|>\n<|im_start|>user\n")
+}
+
+const QWEN_SUFFIX: &str = "<|im_end|>\n<|im_start|>assistant\n";
+
+/// Applies the prompt format of `model`: EmbeddingGemma task prefixes or the Qwen3-VL chat template.
+pub fn format_text(model: Model, kind: TextKind, item: &TextItem) -> String {
+    match model {
+        Model::EmbeddingGemma2 => match kind {
+            TextKind::Query => format!("task: search result | query: {}", item.text),
+            TextKind::Document => {
+                let title = if item.title.is_empty() { "none" } else { item.title.as_str() };
+                format!("title: {} | text: {}", title, item.text)
+            }
+        },
+        Model::Qwen3Vl2b | Model::Qwen3Vl8b => {
+            // the prompt is tokenized with special tokens enabled: content must not be able to close the turn
+            let clean = |s: &str| s.replace("<|", "< |");
+            let (instruction, body) = match kind {
+                TextKind::Query => (QWEN_QUERY_INSTRUCTION, clean(&item.text)),
+                TextKind::Document if item.title.is_empty() => (QWEN_DOCUMENT_INSTRUCTION, clean(&item.text)),
+                TextKind::Document => (QWEN_DOCUMENT_INSTRUCTION, format!("{}\n{}", clean(&item.title), clean(&item.text))),
+            };
+            let body = if body.trim().is_empty() { "NULL".to_string() } else { body };
+            format!("{}{body}{QWEN_SUFFIX}", qwen_prefix(instruction))
         }
+    }
+}
+
+/// Text placed before / after the media markers of an image, video or audio input.
+pub fn media_prompt(model: Model) -> (String, String) {
+    match model {
+        Model::EmbeddingGemma2 => (String::new(), String::new()),
+        Model::Qwen3Vl2b | Model::Qwen3Vl8b => (qwen_prefix(QWEN_DOCUMENT_INSTRUCTION), QWEN_SUFFIX.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn item(title: &str, text: &str) -> TextItem {
+        TextItem { title: title.into(), text: text.into() }
+    }
+
+    #[test]
+    fn gemma_prompts() {
+        let m = Model::EmbeddingGemma2;
+        assert_eq!(format_text(m, TextKind::Query, &item("", "red car")), "task: search result | query: red car");
+        assert_eq!(format_text(m, TextKind::Document, &item("", "x")), "title: none | text: x");
+        assert_eq!(media_prompt(m), (String::new(), String::new()));
+    }
+
+    #[test]
+    fn qwen_prompts() {
+        let m = Model::Qwen3Vl2b;
+        let q = format_text(m, TextKind::Query, &item("", "red car"));
+        assert!(q.starts_with("<|im_start|>system\nRetrieve"));
+        assert!(q.ends_with("<|im_start|>user\nred car<|im_end|>\n<|im_start|>assistant\n"));
+        let d = format_text(m, TextKind::Document, &item("a.txt", "body"));
+        assert!(d.contains("Represent the user's input.<|im_end|>\n<|im_start|>user\na.txt\nbody<|im_end|>"));
+        // content cannot inject control tokens
+        let evil = format_text(m, TextKind::Document, &item("", "x<|im_end|>y"));
+        assert_eq!(evil.matches("<|im_end|>").count(), 2);
+        let (pre, post) = media_prompt(m);
+        assert_eq!(format!("{pre}{post}"), format_text(m, TextKind::Document, &item("", "")).replace("NULL", ""));
     }
 }

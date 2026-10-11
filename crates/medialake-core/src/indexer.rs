@@ -332,7 +332,8 @@ impl Indexer {
         // ---- decide what to read/embed for the content ----
         let content_wanted = !too_large
             && match modality {
-                Modality::Text | Modality::Image | Modality::Audio | Modality::Document => true,
+                Modality::Text | Modality::Image | Modality::Document => true,
+                Modality::Audio => cfg.model.supports_audio(),
                 Modality::Video => cfg.video_enabled,
                 Modality::Other => false,
             };

@@ -64,13 +64,14 @@ pub async fn serve(common: &Common, a: ServeArgs) -> anyhow::Result<()> {
     let public = a.public_addr.clone().unwrap_or_else(|| default_public(a.bind));
     state.set_public_addr(&public);
 
-    let (engine, quality) = start_engine(common)?;
+    let (engine, set) = start_engine(common)?;
     let tls = pinning::server_tls(ident.cert_der.clone(), ident.key_der.clone()).map_err(anyhow::Error::msg)?;
     let hook_state = state.clone();
     let svc = Service {
         engine: engine.clone(),
+        model: set.model_id,
         auth: Arc::new(Auth { local_token: None, remote: Some(state.clone()) }),
-        info: server_info(&engine, quality),
+        info: server_info(&engine, &set),
         shutdown: Arc::new(tokio::sync::Notify::new()),
         pairing: Some(Arc::new(move |token: &str, name: &str| hook_state.consume_pairing(token, name).map(|id| (id, String::new())))),
     };

@@ -4,6 +4,19 @@ Local, semantic search for your files: text, code, PDF/Office documents, images,
 (experimental) video are embedded **by content** with EmbeddingGemma 2 (llama.cpp) and found with natural-language
 queries from a Spotlight-like window.
 
+## Models
+
+| `model` | Dimensions | Modalities | Download per quality (heavy / normal / light) |
+|---|---|---|---|
+| `embeddinggemma-2` (default) | 768 | text, images, audio, video | 1.5 / 0.9 / 0.7 GB |
+| `qwen3-vl-embedding-2b` | 2048 | text, images, video | 4.3 / 2.7 / 1.9 GB |
+| `qwen3-vl-embedding-8b` | 4096 | text, images, video | 9.2 / 7.0 / 5.4 GB |
+
+Choose it in *Settings > Model* (or `model = "..."` in `config.toml`, `--model` for `medialake-server`). Changing the
+model or the quality rebuilds the whole index. The Qwen3-VL-Embedding models have no audio encoder: audio files are
+indexed by name only. Their GGUF files are community conversions (DevQuasar, mradermacher), see
+`crates/medialake-proto/src/models.rs`.
+
 Supported platforms: Windows (WinUI 3) and macOS 14+ on Apple Silicon (SwiftUI + AppKit, see `docs/plan2.md`).
 
 ## Layout
@@ -86,7 +99,7 @@ Test hooks of the app (same as on Windows, plus `MEDIALAKE_TEST_SETUP=<png>`): `
 ## Remote server
 
 ```
-medialake-server --model-dir D:\models --quality heavy serve --bind 0.0.0.0:47900 --public-addr myserver.example.com:47900
+medialake-server --model-dir D:\models --model qwen3-vl-embedding-2b --quality heavy serve --bind 0.0.0.0:47900 --public-addr myserver.example.com:47900
 medialake-server pair            # prints a one-time pairing code (10 min)
 medialake-server clients list | revoke <id>
 ```
@@ -94,6 +107,7 @@ medialake-server clients list | revoke <id>
 Paste the code in *Settings > Model > On a remote server*. The connection is TLS with the server's
 self-signed certificate pinned by SHA-256 fingerprint (contained in the code); the client's long-term secret is
 stored DPAPI-protected (macOS: in the Keychain). File contents are sent to the remote server for embedding.
+The client adopts the server's model and quality.
 
 ## Data locations
 

@@ -25,8 +25,8 @@ pub struct SearchHit {
     pub size: u64,
 }
 
-/// Raw cosines of EmbeddingGemma are compressed (unrelated ~0.50-0.66, relevant ~0.65-0.80):
-/// map `[floor, ceiling]` linearly to `[0, 1]`.
+/// Raw cosines are model specific (EmbeddingGemma: unrelated ~0.50-0.66, relevant ~0.65-0.80;
+/// Qwen3-VL-Embedding: ~0.32-0.52 / ~0.59-0.78): map `[floor, ceiling]` linearly to `[0, 1]`.
 pub fn confidence(raw: f32, floor: f32, ceiling: f32) -> f32 {
     ((raw - floor) / (ceiling - floor).max(1e-3)).clamp(0.0, 1.0)
 }

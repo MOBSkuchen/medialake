@@ -12,7 +12,7 @@ use std::time::Instant;
 use anyhow::{Context, bail};
 use bierpc::rpc::{RpcServer, ServerConfig};
 use clap::{Parser, Subcommand};
-use medialake_proto::models::{MODEL_ID, Quality, model_set};
+use medialake_proto::models::{Model, ModelSet, Quality, model_set};
 use medialake_proto::{MAX_MESSAGE_BYTES, READY_PREFIX, ServerInfo};
 
 use crate::engine::Engine;
@@ -20,7 +20,7 @@ use crate::service::{Auth, Service};
 use crate::serve::{PairArgs, ServeArgs, StateArgs};
 
 #[derive(Parser)]
-#[command(name = "medialake-server", version, about = "MediaLake embedding server (EmbeddingGemma 2 via llama.cpp)")]
+#[command(name = "medialake-server", version, about = "MediaLake embedding server (EmbeddingGemma 2 / Qwen3-VL-Embedding via llama.cpp)")]
 struct Cli {
     /// Child mode: bind 127.0.0.1, read the auth token from stdin, print `READY <port>` when loaded.
     #[arg(long)]
@@ -39,6 +39,9 @@ pub(crate) struct Common {
     /// Directory containing the GGUF files.
     #[arg(long, env = "MEDIALAKE_MODEL_DIR", default_value = ".")]
     model_dir: PathBuf,
+    /// embeddinggemma-2, qwen3-vl-embedding-2b or qwen3-vl-embedding-8b.
+    #[arg(long, default_value = "embeddinggemma-2")]
+    model: String,
     #[arg(long, default_value = "normal")]
     quality: String,
     /// Layers to offload (0 = CPU). Default: all on macOS (Metal) or when built with Vulkan, else 0.
@@ -117,9 +120,14 @@ fn gpu_layers(c: &Common) -> i32 {
     c.gpu_layers.unwrap_or(if cfg!(any(target_os = "macos", feature = "vulkan")) { 999 } else { 0 })
 }
 
-pub(crate) fn start_engine(c: &Common) -> anyhow::Result<(Engine, Quality)> {
+fn selected_set(c: &Common) -> anyhow::Result<ModelSet> {
+    let model = Model::parse(&c.model).with_context(|| format!("unknown model {:?}", c.model))?;
     let quality = Quality::parse(&c.quality).with_context(|| format!("unknown quality {:?}", c.quality))?;
-    let set = model_set(quality);
+    Ok(model_set(model, quality))
+}
+
+pub(crate) fn start_engine(c: &Common) -> anyhow::Result<(Engine, ModelSet)> {
+    let set = selected_set(c)?;
     let model = c.model_dir.join(set.model.file_name);
     let mmproj = c.model_dir.join(set.mmproj.file_name);
     for p in [&model, &mmproj] {
@@ -128,16 +136,16 @@ pub(crate) fn start_engine(c: &Common) -> anyhow::Result<(Engine, Quality)> {
         }
     }
     let t = Instant::now();
-    let engine = Engine::start(&model, &mmproj, gpu_layers(c), c.verbose_llama).map_err(anyhow::Error::msg)?;
-    tracing::info!("model {} ({}) ready in {} ms, backend {}", MODEL_ID, quality.as_str(), t.elapsed().as_millis(), backend_name());
-    Ok((engine, quality))
+    let engine = Engine::start(set.model_id, &model, &mmproj, gpu_layers(c), c.verbose_llama).map_err(anyhow::Error::msg)?;
+    tracing::info!("model {} ({}) ready in {} ms, backend {}", set.model_id.as_str(), set.quality.as_str(), t.elapsed().as_millis(), backend_name());
+    Ok((engine, set))
 }
 
-pub(crate) fn server_info(engine: &Engine, quality: Quality) -> ServerInfo {
+pub(crate) fn server_info(engine: &Engine, set: &ModelSet) -> ServerInfo {
     ServerInfo {
-        model_id: MODEL_ID.into(),
-        quality: quality.as_str().into(),
-        dims: medialake_proto::DIMS as u32,
+        model_id: set.model_id.as_str().into(),
+        quality: set.quality.as_str().into(),
+        dims: set.model_id.dims() as u32,
         audio_sample_rate: engine.audio_sample_rate,
         supports_audio: engine.supports_audio,
         backend: backend_name().into(),
@@ -152,12 +160,13 @@ async fn run_local(cli: Cli) -> anyhow::Result<()> {
     if token.len() < 16 {
         bail!("expected an auth token (>= 16 chars) on stdin");
     }
-    let (engine, quality) = start_engine(&cli.common)?;
+    let (engine, set) = start_engine(&cli.common)?;
     let shutdown = Arc::new(tokio::sync::Notify::new());
     let svc = Service {
         engine: engine.clone(),
+        model: set.model_id,
         auth: Arc::new(Auth { local_token: Some(token), remote: None }),
-        info: server_info(&engine, quality),
+        info: server_info(&engine, &set),
         shutdown: shutdown.clone(),
         pairing: None,
     };
@@ -189,13 +198,23 @@ async fn run_local(cli: Cli) -> anyhow::Result<()> {
 
 fn bench(common: &Common, media: PathBuf, repeat: usize) -> anyhow::Result<()> {
     use medialake_llama::{Embedder, Input, cosine};
-    let quality = Quality::parse(&common.quality).context("quality")?;
-    let set = model_set(quality);
+    use medialake_proto::{TextItem, TextKind, format_text};
+    let set = selected_set(common)?;
     let gpu = gpu_layers(common);
     let t = Instant::now();
-    let mut e = Embedder::load(&common.model_dir.join(set.model.file_name), &common.model_dir.join(set.mmproj.file_name), gpu, common.verbose_llama)
+    let params = engine::llama_params(set.model_id);
+    let mut e = Embedder::load(&common.model_dir.join(set.model.file_name), &common.model_dir.join(set.mmproj.file_name), gpu, common.verbose_llama, params)
         .map_err(anyhow::Error::msg)?;
-    println!("quality={} backend={} gpu_layers={gpu} load={} ms", quality.as_str(), backend_name(), t.elapsed().as_millis());
+    let audio = e.supports_audio();
+    println!(
+        "model={} quality={} dims={} backend={} gpu_layers={gpu} load={} ms",
+        set.model_id.as_str(),
+        set.quality.as_str(),
+        e.dims(),
+        backend_name(),
+        t.elapsed().as_millis()
+    );
+    let text = |kind, text: &str| format_text(set.model_id, kind, &TextItem { title: String::new(), text: text.into() });
 
     let cat = std::fs::read(media.join("cat_small.jpg"))?;
     let car = std::fs::read(media.join("car_small.jpg"))?;
@@ -204,8 +223,6 @@ fn bench(common: &Common, media: PathBuf, repeat: usize) -> anyhow::Result<()> {
         // 16-bit PCM mono WAV with a 44-byte header (poc media)
         Ok(b[44..].chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0).collect())
     };
-    let dog = read_wav("dog.wav")?;
-    let rain = read_wav("rain.wav")?;
     let long_text = "The quick brown fox jumps over the lazy dog. ".repeat(100);
 
     let mut timed = |label: &str, input: Input| -> anyhow::Result<Vec<f32>> {
@@ -219,14 +236,20 @@ fn bench(common: &Common, media: PathBuf, repeat: usize) -> anyhow::Result<()> {
         println!("{label:<28} {best:>6} ms (best of {repeat})");
         Ok(v)
     };
-    timed("text short", Input::Text("task: search result | query: a red sports car"))?;
-    timed("text ~1000 tokens", Input::Text(&long_text))?;
+    let q = timed("text short", Input::Text(&text(TextKind::Query, "a red sports car")))?;
+    timed("text ~1000 tokens", Input::Text(&text(TextKind::Document, &long_text)))?;
     let a = timed("image cat", Input::Images(&[&cat]))?;
     let b = timed("image car", Input::Images(&[&car]))?;
     timed("video 4 frames", Input::Images(&[&cat, &car, &cat, &car]))?;
-    let d = timed("audio dog", Input::Audio(&dog))?;
-    let r = timed("audio rain", Input::Audio(&rain))?;
-    println!("sanity: cos(cat,car)={:.3} cos(dog,rain)={:.3} cos(cat,cat)={:.3}", cosine(&a, &b), cosine(&d, &r), cosine(&a, &a));
+    println!("sanity: cos(cat,car)={:.3} cos(cat,cat)={:.3}", cosine(&a, &b), cosine(&a, &a));
+    println!("query 'a red sports car': cos(q,car)={:.3} cos(q,cat)={:.3}", cosine(&q, &b), cosine(&q, &a));
+    if audio {
+        let d = timed("audio dog", Input::Audio(&read_wav("dog.wav")?))?;
+        let r = timed("audio rain", Input::Audio(&read_wav("rain.wav")?))?;
+        println!("sanity: cos(dog,rain)={:.3}", cosine(&d, &r));
+    } else {
+        println!("audio: not supported by this model");
+    }
     Ok(())
 }
 

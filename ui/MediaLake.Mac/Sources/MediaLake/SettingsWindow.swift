@@ -34,8 +34,12 @@ final class SettingsModel: ObservableObject {
 
     // Model
     @Published var mode = "local"
+    @Published var embedModel = "embeddinggemma-2"
+    @Published var modelList: [(id: String, label: String)] = []
     @Published var quality = "normal"
-    @Published var models: [String: (downloaded: Bool, size: Int64)] = [:]
+    /// Download state of every quality tier, per model id.
+    @Published var allModels: [String: [String: (downloaded: Bool, size: Int64)]] = [:]
+    var models: [String: (downloaded: Bool, size: Int64)] { allModels[embedModel] ?? [:] }
     @Published var qualityInfo = ""
     @Published var downloading = false
     @Published var downloadProgress = 0.0
@@ -67,11 +71,20 @@ final class SettingsModel: ObservableObject {
         do {
             cfg = try await core.callAsync("get_settings")
             let m = try await core.callAsync("models")
-            var map: [String: (Bool, Int64)] = [:]
-            for q in (m["qualities"] as? [[String: Any]]) ?? [] {
-                map[q["quality"] as? String ?? ""] = (q["downloaded"] as? Bool ?? false, (q["size"] as? NSNumber)?.int64Value ?? 0)
+            var all: [String: [String: (downloaded: Bool, size: Int64)]] = [:]
+            var list: [(id: String, label: String)] = []
+            for e in (m["models"] as? [[String: Any]]) ?? [] {
+                let id = e["id"] as? String ?? ""
+                var map: [String: (downloaded: Bool, size: Int64)] = [:]
+                for q in (e["qualities"] as? [[String: Any]]) ?? [] {
+                    map[q["quality"] as? String ?? ""] = (q["downloaded"] as? Bool ?? false, (q["size"] as? NSNumber)?.int64Value ?? 0)
+                }
+                all[id] = map
+                let media = e["supports_audio"] as? Bool == true ? "text, images, audio, video" : "text, images, video"
+                list.append((id, "\(e["name"] as? String ?? id) (\(media))"))
             }
-            models = map.mapValues { (downloaded: $0.0, size: $0.1) }
+            allModels = all
+            modelList = list
         } catch {
             hotkeyError = error.localizedDescription
             return
@@ -80,6 +93,7 @@ final class SettingsModel: ObservableObject {
         hotkeyText = cfg["hotkey"] as? String ?? "Alt+Space"
         autostart = LoginItem.isEnabled
         mode = cfg["server_mode"] as? String ?? "local"
+        embedModel = cfg["model"] as? String ?? "embeddinggemma-2"
         quality = cfg["quality"] as? String ?? "normal"
         threshold = cfg["threshold"] as? Double ?? 0.4
         videoEnabled = cfg["video_enabled"] as? Bool ?? false
@@ -227,7 +241,7 @@ final class SettingsModel: ObservableObject {
         qualityInfo = (m.downloaded
             ? "Downloaded"
             : "Not downloaded yet (\((m.size / 1_048_576).formatted()) MB). MediaLake cannot index or search until the model is present")
-            + ". Changing the quality re-indexes everything."
+            + ". Changing the model or the quality re-indexes everything."
     }
 
     var showDownloadNow: Bool { !(models[quality]?.downloaded ?? true) && !downloading }
@@ -237,8 +251,8 @@ final class SettingsModel: ObservableObject {
         downloading = true
         downloadProgress = 0
         do {
-            _ = try await core!.callAsync("download_model", ["quality": tag])
-            models[tag] = (true, models[tag]?.size ?? 0)
+            _ = try await core!.callAsync("download_model", ["model": embedModel, "quality": tag])
+            allModels[embedModel]?[tag] = (true, models[tag]?.size ?? 0)
         } catch {
             qualityInfo = error.localizedDescription
         }
@@ -250,16 +264,22 @@ final class SettingsModel: ObservableObject {
         Task { _ = try? await core?.callAsync("cancel_download") }
     }
 
-    /// Returns the quality to show afterwards.
-    func qualityPicked(_ tag: String) async {
-        if loading || downloading || tag == quality { return }
-        let info = models[tag]
+    func qualityPicked(_ tag: String) async { await switchTo(modelId: embedModel, tag: tag) }
+
+    func modelPicked(_ id: String) async { await switchTo(modelId: id, tag: quality) }
+
+    /// Switches model and/or quality after a confirmation (and a download when the files are missing).
+    private func switchTo(modelId: String, tag: String) async {
+        if loading || downloading || (modelId == embedModel && tag == quality) { return }
+        let modelChanged = modelId != embedModel
+        let info = allModels[modelId]?[tag]
         let needsDownload = info != nil && !(info!.downloaded)
+        let name = modelList.first { $0.id == modelId }?.label ?? modelId
         let alert = NSAlert()
-        alert.messageText = "Switch to \(tag) quality?"
+        alert.messageText = modelChanged ? "Switch to \(name)?" : "Switch to \(tag) quality?"
         alert.informativeText = needsDownload
-            ? "\"\(tag)\" needs a download of \(((info?.size ?? 0) / 1_048_576).formatted()) MB. Afterwards the whole index is rebuilt with the new model."
-            : "The whole index is rebuilt with the new quality. Searching keeps working while this happens."
+            ? "This needs a download of \(((info?.size ?? 0) / 1_048_576).formatted()) MB (\(tag) quality). Afterwards the whole index is rebuilt with the new model."
+            : "The whole index is rebuilt with the new \(modelChanged ? "model" : "quality"). Searching keeps working while this happens."
         alert.addButton(withTitle: needsDownload ? "Download and switch" : "Switch")
         alert.addButton(withTitle: "Cancel")
         if alert.runModal() != .alertFirstButtonReturn {
@@ -270,8 +290,8 @@ final class SettingsModel: ObservableObject {
             downloading = true
             downloadProgress = 0
             do {
-                _ = try await core!.callAsync("download_model", ["quality": tag])
-                models[tag] = (true, info?.size ?? 0)
+                _ = try await core!.callAsync("download_model", ["model": modelId, "quality": tag])
+                allModels[modelId]?[tag] = (true, info?.size ?? 0)
             } catch {
                 qualityInfo = error.localizedDescription
                 downloading = false
@@ -280,16 +300,21 @@ final class SettingsModel: ObservableObject {
             }
             downloading = false
         }
+        embedModel = modelId
         quality = tag
+        cfg["model"] = modelId
         cfg["quality"] = tag
         refreshQualityInfo()
         await save()
+        if modelChanged, let fresh = try? await core?.callAsync("get_settings") {
+            cfg = fresh  // the score mapping follows the model
+        }
     }
 
     private func revertQuality() {
-        let q = quality
-        quality = ""  // force the picker to re-read its binding
-        quality = q
+        let (m, q) = (embedModel, quality)
+        (embedModel, quality) = ("", "")  // force the pickers to re-read their bindings
+        (embedModel, quality) = (m, q)
         refreshQualityInfo()
     }
 
@@ -498,8 +523,10 @@ struct ModelPage: View {
                 VStack(alignment: .leading, spacing: 14) {
                     VStack(alignment: .leading, spacing: 4) {
                         Text("Model")
-                        Picker("", selection: .constant(0)) { Text("EmbeddingGemma 2 (text, images, audio, video)").tag(0) }
-                            .labelsHidden().frame(width: 360, alignment: .leading)
+                        Picker("", selection: Binding(get: { model.embedModel }, set: { v in Task { await model.modelPicked(v) } })) {
+                            ForEach(model.modelList, id: \.id) { m in Text(m.label).tag(m.id) }
+                        }
+                        .labelsHidden().frame(width: 360, alignment: .leading).disabled(model.downloading)
                     }
                     VStack(alignment: .leading, spacing: 6) {
                         Text("Quality")
