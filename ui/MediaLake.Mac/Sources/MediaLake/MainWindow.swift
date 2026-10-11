@@ -120,6 +120,8 @@ final class SearchModel: ObservableObject {
     @Published var hotkeyError = ""
     @Published var autostart = false
     @Published var autostartError = ""
+    /// The model finished downloading while the setup window was open.
+    @Published var setupDone = false
 
     @Published var progressText = ""
     @Published var serverText = ""
@@ -128,13 +130,16 @@ final class SearchModel: ObservableObject {
     var currentQuality = "normal"
     var onHide: (() -> Void)?
     var onOpenSettings: (() -> Void)?
+    /// First run: the search model is missing, so the setup window replaces the search panel.
+    var onNeedSetup: (() -> Void)?
+    var onCloseSetup: (() -> Void)?
     var applyHotkey: ((String) -> String?)?
 
     private var searchId = 0
     private var debounce: Task<Void, Never>?
     private var core: CoreClient? { AppState.core }
 
-    var wantsExpanded: Bool { setupVisible || !query.trimmingCharacters(in: .whitespaces).isEmpty }
+    var wantsExpanded: Bool { !query.trimmingCharacters(in: .whitespaces).isEmpty }
 
     var statusText: String { [serverText, progressText].filter { !$0.isEmpty }.joined(separator: "  ·  ") }
 
@@ -256,8 +261,9 @@ final class SearchModel: ObservableObject {
         downloading = false
         setupProgress = nil
         await checkSetup()
-        if !setupVisible {
+        if !setupVisible && setupInfo.isEmpty {
             serverText = "Model ready. Add folders to index in Settings."
+            setupDone = true
             focusTick += 1
         }
     }
@@ -383,7 +389,7 @@ final class MainWindowController: NSObject {
         panel.contentView = backdrop
 
         panel.onResign = { [weak self] in
-            guard let self, self.everShown, !self.model.downloading else { return }
+            guard let self, self.everShown else { return }
             self.hide()
         }
         model.onHide = { [weak self] in self?.hide() }
@@ -395,6 +401,10 @@ final class MainWindowController: NSObject {
 
     /// Shown centred on the screen under the mouse pointer.
     func show() {
+        if model.setupVisible {
+            model.onNeedSetup?()
+            return
+        }
         let mouse = NSEvent.mouseLocation
         let screen = NSScreen.screens.first { NSMouseInRect(mouse, $0.frame, false) } ?? NSScreen.main ?? NSScreen.screens[0]
         let wa = screen.visibleFrame
@@ -404,7 +414,14 @@ final class MainWindowController: NSObject {
         panel.makeKeyAndOrderFront(nil)
         everShown = true
         model.focusTick += 1
-        Task { await model.checkSetup() }
+        Task {
+            await model.checkSetup()
+            // the model turned out to be missing: the setup window takes over
+            if model.setupVisible, panel.isVisible {
+                hide()
+                model.onNeedSetup?()
+            }
+        }
     }
 
     func hide() { panel.orderOut(nil) }
@@ -464,9 +481,7 @@ struct SearchView: View {
             .padding(.horizontal, 2)
 
             ZStack {
-                if model.setupVisible {
-                    SetupPanel(model: model)
-                } else if model.resultsVisible {
+                if model.resultsVisible {
                     ResultsList(model: model)
                 } else {
                     Text(model.emptyText)
@@ -552,42 +567,107 @@ struct ResultRow: View {
     }
 }
 
-/// First run: the model is not on this computer yet.
-struct SetupPanel: View {
+// MARK: - First-run setup window
+
+/// A normal window (so it can always be closed with the button, ⌘W or Esc). Closing it does not stop a
+/// running download: the download lives in the core and the model, not in the window.
+final class SetupWindow: NSWindow {
+    override func cancelOperation(_ sender: Any?) { performClose(nil) }
+}
+
+@MainActor
+final class SetupWindowController: NSObject {
+    let window: SetupWindow
+    var rootView: NSView { window.contentView! }
+
+    init(model: SearchModel) {
+        window = SetupWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 540, height: 10),
+            styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        super.init()
+        window.title = "MediaLake"
+        window.isReleasedWhenClosed = false
+        let host = NSHostingView(rootView: SetupView(model: model))
+        window.contentView = host
+        window.setContentSize(host.fittingSize)
+        window.center()
+    }
+
+    func show() {
+        NSApp.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
+    }
+
+    func close() { window.close() }
+}
+
+struct SetupView: View {
     @ObservedObject var model: SearchModel
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text("One more step: download the search model").font(.system(size: 18, weight: .semibold))
+        VStack(alignment: .leading, spacing: 16) {
+            Text("Welcome to MediaLake").font(.system(size: 26, weight: .bold))
+            if model.setupDone {
+                ready
+            } else {
+                download
+            }
+        }
+        .padding(28)
+        .frame(width: 540, alignment: .leading)
+    }
+
+    private var download: some View {
+        VStack(alignment: .leading, spacing: 16) {
             Text("MediaLake understands your files with an AI model that runs on this computer. It is downloaded once and stays here. Pick a quality (you can change it later in Settings):")
-                .opacity(0.75).fixedSize(horizontal: false, vertical: true)
+                .opacity(0.8).fixedSize(horizontal: false, vertical: true)
             Picker("", selection: $model.setupQuality) {
                 ForEach(model.qualities) { q in Text(q.label).tag(q.name) }
             }
             .labelsHidden()
-            .frame(maxWidth: 440)
+            .frame(maxWidth: 460, alignment: .leading)
             .disabled(model.downloading)
 
-            HStack(alignment: .top, spacing: 16) {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Global shortcut").fontWeight(.semibold)
-                    HotkeyRecorder(text: $model.hotkeyText, error: $model.hotkeyError) { model.applyHotkey?($0) }
-                }
-                Toggle("Start MediaLake when I sign in", isOn: Binding(get: { model.autostart }, set: { model.setAutostart($0) }))
-                    .padding(.top, 20)
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Global shortcut").fontWeight(.semibold)
+                HotkeyRecorder(text: $model.hotkeyText, error: $model.hotkeyError) { model.applyHotkey?($0) }
             }
-            if !model.autostartError.isEmpty { Text(model.autostartError).foregroundColor(.red).font(.system(size: 12)) }
+            VStack(alignment: .leading, spacing: 4) {
+                Toggle("Start MediaLake when I sign in", isOn: Binding(get: { model.autostart }, set: { model.setAutostart($0) }))
+                if !model.autostartError.isEmpty { Text(model.autostartError).foregroundColor(.red).font(.system(size: 12)) }
+            }
 
-            HStack(spacing: 12) {
+            if let p = model.setupProgress { ProgressView(value: p).progressViewStyle(.linear) }
+            if !model.setupInfo.isEmpty { Text(model.setupInfo).opacity(0.75).fixedSize(horizontal: false, vertical: true) }
+            if model.downloading {
+                Text("You can close this window: the download continues in the background.").opacity(0.6).font(.system(size: 12))
+            }
+
+            HStack {
+                Spacer()
+                Button(model.downloading ? "Hide" : "Close") { model.onCloseSetup?() }.keyboardShortcut(.cancelAction)
                 Button("Download") { Task { await model.download() } }
                     .buttonStyle(.borderedProminent)
-                    .disabled(model.downloading)
-                Text(model.setupInfo).opacity(0.75).lineLimit(2)
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(model.downloading || model.qualities.isEmpty)
             }
-            if let p = model.setupProgress { ProgressView(value: p).progressViewStyle(.linear) }
-            Spacer(minLength: 0)
         }
-        .padding(.top, 10)
-        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var ready: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("The model is ready. Press \(HotkeySpec.display(of: model.hotkeyText)) anywhere to search. Add the folders you want to search in Settings.")
+                .opacity(0.8).fixedSize(horizontal: false, vertical: true)
+            HStack {
+                Spacer()
+                Button("Close") { model.onCloseSetup?() }.keyboardShortcut(.cancelAction)
+                Button("Add folders…") {
+                    model.onCloseSetup?()
+                    model.onOpenSettings?()
+                }
+                .buttonStyle(.borderedProminent)
+                .keyboardShortcut(.defaultAction)
+            }
+        }
     }
 }

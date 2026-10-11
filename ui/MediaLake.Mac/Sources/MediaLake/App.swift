@@ -25,6 +25,7 @@ struct MediaLakeMain {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var main: MainWindowController!
     private var settings: SettingsWindowController?
+    private var setup: SetupWindowController?
     private var statusItem: StatusItemController?
     private var hotkeyText = "Alt+Space"
     private var testMode = false
@@ -53,6 +54,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         main = MainWindowController()
         main.model.onOpenSettings = { [weak self] in self?.showSettings() }
+        main.model.onNeedSetup = { [weak self] in self?.showSetup() }
+        main.model.onCloseSetup = { [weak self] in self?.setup?.close() }
         main.model.applyHotkey = { [weak self] in self?.applyHotkey($0) }
         AppState.core?.onEvent = { [weak self] ev in
             self?.main.model.handle(event: ev)
@@ -77,10 +80,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         if let e = AppState.startupError { main.model.handle(event: ["type": "error", "message": e]) }
 
+        let background = argv.contains("--background") || launchedAtLogin()
         if testMode {
             Task { await runTest(selfTest: selfTest, shotPath: shot) }
-        } else if !argv.contains("--background") && !launchedAtLogin() && AppState.core != nil && isFirstRun() {
-            main.show()
+        } else if AppState.core != nil {
+            Task {
+                // learn early whether the model is missing, so the hotkey opens the right window at once
+                await main.model.checkSetup()
+                if background { return }
+                if main.model.setupVisible { showSetup() } else if isFirstRun() { main.show() }
+            }
         }
     }
 
@@ -111,6 +120,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func toggle() { main.toggle() }
+
+    private func showSetup() {
+        if setup == nil { setup = SetupWindowController(model: main.model) }
+        main.hide()
+        setup?.show()
+    }
 
     private func showSettings() {
         if settings == nil {
@@ -245,6 +260,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             log.append("hotkey \(t) -> \(HotkeySpec.parse(t)?.display ?? "invalid")")
         }
         if let shotPath { await saveScreenshot(of: main.rootView, to: shotPath) }
+        if let path = env["MEDIALAKE_TEST_SETUP"] {
+            showSetup()
+            setup?.window.appearance = NSAppearance(named: .aqua)  // see the settings screenshot below
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            if let v = setup?.rootView { await saveScreenshot(of: v, to: path) }
+        }
         if let spec = env["MEDIALAKE_TEST_SETTINGS"] {
             let parts = spec.split(separator: "|", maxSplits: 1).map(String.init)
             if parts.count == 2, let page = Int(parts[0]), let p = SettingsModel.Page(rawValue: page) {

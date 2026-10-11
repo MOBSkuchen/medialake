@@ -80,7 +80,7 @@ Uninstall with Settings > General > Uninstall (moves the app to the Trash, remov
 item, optionally deletes the data folder). Dragging the app to the Trash by hand also works but leaves
 `~/Library/Application Support/MediaLake` and the login item entry behind.
 
-Test hooks of the app (same as on Windows): `--selftest`, `--screenshot <png>`, `--background`,
+Test hooks of the app (same as on Windows, plus `MEDIALAKE_TEST_SETUP=<png>`): `--selftest`, `--screenshot <png>`, `--background`,
 `MEDIALAKE_TEST_QUERY` / `_WAIT` / `_NOWAIT` / `_SETTINGS=<page>|<png>`; the log goes to `logs/selftest.log`.
 
 ## Remote server
@@ -100,3 +100,7 @@ stored DPAPI-protected (macOS: in the Keychain). File contents are sent to the r
 `%LOCALAPPDATA%\MediaLake\` : `config.toml`, `index.db` (+ `vectors.usearch`), `models\`, `logs\`
 (`client.log`, `server.log`, `ui.log`). Override with `MEDIALAKE_HOME` / `MEDIALAKE_MODEL_DIR`. On macOS the same files live in
 `~/Library/Application Support/MediaLake/`.
+
+## License
+
+GNU Affero General Public License v3, see `LICENSE`. Both installers show it on their licence page.

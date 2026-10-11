@@ -2,7 +2,7 @@
 <installer-gui-script minSpecVersion="2">
     <title>MediaLake</title>
     <welcome file="welcome.html"/>
-    <license file="license.html"/>
+    <license file="license.txt" mime-type="text/plain"/>
     <conclusion file="conclusion.html"/>
     <!-- "Install for me only" (~/Applications, no admin password) next to the all-users install -->
     <domains enable_anywhere="false" enable_currentUserHome="true" enable_localSystem="true"/>

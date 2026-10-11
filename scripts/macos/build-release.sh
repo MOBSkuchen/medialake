@@ -58,7 +58,10 @@ if [ "$installer" = 1 ]; then
     pkgbuild --root dist/app --component-plist installer/macos/component.plist \
         --identifier com.sonvogel.medialake --version "$version" --install-location /Applications \
         --scripts installer/macos/scripts "$work/MediaLake.pkg"
-    product=(productbuild --distribution installer/macos/Distribution.xml --package-path "$work" --resources installer/macos/resources)
+    # the licence page shows the repository's LICENSE
+    cp -R installer/macos/resources "$work/resources"
+    cp LICENSE "$work/resources/license.txt"
+    product=(productbuild --distribution installer/macos/Distribution.xml --package-path "$work" --resources "$work/resources")
     if [ -n "${MEDIALAKE_INSTALLER_SIGN_ID:-}" ]; then product+=(--sign "$MEDIALAKE_INSTALLER_SIGN_ID" --timestamp); fi
     "${product[@]}" "$pkg"
     rm -rf "$work"

@@ -380,3 +380,11 @@ Deviations from the plan, and things the plan did not know:
   AppleDouble entries for the provenance attribute; they are harmless and absent when built from a normal terminal.
 - Not covered by a test: remote pairing against a Windows server (M4), the first-run model download button in the
   UI (the download manager itself is shared with Windows), real Gatekeeper behaviour, the case-sensitive volume case.
+- **First run (revised after review).** The first-run panel inside the search window was replaced by a separate
+  *Welcome* window (quality, shortcut, start at login, Download). The search box and the settings button do not
+  appear until the model is there; the window closes with the button, Esc or ⌘W and a running download continues in
+  the background (the hotkey reopens the same window while the model is missing). The Windows window got the same
+  behaviour: no search box / settings button during setup, compact height, a Hide button, Esc, and it no longer
+  stays open while downloading. The Windows part is not compiled on this machine.
+- **License.** `LICENSE` (AGPLv3, from master) is shown on the licence page of both installers; the pkg gets it from
+  `build-release.sh`, Inno Setup via `LicenseFile`.

@@ -6,6 +6,9 @@
     xmlns:local="using:MediaLake"
     Title="MediaLake">
     <Grid x:Name="Root" Padding="24,18,24,14" RowSpacing="8">
+        <Grid.KeyboardAccelerators>
+            <KeyboardAccelerator Key="Escape" Invoked="Escape_Invoked" />
+        </Grid.KeyboardAccelerators>
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto" />
             <RowDefinition Height="Auto" />
@@ -15,7 +18,7 @@
         </Grid.RowDefinitions>
 
         <Grid>
-            <TextBlock Text="SearchNow" FontSize="30" FontWeight="Black" VerticalAlignment="Center" />
+            <TextBlock Text="MediaLake" FontSize="30" FontWeight="Black" VerticalAlignment="Center" />
             <Button x:Name="SettingsButton" HorizontalAlignment="Right" VerticalAlignment="Center"
                     Click="Settings_Click" ToolTipService.ToolTip="Settings" Background="Transparent" BorderThickness="0">
                 <FontIcon Glyph="&#xE713;" />
@@ -76,6 +79,8 @@
             <ComboBox x:Name="SetupQuality" MinWidth="440" />
             <StackPanel Orientation="Horizontal" Spacing="12">
                 <Button x:Name="SetupButton" Content="Download" Style="{StaticResource AccentButtonStyle}" Click="SetupDownload_Click" />
+                <Button x:Name="SetupHide" Content="Hide" Click="SetupHide_Click"
+                        ToolTipService.ToolTip="Close this window; a running download continues in the background" />
                 <TextBlock x:Name="SetupInfo" VerticalAlignment="Center" Opacity="0.75" />
             </StackPanel>
             <ProgressBar x:Name="SetupBar" Minimum="0" Maximum="1" Visibility="Collapsed" />

@@ -18,6 +18,7 @@ ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 OutputDir=..\dist
 OutputBaseFilename=MediaLake-Setup-{#AppVersion}
+LicenseFile=..\LICENSE
 SetupIconFile=..\ui\MediaLake.App\Assets\MediaLake.ico
 UninstallDisplayIcon={app}\{#AppExe}
 Compression=lzma2/max
