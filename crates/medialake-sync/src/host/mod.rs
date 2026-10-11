@@ -339,13 +339,14 @@ impl PersistentRpcServerHandler for SyncStreams {
                         f.seek(std::io::SeekFrom::Start(offset)).await.map_err(io_err)?;
                         let mut remaining = if len == 0 { size.saturating_sub(offset) } else { len.min(size.saturating_sub(offset)) };
                         let mut buf = vec![0u8; MAX_FRAME.min(1 << 20)];
+                        let mut fw = FrameWriter::new();
                         while remaining > 0 {
                             let want = (buf.len() as u64).min(remaining) as usize;
                             let n = f.read(&mut buf[..want]).await.map_err(io_err)?;
                             if n == 0 {
                                 break;
                             }
-                            write_frame(s, &buf[..n]).await.map_err(io_err)?;
+                            fw.write(s, &buf[..n]).await.map_err(io_err)?;
                             remaining -= n as u64;
                         }
                         write_frame(s, &[]).await.map_err(io_err)?;

@@ -324,3 +324,230 @@ async fn throughput_localhost() {
     println!("upload   {mb} MiB in {:.2} s = {:.0} MiB/s", up.as_secs_f64(), mb as f64 / up.as_secs_f64());
     println!("download {mb} MiB in {:.2} s = {:.0} MiB/s", down.as_secs_f64(), mb as f64 / down.as_secs_f64());
 }
+
+fn noise(n: usize, seed: u64) -> Vec<u8> {
+    let mut x = seed | 1;
+    (0..n)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x >> 24) as u8
+        })
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bandwidth_limit_is_enforced_and_pool_is_reused() {
+    use medialake_sync::member::transport::{Transport, Upload};
+    let f = fixture().await;
+    let creds = pair(&code(&f, "rw"), "Laptop").await.unwrap();
+    let client = HostClient::new(tokio::runtime::Handle::current(), creds, "Laptop");
+    let dir = tempfile::tempdir().unwrap();
+
+    // several uploads in a row reuse pooled connections (and survive their idling)
+    for i in 0..4u64 {
+        let src = dir.path().join(format!("f{i}.bin"));
+        std::fs::write(&src, noise(200_000, 1 + i)).unwrap();
+        let (hash, size) = medialake_sync::util::hash_file(&src).unwrap();
+        let t = client.transport(&f.sync_id);
+        let r = tokio::task::spawn_blocking(move || t.upload(&hash, &src, size)).await.unwrap().unwrap();
+        assert_eq!(r, Upload::Done);
+    }
+
+    // 800 kbit/s = 100 kB/s: 250 kB of incompressible data takes about 2.5 s
+    client.set_limits(800, 0);
+    let src = dir.path().join("slow.bin");
+    std::fs::write(&src, noise(250_000, 99)).unwrap();
+    let (hash, size) = medialake_sync::util::hash_file(&src).unwrap();
+    let t = client.transport(&f.sync_id);
+    let started = std::time::Instant::now();
+    let r = tokio::task::spawn_blocking(move || t.upload(&hash, &src, size)).await.unwrap().unwrap();
+    let took = started.elapsed();
+    assert_eq!(r, Upload::Done);
+    assert!(took >= Duration::from_millis(1800), "upload took {took:?}, limit not enforced");
+    assert!(took < Duration::from_secs(20), "upload took {took:?}");
+
+    // unlimited again
+    client.set_limits(0, 0);
+    let src = dir.path().join("fast.bin");
+    std::fs::write(&src, noise(250_000, 7)).unwrap();
+    let (hash, size) = medialake_sync::util::hash_file(&src).unwrap();
+    let t = client.transport(&f.sync_id);
+    let started = std::time::Instant::now();
+    tokio::task::spawn_blocking(move || t.upload(&hash, &src, size)).await.unwrap().unwrap();
+    assert!(started.elapsed() < Duration::from_secs(2));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn compressible_content_travels_compressed() {
+    use medialake_sync::member::transport::{Fetch, Transport, Upload};
+    let f = fixture().await;
+    let creds = pair(&code(&f, "rw"), "Laptop").await.unwrap();
+    let client = HostClient::new(tokio::runtime::Handle::current(), creds, "Laptop");
+    let text = "MediaLake keeps folders in step. ".repeat(60_000).into_bytes(); // ~2 MB of text
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("text.txt");
+    std::fs::write(&src, &text).unwrap();
+    let (hash, size) = medialake_sync::util::hash_file(&src).unwrap();
+    let hs = f.host.sync(&f.sync_id).unwrap();
+    let t = client.transport(&f.sync_id);
+    let (s2, h2) = (src.clone(), hash.clone());
+    assert_eq!(tokio::task::spawn_blocking(move || t.upload(&h2, &s2, size)).await.unwrap().unwrap(), Upload::Done);
+    hs.commit(
+        Access::ReadWrite,
+        "x",
+        &[medialake_proto::sync::Change::Put { path: "text.txt".into(), hash, size, mtime: 0, exec: false, base_rev: 0 }],
+    )
+    .unwrap();
+    let rev = hs.entry("text.txt").unwrap().rev;
+    let dest = dir.path().join("text.dl");
+    let (t, d2) = (client.transport(&f.sync_id), dest.clone());
+    let got = tokio::task::spawn_blocking(move || t.download("text.txt", rev, &d2)).await.unwrap().unwrap();
+    assert_eq!(got, Fetch::Done);
+    assert_eq!(std::fs::read(&dest).unwrap(), text);
+}
+
+/// A TCP forwarder that cuts the first connection that carries `cut_after` bytes towards the host.
+struct CutProxy {
+    addr: std::net::SocketAddr,
+    /// bytes forwarded towards the host, per accepted connection
+    sent: Arc<std::sync::Mutex<Vec<u64>>>,
+}
+
+async fn cut_proxy(upstream: String, cut_after: u64) -> CutProxy {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let sent = Arc::new(std::sync::Mutex::new(Vec::<u64>::new()));
+    let cut_done = Arc::new(AtomicBool::new(false));
+    let sent2 = sent.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut client, _)) = listener.accept().await else { return };
+            let upstream = upstream.clone();
+            let sent = sent2.clone();
+            let cut_done = cut_done.clone();
+            let idx = {
+                let mut v = sent.lock().unwrap();
+                v.push(0);
+                v.len() - 1
+            };
+            tokio::spawn(async move {
+                let Ok(mut server) = tokio::net::TcpStream::connect(&upstream).await else { return };
+                let (mut cr, mut cw) = client.split();
+                let (mut sr, mut sw) = server.split();
+                let up = async {
+                    let mut buf = vec![0u8; 64 * 1024];
+                    loop {
+                        let n = cr.read(&mut buf).await?;
+                        if n == 0 {
+                            return Ok::<(), std::io::Error>(());
+                        }
+                        sw.write_all(&buf[..n]).await?;
+                        let total = {
+                            let mut v = sent.lock().unwrap();
+                            v[idx] += n as u64;
+                            v[idx]
+                        };
+                        if total >= cut_after && !cut_done.swap(true, Ordering::SeqCst) {
+                            return Err(std::io::Error::other("cut"));
+                        }
+                    }
+                };
+                let down = tokio::io::copy(&mut sr, &mut cw);
+                tokio::select! {
+                    _ = up => {}
+                    _ = down => {}
+                }
+            });
+        }
+    });
+    CutProxy { addr, sent }
+}
+
+/// S0: a large upload whose connection is cut half way resumes at the byte the host already has.
+/// `SYNC_BIG_MB=5120 cargo test --release -p medialake-sync --test network -- --ignored --nocapture cut`
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn cut_connection_resumes_large_upload() {
+    use medialake_sync::member::transport::{HostCreds, Transport, Upload};
+    let mb: u64 = std::env::var("SYNC_BIG_MB").ok().and_then(|s| s.parse().ok()).unwrap_or(256);
+    let f = fixture().await;
+    let creds = pair(&code(&f, "rw"), "Laptop").await.unwrap();
+    let proxy = cut_proxy(creds.address.clone(), mb * 1_048_576 * 4 / 10).await;
+    let via_proxy = HostCreds { address: proxy.addr.to_string(), ..creds };
+    let client = HostClient::new(tokio::runtime::Handle::current(), via_proxy, "Laptop");
+
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("huge.bin");
+    {
+        use std::io::Write;
+        let mut w = std::io::BufWriter::new(std::fs::File::create(&src).unwrap());
+        let mut x = 0x2545_F491_4F6C_DD1Du64;
+        let mut block = vec![0u8; 1 << 20];
+        for _ in 0..mb {
+            for b in block.iter_mut() {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                *b = (x >> 24) as u8;
+            }
+            w.write_all(&block).unwrap();
+        }
+    }
+    let (hash, size) = medialake_sync::util::hash_file(&src).unwrap();
+    let hs = f.host.sync(&f.sync_id).unwrap();
+
+    let t = client.transport(&f.sync_id);
+    let (s2, h2) = (src.clone(), hash.clone());
+    let first = tokio::task::spawn_blocking(move || t.upload(&h2, &s2, size)).await.unwrap();
+    assert!(first.is_err(), "the first attempt should have been cut: {first:?}");
+    // give the host a moment to notice the closed stream and settle its partial file
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let have = hs.upload_have(&hash, size);
+    assert!(have > 0 && have < size, "host kept a partial file: {have} of {size}");
+    println!("cut after ~{} MiB, host holds {} MiB", mb * 4 / 10, have / 1_048_576);
+
+    let t = client.transport(&f.sync_id);
+    let (s2, h2) = (src.clone(), hash.clone());
+    let started = std::time::Instant::now();
+    let second = tokio::task::spawn_blocking(move || t.upload(&h2, &s2, size)).await.unwrap().unwrap();
+    assert_eq!(second, Upload::Done);
+    let sent = proxy.sent.lock().unwrap().clone();
+    let resumed = *sent.last().unwrap();
+    println!("second attempt sent {} MiB of {} MiB in {:.1} s", resumed / 1_048_576, size / 1_048_576, started.elapsed().as_secs_f64());
+    // TLS records and frame headers add about 0.15 %; anything near the full size means a restart
+    assert!(resumed < (size - have) / 100 * 101, "resume re-sent data: {resumed} bytes for {} missing", size - have);
+    assert_eq!(hs.upload_have(&hash, size), size);
+}
+
+/// S0: a notification stream that sits idle for a long time stays connected (heartbeats every 30 s)
+/// and still delivers. `SYNC_IDLE_MINUTES=60 cargo test --release -p medialake-sync --test network --
+/// --ignored --nocapture idle`
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn idle_notification_stream_survives() {
+    let minutes: u64 = std::env::var("SYNC_IDLE_MINUTES").ok().and_then(|s| s.parse().ok()).unwrap_or(2);
+    let f = fixture().await;
+    let creds = pair(&code(&f, "rw"), "Laptop").await.unwrap();
+    let client = HostClient::new(tokio::runtime::Handle::current(), creds, "Laptop");
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let _sub = client.subscribe(vec![SubscribeItem { sync: f.sync_id.clone(), cursor: f.host.sync(&f.sync_id).unwrap().seq() }], tx);
+    let rx = Arc::new(std::sync::Mutex::new(rx));
+    let r2 = rx.clone();
+    let first = tokio::task::spawn_blocking(move || r2.lock().unwrap().recv_timeout(Duration::from_secs(10))).await.unwrap().unwrap();
+    assert_eq!(first, "", "connected marker");
+    println!("idle for {minutes} min ...");
+    tokio::time::sleep(Duration::from_secs(minutes * 60)).await;
+    // no reconnects happened (each one would have produced another empty marker)
+    let r2 = rx.clone();
+    let extra: Vec<String> = tokio::task::spawn_blocking(move || r2.lock().unwrap().try_iter().collect()).await.unwrap();
+    assert!(extra.is_empty(), "the stream reconnected while idle: {extra:?}");
+    write(&f.host_root, "after-idle.txt", "still alive");
+    let r2 = rx.clone();
+    let got = tokio::task::spawn_blocking(move || r2.lock().unwrap().recv_timeout(Duration::from_secs(20))).await.unwrap();
+    assert_eq!(got.unwrap(), f.sync_id);
+    println!("survived {minutes} min idle and delivered");
+}

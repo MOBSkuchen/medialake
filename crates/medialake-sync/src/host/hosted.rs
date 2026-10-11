@@ -815,9 +815,17 @@ impl HostedSync {
     /// Reconciles the given paths (files or folders; empty string = everything), as one batch so that a
     /// rename shows up as a move.
     pub fn scan_paths(&self, prefixes: &[String]) -> Result<usize> {
+        if !self.root.is_dir() {
+            // vanished root: never turn an unplugged disk into mass deletes
+            bail!("sync folder {} is missing", self.root.display());
+        }
+        // walking and hashing (and copying into the blob store) happen without the sync's lock, so a
+        // large file edited on the host does not hold up members' commits
+        let (scope, found) = self.walk_scope(prefixes);
+        let pre = self.prehash(&scope, &found);
         let n = {
             let mut c = self.db.lock().unwrap();
-            self.scan_locked(&mut c, prefixes)?
+            self.scan_locked(&mut c, &scope, &found, &pre)?
         };
         if n > 0 {
             self.notify_if_advanced();
@@ -882,12 +890,9 @@ impl HostedSync {
         }
     }
 
-    fn scan_locked(&self, conn: &mut Connection, prefixes: &[String]) -> Result<usize> {
+    /// Normalises the scan roots and lists what is on disk below them.
+    fn walk_scope(&self, prefixes: &[String]) -> (Vec<String>, Vec<Found>) {
         let ignore = self.ignore();
-        if !self.root.is_dir() {
-            // vanished root: never turn an unplugged disk into mass deletes
-            bail!("sync folder {} is missing", self.root.display());
-        }
         let mut found: Vec<Found> = vec![];
         let mut issues = vec![];
         let mut keys = HashMap::new();
@@ -906,13 +911,50 @@ impl HostedSync {
         if scope.iter().any(|p| p.is_empty()) {
             *self.issues.lock().unwrap() = issues;
         }
+        (scope, found)
+    }
 
+    /// Hashes (and preserves) every file that differs from its row, without holding the lock.
+    fn prehash(&self, scope: &[String], found: &[Found]) -> HashMap<String, (String, u64)> {
+        let live: HashMap<String, Entry> = {
+            let c = self.db.lock().unwrap();
+            let mut m = HashMap::new();
+            for p in scope {
+                for e in live_under(&c, p).unwrap_or_default() {
+                    m.insert(e.path.clone(), e);
+                }
+            }
+            m
+        };
+        let preserve = self.policy().enabled();
+        let mut out = HashMap::new();
+        for f in found.iter().filter(|f| f.kind == EntryKind::File) {
+            let unchanged = matches!(live.get(&f.rel), Some(e) if e.kind == EntryKind::File && e.size == f.size && e.mtime == f.mtime && e.exec == f.exec);
+            if unchanged {
+                continue;
+            }
+            let abs = self.abs(&f.rel);
+            let Ok((hash, size)) = hash_file(&abs) else { continue };
+            // still being written: the locked pass (or the next scan) deals with it
+            match std::fs::metadata(&abs) {
+                Ok(m) if m.len() == f.size && mtime_ms(&m) == f.mtime => {}
+                _ => continue,
+            }
+            if preserve {
+                let _ = self.store_blob_file(&hash, &abs);
+            }
+            out.insert(f.rel.clone(), (hash, size));
+        }
+        out
+    }
+
+    fn scan_locked(&self, conn: &mut Connection, scope: &[String], found: &[Found], pre: &HashMap<String, (String, u64)>) -> Result<usize> {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let seq: u64 = get_meta(&tx, "seq")?.and_then(|s| s.parse().ok()).unwrap_or(0);
         let mut cx = Cx { c: &tx, seq, author: HOST_AUTHOR.to_string(), now: now_secs() };
 
         let mut live: BTreeMap<String, Entry> = BTreeMap::new();
-        for p in &scope {
+        for p in scope {
             for e in live_under(&tx, p)? {
                 live.insert(e.path.clone(), e);
             }
@@ -922,15 +964,20 @@ impl HostedSync {
         // classify
         let mut new_dirs: Vec<&Found> = vec![];
         let mut puts: Vec<(&Found, String, u64, bool)> = vec![]; // found, hash, size, is_new
-        for f in &found {
+        for f in found {
             let cur = live.get(&f.rel);
             match (f.kind, cur) {
                 (EntryKind::Dir, Some(e)) if e.kind == EntryKind::Dir => {}
                 (EntryKind::Dir, _) => new_dirs.push(f),
                 (EntryKind::File, Some(e)) if e.kind == EntryKind::File && e.size == f.size && e.mtime == f.mtime && e.exec == f.exec => {}
                 (EntryKind::File, cur) => {
-                    let abs = self.abs(&f.rel);
-                    let Ok((hash, size)) = hash_file(&abs) else { continue };
+                    let (hash, size) = match pre.get(&f.rel) {
+                        Some(h) => h.clone(),
+                        None => match hash_file(&self.abs(&f.rel)) {
+                            Ok(h) => h,
+                            Err(_) => continue,
+                        },
+                    };
                     let is_new = !matches!(cur, Some(e) if e.kind == EntryKind::File);
                     if let Some(e) = cur {
                         if e.kind == EntryKind::File && e.hash == hash {
@@ -1184,10 +1231,21 @@ impl HostedSync {
     /// Makes sure `<store>/blobs/..` holds `hash`, taking it from `src`. Returns false if `src` no
     /// longer has that content (changed meanwhile).
     fn ensure_blob(&self, c: &Connection, hash: &str, size: u64, src: &Path) -> Result<bool> {
-        let blob = self.blob_path(hash);
-        if blob.is_file() {
+        if self.blob_path(hash).is_file() {
             c.execute("INSERT OR IGNORE INTO blobs(hash,size) VALUES(?1,?2)", params![hash, size as i64])?;
             return Ok(true);
+        }
+        let (h, n) = self.store_blob_file(hash, src)?;
+        c.execute("INSERT OR IGNORE INTO blobs(hash,size) VALUES(?1,?2)", params![h, n as i64])?;
+        Ok(h == hash)
+    }
+
+    /// The file half of [`HostedSync::ensure_blob`]: no database access, so it can run unlocked.
+    /// Returns the hash and size of what was actually stored.
+    fn store_blob_file(&self, hash: &str, src: &Path) -> Result<(String, u64)> {
+        let blob = self.blob_path(hash);
+        if blob.is_file() {
+            return Ok((hash.to_string(), std::fs::metadata(&blob)?.len()));
         }
         let tmp = self.tmp_file(&format!("{}.blob", random_id()));
         let (h, n) = if try_clone(src, &tmp) {
@@ -1207,8 +1265,7 @@ impl HostedSync {
         } else {
             move_file(&tmp, &final_blob)?;
         }
-        c.execute("INSERT OR IGNORE INTO blobs(hash,size) VALUES(?1,?2)", params![h, n as i64])?;
-        Ok(h == hash)
+        Ok((h, n))
     }
 
     /// Preserves every current file that has no blob yet (a backup strategy was just switched on).
@@ -1408,7 +1465,7 @@ impl HostedSync {
                     let Some((hash, size, mtime)) = v else { bail!("no version {rev} of {path}") };
                     targets.push((path.clone(), EntryKind::File, hash, size as u64, mtime, false));
                 }
-                RestoreWhat::Snapshot { id, path } => {
+                RestoreWhat::Snapshot { id, path, .. } => {
                     let mut st = c.prepare(
                         "SELECT path,kind,hash,size,mtime,exec FROM snapshot_entries WHERE snapshot=?1 ORDER BY path",
                     )?;
@@ -1438,6 +1495,7 @@ impl HostedSync {
             let (y, m, d, _, _) = civil(now_secs());
             format!("{y:04}-{m:02}-{d:02}")
         };
+        let snapshot_paths: Vec<String> = targets.iter().map(|t| t.0.clone()).collect();
         let mut changes: Vec<Change> = vec![];
         for (path, kind, hash, size, mtime, exec) in targets {
             let dest = if as_copy { restored_name(&path, &stamp) } else { path.clone() };
@@ -1455,6 +1513,18 @@ impl HostedSync {
                     let base_rev = cur.map(|e| e.rev).unwrap_or(0);
                     changes.push(Change::Put { path: dest, hash, size, mtime, exec, base_rev });
                 }
+            }
+        }
+        if let (RestoreWhat::Snapshot { path, prune: true, .. }, false) = (what, as_copy) {
+            let keep: HashSet<&str> = snapshot_paths.iter().map(String::as_str).collect();
+            let mut extra: Vec<Entry> = {
+                let c = self.db.lock().unwrap();
+                live_under(&c, path)?.into_iter().filter(|e| !keep.contains(e.path.as_str())).collect()
+            };
+            // children before their folders
+            extra.sort_by(|a, b| b.path.cmp(&a.path));
+            for e in extra {
+                changes.push(Change::Delete { path: e.path, base_rev: e.rev });
             }
         }
         self.commit(Access::ReadWrite, author, &changes)

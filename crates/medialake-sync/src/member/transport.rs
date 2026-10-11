@@ -19,6 +19,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufStream};
 use tokio::runtime::Handle;
 
 use crate::host::hosted::{ChangesResult, DownloadSource, HostedSync};
+use crate::util::RateLimiter;
 
 pub enum ChangesReply {
     Reset { epoch: String },
@@ -220,16 +221,72 @@ pub async fn pair_ex(code_text: &str, device_name: &str) -> Result<Paired> {
     Ok(Paired { creds, embedding })
 }
 
+/// Idle transfer connections kept for the next transfer (the plan's pool of 2 up + 2 down).
+const POOL_MAX: usize = 4;
+
 pub struct HostClient {
     handle: Handle,
     creds: HostCreds,
     device: String,
     control: tokio::sync::Mutex<Option<Rpc>>,
+    pool: std::sync::Mutex<Vec<Rpc>>,
+    up: Arc<RateLimiter>,
+    down: Arc<RateLimiter>,
 }
 
 impl HostClient {
     pub fn new(handle: Handle, creds: HostCreds, device: &str) -> Arc<HostClient> {
-        Arc::new(HostClient { handle, creds, device: device.to_string(), control: tokio::sync::Mutex::new(None) })
+        Arc::new(HostClient {
+            handle,
+            creds,
+            device: device.to_string(),
+            control: tokio::sync::Mutex::new(None),
+            pool: std::sync::Mutex::new(Vec::new()),
+            up: Arc::new(RateLimiter::new(0)),
+            down: Arc::new(RateLimiter::new(0)),
+        })
+    }
+
+    /// Bandwidth limits in kilobits per second (0 = unlimited), shared by every transfer of this host.
+    pub fn set_limits(&self, upload_kbps: u64, download_kbps: u64) {
+        self.up.set_kbps(upload_kbps);
+        self.down.set_kbps(download_kbps);
+    }
+
+    /// Runs one persistent call on a pooled (or new) connection. `op` returns its result and whether
+    /// the connection is still in step with the host and may be reused. A pooled connection that has
+    /// idled out is replaced by a fresh one once.
+    async fn stream<R>(&self, mut op: impl AsyncFnMut(&mut Rpc) -> Result<(R, bool)>) -> Result<R> {
+        let mut attempt = 0;
+        loop {
+            let pooled = self.pool.lock().unwrap().pop();
+            let was_pooled = pooled.is_some();
+            let mut rpc = match pooled {
+                Some(r) => r,
+                None => {
+                    let addr = resolve(&self.creds.address).await?;
+                    connect(addr, self.creds.fp()?, true).await?
+                }
+            };
+            match op(&mut rpc).await {
+                Ok((r, reuse)) => {
+                    if reuse && !rpc.is_poisoned() {
+                        let mut p = self.pool.lock().unwrap();
+                        if p.len() < POOL_MAX {
+                            p.push(rpc);
+                        }
+                    }
+                    return Ok(r);
+                }
+                Err(e) => {
+                    attempt += 1;
+                    if was_pooled && attempt < 2 {
+                        continue;
+                    }
+                    return Err(e);
+                }
+            }
+        }
     }
 
     pub fn creds(&self) -> &HostCreds {
@@ -384,81 +441,93 @@ impl Transport for RemoteTransport {
     }
 
     fn download(&self, path: &str, rev: u64, part: &Path) -> Result<Fetch> {
-        let c = &self.client;
-        self.block(async {
-            let have = tokio::fs::metadata(part).await.map(|m| m.len()).unwrap_or(0);
-            let addr = resolve(&c.creds.address).await?;
-            let mut rpc = connect(addr, c.creds.fp()?, true).await?;
-            let mut file = tokio::fs::OpenOptions::new().create(true).append(true).open(part).await?;
-            let mut status = 255u8;
-            let resp: StreamResponse = rpc
-                .call_persistent(
-                    StreamAction::Download { auth: c.creds.auth(), sync: self.sync.clone(), path: path.to_string(), rev, offset: have, len: 0 },
-                    async |s: &mut BufStream<ClientStream>| {
-                        let mut st = [0u8; 1];
-                        s.read_exact(&mut st).await?;
-                        status = st[0];
-                        if status != DL_OK {
-                            return Ok(());
-                        }
-                        let _total = read_u64(s).await?;
-                        let mut buf = Vec::new();
-                        loop {
-                            let n = read_frame(s, &mut buf).await?;
-                            if n == 0 {
-                                break;
+        let c = self.client.clone();
+        let down = c.down.clone();
+        self.block(async move {
+            c.stream(async |rpc: &mut Rpc| {
+                // recomputed per attempt: a failed attempt may have appended part of the file
+                let have = tokio::fs::metadata(part).await.map(|m| m.len()).unwrap_or(0);
+                let mut file = tokio::fs::OpenOptions::new().create(true).append(true).open(part).await?;
+                let mut status = 255u8;
+                let resp: StreamResponse = rpc
+                    .call_persistent(
+                        StreamAction::Download { auth: c.creds.auth(), sync: self.sync.clone(), path: path.to_string(), rev, offset: have, len: 0 },
+                        async |s: &mut BufStream<ClientStream>| {
+                            let mut st = [0u8; 1];
+                            s.read_exact(&mut st).await?;
+                            status = st[0];
+                            if status != DL_OK {
+                                return Ok(());
                             }
-                            file.write_all(&buf).await?;
-                        }
-                        Ok(())
-                    },
-                )
-                .await
-                .map_err(|e| anyhow!("download failed: {e:?}"))?;
-            file.flush().await?;
-            match (resp, status) {
-                (StreamResponse::Done, DL_OK) => Ok(Fetch::Done),
-                (StreamResponse::Stale, _) | (_, DL_STALE) => Ok(Fetch::Stale),
-                (StreamResponse::NotFound, _) | (_, DL_NOT_FOUND) => Ok(Fetch::NotFound),
-                (StreamResponse::Denied(m), _) => bail!("access denied: {m}"),
-                (other, _) => bail!("download failed: {other:?}"),
-            }
+                            let _total = read_u64(s).await?;
+                            let mut buf = Vec::new();
+                            loop {
+                                let n = read_frame(s, &mut buf).await?;
+                                if n == 0 {
+                                    break;
+                                }
+                                file.write_all(&buf).await?;
+                                down.throttle(n).await;
+                            }
+                            Ok(())
+                        },
+                    )
+                    .await
+                    .map_err(|e| anyhow!("download failed: {e:?}"))?;
+                file.flush().await?;
+                let reuse = resp == StreamResponse::Done;
+                let out = match (resp, status) {
+                    (StreamResponse::Done, DL_OK) => Fetch::Done,
+                    (StreamResponse::Stale, _) | (_, DL_STALE) => Fetch::Stale,
+                    (StreamResponse::NotFound, _) | (_, DL_NOT_FOUND) => Fetch::NotFound,
+                    (StreamResponse::Denied(m), _) => bail!("access denied: {m}"),
+                    (other, _) => bail!("download failed: {other:?}"),
+                };
+                Ok((out, reuse))
+            })
+            .await
         })
     }
 
     fn upload(&self, hash: &str, src: &Path, size: u64) -> Result<Upload> {
-        let c = &self.client;
-        self.block(async {
-            let addr = resolve(&c.creds.address).await?;
-            let mut rpc = connect(addr, c.creds.fp()?, true).await?;
-            let mut file = tokio::fs::File::open(src).await?;
-            let resp: StreamResponse = rpc
-                .call_persistent(
-                    StreamAction::Upload { auth: c.creds.auth(), sync: self.sync.clone(), hash: hash.to_string(), size },
-                    async |s: &mut BufStream<ClientStream>| {
-                        let have = read_u64(s).await?;
-                        file.seek(std::io::SeekFrom::Start(have)).await?;
-                        let mut buf = vec![0u8; 1 << 20];
-                        loop {
-                            let n = file.read(&mut buf).await?;
-                            if n == 0 {
-                                break;
+        let c = self.client.clone();
+        let up = c.up.clone();
+        self.block(async move {
+            c.stream(async |rpc: &mut Rpc| {
+                let mut file = tokio::fs::File::open(src).await?;
+                let resp: StreamResponse = rpc
+                    .call_persistent(
+                        StreamAction::Upload { auth: c.creds.auth(), sync: self.sync.clone(), hash: hash.to_string(), size },
+                        async |s: &mut BufStream<ClientStream>| {
+                            let have = read_u64(s).await?;
+                            file.seek(std::io::SeekFrom::Start(have)).await?;
+                            let mut buf = vec![0u8; up.chunk(1 << 20)];
+                            let mut fw = FrameWriter::new();
+                            loop {
+                                let n = file.read(&mut buf).await?;
+                                if n == 0 {
+                                    break;
+                                }
+                                fw.write(s, &buf[..n]).await?;
+                                up.throttle(n).await;
                             }
-                            write_frame(s, &buf[..n]).await?;
-                        }
-                        write_frame(s, &[]).await?;
-                        s.flush().await?;
-                        Ok(())
-                    },
-                )
-                .await
-                .map_err(|e| anyhow!("upload failed: {e:?}"))?;
-            match resp {
-                StreamResponse::Done => Ok(Upload::Done),
-                StreamResponse::HashMismatch => Ok(Upload::HashMismatch),
-                StreamResponse::Denied(m) => bail!("access denied: {m}"),
-                other => bail!("upload failed: {other:?}"),
-            }
+                            write_frame(s, &[]).await?;
+                            s.flush().await?;
+                            Ok(())
+                        },
+                    )
+                    .await
+                    .map_err(|e| anyhow!("upload failed: {e:?}"))?;
+                let reuse = matches!(resp, StreamResponse::Done | StreamResponse::HashMismatch);
+                let out = match resp {
+                    StreamResponse::Done => Upload::Done,
+                    StreamResponse::HashMismatch => Upload::HashMismatch,
+                    StreamResponse::Denied(m) => bail!("access denied: {m}"),
+                    other => bail!("upload failed: {other:?}"),
+                };
+                Ok((out, reuse))
+            })
+            .await
         })
     }
 

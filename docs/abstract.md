@@ -19,6 +19,14 @@ Local file, data, media search based on embeddings.
 
 - Currently only supports EmbeddingGemma2 as a model
 
+### File sync (`medialake-sync`, see `post-plan3.md`)
+- Optional and independent of search: either can be switched off.
+- Hub and spoke. A *host* (`medialake-server serve`, or the app) owns a plain folder and numbers every change;
+  *members* mirror it and push their own changes. Same listener, certificate and pairing as embedding; pairing
+  codes carry per-sync read-write / read-only grants.
+- Conflicts never discard a version; backups (time snapshots or last N versions, content-addressed) live on the host.
+- The engine is platform-free; a frontend (plain mirror folder today, Cloud Files / mount later) only shows the result.
+
 ## UI
 Client UI uses the native toolkit of each platform: WinUI on Windows, SwiftUI/AppKit on macOS (planned, see `plan2.md`).
 Both hosts load the same rust client; only the UI differs.

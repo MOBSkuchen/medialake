@@ -91,6 +91,9 @@ pub enum SyncCmd {
         /// Write `name (restored <date>).ext` instead of replacing the current file.
         #[arg(long)]
         as_copy: bool,
+        /// With `--snapshot`: also delete files that are not in the snapshot (they stay in the history).
+        #[arg(long)]
+        prune: bool,
         #[command(flatten)]
         state: StateArgs,
     },
@@ -200,10 +203,10 @@ pub fn run(cmd: SyncCmd) -> anyhow::Result<()> {
                 println!("rev {}  {}  {} bytes  by {}  {}", v.rev, ts(v.created), v.size, v.author, &v.hash[..12]);
             }
         }
-        SyncCmd::Restore { name, path, snapshot, as_copy, state } => {
+        SyncCmd::Restore { name, path, snapshot, as_copy, prune, state } => {
             let hs = open(&state, &name)?;
             let what = match (snapshot, path) {
-                (Some(id), p) => RestoreWhat::Snapshot { id, path: p.unwrap_or_default() },
+                (Some(id), p) => RestoreWhat::Snapshot { id, path: p.unwrap_or_default(), prune },
                 (None, Some(p)) => {
                     let (path, rev) = match p.rsplit_once('@') {
                         Some((a, r)) => (a.to_string(), r.parse::<u64>().with_context(|| format!("bad revision {r:?}"))?),

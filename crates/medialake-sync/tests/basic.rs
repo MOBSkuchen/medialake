@@ -532,13 +532,13 @@ fn time_snapshots_restore_folder_and_whole() {
     assert_eq!(h.hs.snapshots().len(), 2);
 
     // a folder at a snapshot
-    let r = h.hs.restore("admin", &RestoreWhat::Snapshot { id: s1, path: "dir".into() }, false).unwrap();
+    let r = h.hs.restore("admin", &RestoreWhat::Snapshot { id: s1, path: "dir".into(), prune: false }, false).unwrap();
     assert!(r.iter().all(|r| matches!(r, ChangeResult::Ok { .. })), "{r:?}");
     assert_eq!(std::fs::read_to_string(h.root.join("dir/b.txt")).unwrap(), "b1");
     assert_eq!(std::fs::read_to_string(h.root.join("dir/c.txt")).unwrap(), "c1");
     assert_eq!(std::fs::read_to_string(h.root.join("a.txt")).unwrap(), "a2");
     // the whole snapshot
-    h.hs.restore("admin", &RestoreWhat::Snapshot { id: s1, path: String::new() }, false).unwrap();
+    h.hs.restore("admin", &RestoreWhat::Snapshot { id: s1, path: String::new(), prune: false }, false).unwrap();
     assert_eq!(std::fs::read_to_string(h.root.join("a.txt")).unwrap(), "a1");
 
     // pruning: only `keep` snapshots remain, and blobs only they refer to are collected
@@ -547,7 +547,7 @@ fn time_snapshots_restore_folder_and_whole() {
     let s3 = h.hs.snapshot_now().unwrap();
     let ids: Vec<u64> = h.hs.snapshots().into_iter().map(|s| s.id).collect();
     assert_eq!(ids, vec![s2, s3]);
-    let r = h.hs.restore("admin", &RestoreWhat::Snapshot { id: s1, path: String::new() }, false);
+    let r = h.hs.restore("admin", &RestoreWhat::Snapshot { id: s1, path: String::new(), prune: false }, false);
     assert!(r.is_err(), "snapshot s1 is gone");
 }
 
@@ -674,4 +674,39 @@ fn old_cursor_after_tombstone_purge_reconciles_in_full() {
     assert!(!m.exists("gone.txt"), "a delete that was purged is still learned, by absence");
     assert_eq!(m.read("new.txt").unwrap(), "new");
     assert_eq!(m.tree(), tree(&h.root));
+}
+
+#[test]
+fn restoring_a_snapshot_can_prune_newer_files() {
+    let h = host(BackupPolicy::Time { every_hours: 24, keep: 5 });
+    write(&h.root, "keep.txt", "k1");
+    write(&h.root, "dir/old.txt", "o1");
+    h.hs.scan().unwrap();
+    let snap = h.hs.snapshot_now().unwrap();
+    write(&h.root, "keep.txt", "k2");
+    write(&h.root, "dir/new.txt", "n1");
+    write(&h.root, "later/x.txt", "x1");
+    h.hs.scan().unwrap();
+
+    // without prune the newer files stay
+    h.hs.restore("admin", &RestoreWhat::Snapshot { id: snap, path: String::new(), prune: false }, false).unwrap();
+    assert_eq!(std::fs::read_to_string(h.root.join("keep.txt")).unwrap(), "k1");
+    assert!(h.root.join("dir/new.txt").exists());
+
+    // with prune they go (and a member sees the deletes like any other)
+    let mut m = member(&h, "Mac", ConflictPolicy::ServerWins, Access::ReadWrite);
+    m.sync();
+    assert!(m.exists("later/x.txt"));
+    let r = h.hs.restore("admin", &RestoreWhat::Snapshot { id: snap, path: String::new(), prune: true }, false).unwrap();
+    assert!(r.iter().all(|r| matches!(r, ChangeResult::Ok { .. })), "{r:?}");
+    assert!(!h.root.join("dir/new.txt").exists());
+    assert!(!h.root.join("later").exists());
+    assert!(h.root.join("dir/old.txt").exists());
+    m.sync();
+    assert!(!m.exists("later/x.txt") && !m.exists("dir/new.txt"));
+    assert_eq!(tree(&h.root), m.tree());
+
+    // the pruned file is still in the history of a file-based strategy; here we only check the folder case
+    let r = h.hs.restore("admin", &RestoreWhat::Snapshot { id: snap, path: "dir".into(), prune: true }, false).unwrap();
+    assert!(r.iter().all(|r| matches!(r, ChangeResult::Ok { .. })));
 }

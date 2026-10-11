@@ -152,3 +152,63 @@ async fn sync_is_off_by_default_and_search_unchanged() {
     let c3 = medialake_core::config::Config::load(&home.join("config.toml")).unwrap();
     assert_eq!(c2, c3);
 }
+
+#[test]
+fn errors_map_to_states() {
+    use medialake_core::sync::classify_error as c;
+    assert_eq!(c("cannot connect to 10.0.0.2:47900: Os { code: 61, kind: ConnectionRefused }"), "offline");
+    assert_eq!(c("cannot resolve nas.local:47900: failed to lookup address"), "offline");
+    assert_eq!(c("access denied: no access to sync 9f2c"), "denied");
+    assert_eq!(c("a.txt: No space left on device (os error 28)"), "disk_full");
+    assert_eq!(c("a.txt: rejected by the host: ignored name"), "error");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn search_can_be_switched_off_and_on_while_running() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    write_config(&home, "search_enabled = false\n");
+    let core = Core::start(Paths::new(&home), StartOptions { no_watch: true, ..Default::default() }).await.unwrap();
+    let off = format!("{:?}", core.search("hello").await.unwrap_err());
+    assert!(off.contains("turned off"), "{off}");
+
+    let mut c = core.config();
+    c.search_enabled = true;
+    core.set_config(c).await.unwrap();
+    // no model server in this test: the failure is now "unavailable", not "turned off"
+    let on = format!("{:?}", core.search("hello").await.unwrap_err());
+    assert!(!on.contains("turned off"), "{on}");
+    // the setting was saved
+    assert!(medialake_core::config::Config::load(&home.join("config.toml")).unwrap().search_enabled);
+
+    let mut c = core.config();
+    c.search_enabled = false;
+    core.set_config(c).await.unwrap();
+    let off = format!("{:?}", core.search("hello").await.unwrap_err());
+    assert!(off.contains("turned off"), "{off}");
+    core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sync_can_be_enabled_at_runtime_and_limits_apply() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    write_config(&home, "search_enabled = false\n");
+    let core = Core::start(Paths::new(&home), StartOptions { no_watch: true, ..Default::default() }).await.unwrap();
+    assert!(core.sync().is_err());
+    let mut c = core.config();
+    c.sync.enabled = true;
+    c.sync.upload_limit_kbps = 4000;
+    core.set_config(c).await.unwrap();
+    let m = core.sync().unwrap();
+    assert!(m.status().is_empty());
+    // raising the limit later reaches the manager without a restart
+    let mut c = core.config();
+    c.sync.upload_limit_kbps = 0;
+    core.set_config(c).await.unwrap();
+    let mut c = core.config();
+    c.sync.enabled = false;
+    core.set_config(c).await.unwrap();
+    assert!(core.sync().is_err());
+    core.shutdown().await;
+}

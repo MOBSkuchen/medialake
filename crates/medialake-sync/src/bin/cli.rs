@@ -73,6 +73,9 @@ enum Cmd {
         snapshot: Option<u64>,
         #[arg(long)]
         as_copy: bool,
+        /// With `--snapshot`: also delete files that are not in the snapshot (they stay in the history).
+        #[arg(long)]
+        prune: bool,
     },
 }
 
@@ -300,10 +303,10 @@ fn main() -> Result<()> {
                 println!("{}  {}  {} entries", s.id, ts(s.created), s.entries);
             }
         }
-        Cmd::Restore { sync, path, snapshot, as_copy } => {
+        Cmd::Restore { sync, path, snapshot, as_copy, prune } => {
             let m = cx.member(&sync)?;
             let what = match (snapshot, path) {
-                (Some(id), p) => RestoreWhat::Snapshot { id, path: p.unwrap_or_default() },
+                (Some(id), p) => RestoreWhat::Snapshot { id, path: p.unwrap_or_default(), prune },
                 (None, Some(p)) => {
                     let (path, rev) = p.rsplit_once('@').context("expected <path>@<rev> (see `versions`)")?;
                     RestoreWhat::File { path: path.to_string(), rev: rev.parse().context("bad revision")? }

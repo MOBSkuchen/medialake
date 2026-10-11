@@ -75,7 +75,7 @@ pub struct Core {
     pub vindex: Arc<VectorIndex>,
     pub client: Arc<EmbedClient>,
     pub indexer: Arc<Indexer>,
-    watcher: Option<Arc<FileWatcher>>,
+    watcher: Mutex<Option<Arc<FileWatcher>>>,
     events: broadcast::Sender<Event>,
     active: Mutex<Active>,
     opts: StartOptions,
@@ -130,8 +130,10 @@ impl Core {
         let cfg = Arc::new(RwLock::new(cfg));
 
         let indexer = Indexer::new(store.clone(), vindex.clone(), client.clone(), cfg.clone(), events.clone());
-        if search_on {
-            indexer.start_workers(opts.workers.unwrap_or(2));
+        // workers wait for work: they are always there, search "off" just keeps them paused
+        indexer.start_workers(opts.workers.unwrap_or(2));
+        if !search_on {
+            indexer.set_paused(true);
         }
 
         let watcher = if opts.no_watch || !search_on {
@@ -149,7 +151,7 @@ impl Core {
             vindex,
             client,
             indexer,
-            watcher,
+            watcher: Mutex::new(watcher),
             events,
             active: Mutex::new(Active { supervisor: None, remote: None, rx: idle_rx, forwarder: None }),
             opts,
@@ -400,9 +402,49 @@ impl Core {
         Ok(())
     }
 
+    /// Search switched on or off while running: server, watcher and indexer follow. Off leaves the index
+    /// on disk untouched.
+    async fn apply_search_toggle(&self, on: bool) {
+        if on {
+            self.indexer.set_paused(false);
+            if !self.opts.no_watch && self.watcher.lock().unwrap().is_none() {
+                match FileWatcher::start(self.indexer.clone(), self.cfg.clone()) {
+                    Ok(w) => {
+                        w.set_dirs(&self.cfg.read().unwrap().dirs);
+                        *self.watcher.lock().unwrap() = Some(w);
+                    }
+                    Err(e) => {
+                        let _ = self.events.send(Event::Error { message: format!("Cannot watch folders: {e}") });
+                    }
+                }
+            }
+            let c = self.config();
+            let remote = if c.server_mode == ServerMode::Remote { c.remote.as_ref().map(RemoteConn::from_creds) } else { None };
+            match remote {
+                Some(Ok(conn)) => self.attach_remote(conn),
+                Some(Err(e)) => {
+                    let _ = self.events.send(Event::Error { message: format!("Remote server credentials unusable: {e}") });
+                    self.attach_local();
+                }
+                None => self.attach_local(),
+            }
+            self.indexer.reconcile().await;
+        } else {
+            self.indexer.set_paused(true);
+            self.indexer.save_if_dirty();
+            *self.watcher.lock().unwrap() = None;
+            self.deactivate();
+            let (tx, rx) = watch::channel(ServerState::Idle);
+            self.client.switch(rx.clone(), None);
+            let mut a = self.active.lock().unwrap();
+            a.rx = rx;
+            drop(tx);
+        }
+    }
+
     /// Re-syncs the watcher and the store with the configured directories.
     async fn apply_dirs(&self) {
-        if let Some(w) = &self.watcher {
+        if let Some(w) = self.watcher.lock().unwrap().as_ref() {
             w.set_dirs(&self.cfg.read().unwrap().dirs);
         }
         self.indexer.reconcile().await;
@@ -422,8 +464,11 @@ impl Core {
         *self.cfg.write().unwrap() = new.clone();
         self.save_config()?;
         self.apply_sync_settings(&old, &new).await;
-        if !new.search_enabled || !old.search_enabled {
-            // turning search on or off takes effect at the next start
+        if old.search_enabled != new.search_enabled {
+            self.apply_search_toggle(new.search_enabled).await;
+            return Ok(false);
+        }
+        if !new.search_enabled {
             return Ok(false);
         }
         let mut reindex = false;
@@ -567,7 +612,14 @@ impl Core {
                     s.stop().await;
                 }
             }
-        } else if old.sync.device_name != new.sync.device_name || old.sync.hosting != new.sync.hosting {
+        } else if old.sync.upload_limit_kbps != new.sync.upload_limit_kbps || old.sync.download_limit_kbps != new.sync.download_limit_kbps {
+            if let Ok(s) = self.sync() {
+                s.apply_limits();
+            }
+        }
+        if old.sync.enabled == new.sync.enabled
+            && (old.sync.device_name != new.sync.device_name || old.sync.hosting != new.sync.hosting)
+        {
             if let Ok(s) = self.sync() {
                 s.reset_clients();
                 if let Err(e) = s.ensure_hosting().await {

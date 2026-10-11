@@ -125,3 +125,52 @@ pub fn move_file(src: &Path, dst: &Path) -> std::io::Result<()> {
         }
     }
 }
+
+/// Paces transfers to a rate shared by all of them (0 = unlimited). Callers `throttle` after (or
+/// before) moving `n` bytes; the limiter spreads them evenly over time.
+pub struct RateLimiter {
+    bytes_per_sec: std::sync::atomic::AtomicU64,
+    next: std::sync::Mutex<std::time::Instant>,
+}
+
+impl RateLimiter {
+    /// `kbps` = kilobits per second, like the settings.
+    pub fn new(kbps: u64) -> RateLimiter {
+        let r = RateLimiter { bytes_per_sec: Default::default(), next: std::sync::Mutex::new(std::time::Instant::now()) };
+        r.set_kbps(kbps);
+        r
+    }
+
+    pub fn set_kbps(&self, kbps: u64) {
+        self.bytes_per_sec.store(kbps.saturating_mul(1000) / 8, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn bytes_per_sec(&self) -> u64 {
+        self.bytes_per_sec.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// A buffer size that keeps the pacing smooth (about a quarter second of data), at most `max`.
+    pub fn chunk(&self, max: usize) -> usize {
+        match self.bytes_per_sec() {
+            0 => max,
+            r => ((r / 4) as usize).clamp(4096, max),
+        }
+    }
+
+    pub async fn throttle(&self, n: usize) {
+        let rate = self.bytes_per_sec();
+        if rate == 0 || n == 0 {
+            return;
+        }
+        let wait = {
+            let mut next = self.next.lock().unwrap();
+            let now = std::time::Instant::now();
+            let start = (*next).max(now);
+            *next = start + std::time::Duration::from_secs_f64(n as f64 / rate as f64);
+            start.saturating_duration_since(now)
+        };
+        if !wait.is_zero() {
+            tokio::time::sleep(wait).await;
+        }
+    }
+}

@@ -6,22 +6,14 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
-use notify::event::{ModifyKind, RenameMode};
-use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::mpsc;
 
 use crate::config::{Config, IndexedDir};
 use crate::extract;
 use crate::indexer::Indexer;
 
-#[derive(Debug)]
-enum Change {
-    Touched(PathBuf),
-    Removed(PathBuf),
-    RenamedFrom(PathBuf),
-    RenamedTo(PathBuf),
-    Renamed(PathBuf, PathBuf),
-}
+use medialake_sync::watch::{FsChange as Change, normalize};
 
 pub struct FileWatcher {
     watcher: std::sync::Mutex<RecommendedWatcher>,
@@ -34,44 +26,9 @@ impl FileWatcher {
         let watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
             let Ok(ev) = res else { return };
             tracing::debug!("fs event {:?} {:?}", ev.kind, ev.paths);
-            let mut paths = ev.paths.into_iter();
-            match ev.kind {
-                EventKind::Create(_) | EventKind::Modify(ModifyKind::Data(_)) | EventKind::Modify(ModifyKind::Any) | EventKind::Modify(ModifyKind::Metadata(_)) => {
-                    for p in paths {
-                        let _ = tx.send(Change::Touched(p));
-                    }
-                }
-                EventKind::Modify(ModifyKind::Name(RenameMode::Both)) => {
-                    if let (Some(a), Some(b)) = (paths.next(), paths.next()) {
-                        let _ = tx.send(Change::Renamed(a, b));
-                    }
-                }
-                EventKind::Modify(ModifyKind::Name(RenameMode::From)) => {
-                    for p in paths {
-                        let _ = tx.send(Change::RenamedFrom(p));
-                    }
-                }
-                EventKind::Modify(ModifyKind::Name(RenameMode::To)) => {
-                    for p in paths {
-                        let _ = tx.send(Change::RenamedTo(p));
-                    }
-                }
-                EventKind::Modify(ModifyKind::Name(_)) => {
-                    for p in paths {
-                        // FSEvents reports a rename as an unpaired name change on each path: the one
-                        // that still exists is the new name, the missing one the old name.
-                        #[cfg(target_os = "macos")]
-                        let _ = tx.send(if p.symlink_metadata().is_ok() { Change::RenamedTo(p) } else { Change::RenamedFrom(p) });
-                        #[cfg(not(target_os = "macos"))]
-                        let _ = tx.send(Change::Touched(p));
-                    }
-                }
-                EventKind::Remove(_) => {
-                    for p in paths {
-                        let _ = tx.send(Change::Removed(p));
-                    }
-                }
-                _ => {}
+            // rename pairing and the FSEvents special case live in medialake-sync, shared with sync
+            for ch in normalize(ev) {
+                let _ = tx.send(ch);
             }
         })?;
         let fw = Arc::new(FileWatcher { watcher: std::sync::Mutex::new(watcher), watched: std::sync::Mutex::new(vec![]) });

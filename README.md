@@ -13,6 +13,7 @@ Windows is the supported platform. A macOS port is planned in `docs/plan2.md`; t
 | `crates/medialake-proto` | bierpc message types, model manifest, pairing-code codec, TLS pinning |
 | `crates/medialake-llama` | thin wrapper over raw llama.cpp / mtmd (pinned b11535 via `vendor/`) |
 | `crates/medialake-server` | `medialake-server`: embedding server (`--local` child, `serve`, `pair`, `clients`, `bench`) |
+| `crates/medialake-sync` | file sync: host (watched folder, history), member engine, mirror frontend, `medialake-sync` CLI |
 | `crates/medialake-core` | client logic + `medialake-cli` (diagnostics) |
 | `crates/medialake-ffi` | C ABI for the UI (`medialake_core_ffi.dll`; a static library on macOS) |
 | `ui/MediaLake.App` | Windows: WinUI 3 app (search window, tray, settings) |
@@ -68,6 +69,31 @@ medialake-server clients list | revoke <id>
 Paste the code in *Settings > Model > On a remote server*. The connection is TLS with the server's
 self-signed certificate pinned by SHA-256 fingerprint (contained in the code); the client's long-term secret is
 stored DPAPI-protected (macOS: in the Keychain). File contents are sent to the remote server for embedding.
+
+## File sync
+
+MediaLake can also keep folders in step between paired devices (hub and spoke: one host owns the folder,
+members mirror it), independent of search. Design: `docs/post-plan3.md`; what exists and how it differs:
+`docs/post-plan3-status.md`; wire format: `docs/sync-protocol.md`.
+
+```bash
+# host: a plain folder, watched; headless, no model needed
+medialake-server sync add Photos ~/Pictures --backup file:10      # none | time:24h:7 | file:10
+medialake-server serve --no-embed
+medialake-server pair --sync Photos:rw                            # ro for read-only; --embed adds embedding
+
+# member (the app does the same through its Sync settings)
+medialake-sync pair <code> && medialake-sync join <host> Photos ~/MediaLake/Photos
+medialake-sync run                                                # or: once | status | conflicts | resolve
+```
+
+Conflicts keep both versions (*server wins*: the local one becomes `name (conflict, <device>, <date>).ext`
+and is shared; *ask*: it waits for `resolve … mine|server|both`). History lives on the host
+(`medialake-server sync versions|snapshots|restore`). Sync is off by default in the app (`[sync] enabled`),
+and `search_enabled = false` turns the app into a pure sync client / host.
+
+Tests that need no model: `cargo test -p medialake-proto -p medialake-sync`; soak tests with real
+transfers are `--ignored` in `crates/medialake-sync/tests/network.rs`.
 
 ## Data locations
 

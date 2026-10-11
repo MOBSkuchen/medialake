@@ -146,8 +146,9 @@ pub struct SnapshotInfo {
 pub enum RestoreWhat {
     /// One file at a revision listed by `Versions`.
     File { path: String, rev: u64 },
-    /// A snapshot; `path` limits it to a file or a folder (empty = everything).
-    Snapshot { id: u64, path: String },
+    /// A snapshot; `path` limits it to a file or a folder (empty = everything). With `prune`, files
+    /// below `path` that are not in the snapshot are deleted as well (they stay in the history).
+    Snapshot { id: u64, path: String, prune: bool },
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -221,24 +222,78 @@ pub const DL_NOT_FOUND: u8 = 2;
 
 // ---------------- raw framing ----------------
 
+/// Top bit of a frame's length: the payload is a zstd frame of at most [`MAX_FRAME`] bytes.
+const FRAME_ZSTD: u32 = 0x8000_0000;
+/// Frames below this are never worth compressing.
+const MIN_COMPRESS: usize = 4096;
+const ZSTD_LEVEL: i32 = 1;
+
 /// `u32` big-endian length, then the bytes. An empty frame ends a stream.
 pub async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, data: &[u8]) -> std::io::Result<()> {
     w.write_all(&(data.len() as u32).to_be_bytes()).await?;
     w.write_all(data).await
 }
 
-/// Reads one frame into `buf` (replacing its content). Returns the length; 0 = end of stream.
+/// Writes content frames, compressing them with zstd while that pays off. Media is mostly
+/// incompressible: after a few frames that do not shrink by at least 10 % the writer stops trying for
+/// the rest of the stream, so such transfers cost no CPU.
+pub struct FrameWriter {
+    misses: u32,
+    out: Vec<u8>,
+}
+
+impl Default for FrameWriter {
+    fn default() -> Self {
+        FrameWriter { misses: 0, out: Vec::new() }
+    }
+}
+
+impl FrameWriter {
+    pub fn new() -> FrameWriter {
+        FrameWriter::default()
+    }
+
+    /// A writer that never compresses.
+    pub fn plain() -> FrameWriter {
+        FrameWriter { misses: u32::MAX, out: Vec::new() }
+    }
+
+    pub async fn write<W: AsyncWrite + Unpin>(&mut self, w: &mut W, data: &[u8]) -> std::io::Result<()> {
+        if data.len() >= MIN_COMPRESS && self.misses < 3 {
+            self.out.clear();
+            if let Ok(c) = zstd::bulk::compress(data, ZSTD_LEVEL) {
+                if c.len() < data.len() / 10 * 9 {
+                    self.misses = 0;
+                    w.write_all(&(c.len() as u32 | FRAME_ZSTD).to_be_bytes()).await?;
+                    return w.write_all(&c).await;
+                }
+            }
+            self.misses += 1;
+        }
+        write_frame(w, data).await
+    }
+}
+
+/// Reads one frame into `buf` (replacing its content; compressed frames are inflated, never beyond
+/// [`MAX_FRAME`]). Returns the length; 0 = end of stream.
 pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R, buf: &mut Vec<u8>) -> std::io::Result<usize> {
-    let mut len = [0u8; 4];
-    r.read_exact(&mut len).await?;
-    let len = u32::from_be_bytes(len) as usize;
+    let mut hdr = [0u8; 4];
+    r.read_exact(&mut hdr).await?;
+    let raw = u32::from_be_bytes(hdr);
+    let compressed = raw & FRAME_ZSTD != 0;
+    let len = (raw & !FRAME_ZSTD) as usize;
     if len > MAX_FRAME {
         return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "frame too large"));
     }
     buf.clear();
     buf.resize(len, 0);
     r.read_exact(buf).await?;
-    Ok(len)
+    if compressed {
+        let plain = zstd::bulk::decompress(buf, MAX_FRAME)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("bad compressed frame: {e}")))?;
+        *buf = plain;
+    }
+    Ok(buf.len())
 }
 
 pub async fn write_u64<W: AsyncWrite + Unpin>(w: &mut W, v: u64) -> std::io::Result<()> {
@@ -485,6 +540,66 @@ mod tests {
         assert_eq!(conflict_name("a/b.txt", "Mac", t), "a/b (conflict, Mac, 2026-10-11 14-03).txt");
         assert_eq!(conflict_name("README", "Mac", t), "README (conflict, Mac, 2026-10-11 14-03)");
         assert_eq!(conflict_name(".hidden", "Mac", t), ".hidden (conflict, Mac, 2026-10-11 14-03)");
+    }
+
+    #[test]
+    fn frames_roundtrip_compressed_and_plain() {
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        rt.block_on(async {
+            let text = "the quick brown fox ".repeat(2000).into_bytes();
+            let noise: Vec<u8> = (0..20_000u32).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8).collect();
+            let mut wire: Vec<u8> = vec![];
+            let mut fw = FrameWriter::new();
+            fw.write(&mut wire, &text).await.unwrap();
+            fw.write(&mut wire, &noise).await.unwrap();
+            fw.write(&mut wire, b"tiny").await.unwrap();
+            write_frame(&mut wire, &[]).await.unwrap();
+            assert!(wire.len() < text.len() / 2 + noise.len() + 100, "text frame was compressed");
+            let mut r = &wire[..];
+            let mut buf = Vec::new();
+            assert_eq!(read_frame(&mut r, &mut buf).await.unwrap(), text.len());
+            assert_eq!(buf, text);
+            assert_eq!(read_frame(&mut r, &mut buf).await.unwrap(), noise.len());
+            assert_eq!(buf, noise);
+            assert_eq!(read_frame(&mut r, &mut buf).await.unwrap(), 4);
+            assert_eq!(read_frame(&mut r, &mut buf).await.unwrap(), 0);
+        });
+    }
+
+    #[test]
+    fn incompressible_streams_stop_trying() {
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        rt.block_on(async {
+            let mut x = 0x9E37_79B9_7F4A_7C15u64;
+            let noise: Vec<u8> = (0..65_536)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    (x >> 24) as u8
+                })
+                .collect();
+            let mut wire: Vec<u8> = vec![];
+            let mut fw = FrameWriter::new();
+            for _ in 0..5 {
+                fw.write(&mut wire, &noise).await.unwrap();
+            }
+            assert_eq!(fw.misses, 3, "gave up after three misses");
+            assert_eq!(wire.len(), 5 * (noise.len() + 4));
+        });
+    }
+
+    #[test]
+    fn inflating_is_bounded() {
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        rt.block_on(async {
+            // 64 MiB of zeros compress to almost nothing; a reader must refuse to inflate it
+            let bomb = zstd::bulk::compress(&vec![0u8; 64 << 20], 1).unwrap();
+            let mut wire = ((bomb.len() as u32) | FRAME_ZSTD).to_be_bytes().to_vec();
+            wire.extend_from_slice(&bomb);
+            let mut buf = Vec::new();
+            assert!(read_frame(&mut &wire[..], &mut buf).await.is_err());
+        });
     }
 
     #[test]

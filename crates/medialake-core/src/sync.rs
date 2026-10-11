@@ -40,7 +40,8 @@ pub struct SyncStatus {
     /// The frontend actually in use. Only `mirror` exists until the platform frontends land.
     pub frontend: String,
     pub paused: bool,
-    /// `starting`, `idle`, `syncing`, `paused`, `conflict`, `held` or `error`.
+    /// `starting`, `idle`, `syncing`, `paused`, `conflict`, `held`, or an error state: `offline` (host
+    /// unreachable), `denied` (access revoked), `disk_full`, `error` (anything else).
     pub state: String,
     pub detail: String,
     /// Unix seconds of the last finished round.
@@ -154,6 +155,28 @@ pub struct SyncManager {
     hosting_error: Mutex<String>,
 }
 
+/// Maps an engine / transport error message to the state the UI shows (§12 X2: host unreachable,
+/// disk full, revoked access). The engine retries with backoff in every one of these states.
+pub fn classify_error(msg: &str) -> &'static str {
+    let m = msg.to_lowercase();
+    if m.contains("no space left") || m.contains("not enough space") || m.contains("disk full") || m.contains("quota exceeded") {
+        "disk_full"
+    } else if m.contains("access denied") || m.contains("authentication failed") || m.contains("no access to sync") || m.contains("no longer allows") {
+        "denied"
+    } else if m.contains("cannot connect")
+        || m.contains("cannot resolve")
+        || m.contains("connection refused")
+        || m.contains("connection reset")
+        || m.contains("timed out")
+        || m.contains("is this host a medialake host")
+        || m.contains("broken pipe")
+    {
+        "offline"
+    } else {
+        "error"
+    }
+}
+
 fn to_member(f: &SyncFolderCfg) -> MemberConfig {
     MemberConfig {
         sync_id: f.sync_id.clone(),
@@ -234,8 +257,23 @@ impl SyncManager {
             secret_hex: hex(&secret),
         };
         let c = HostClient::new(self.handle.clone(), creds, &self.device());
+        {
+            let cfg = self.cfg.read().unwrap();
+            c.set_limits(cfg.sync.upload_limit_kbps, cfg.sync.download_limit_kbps);
+        }
         self.clients.lock().unwrap().insert(host_id.to_string(), c.clone());
         Ok(c)
+    }
+
+    /// Applies changed bandwidth limits to the connections that exist.
+    pub fn apply_limits(&self) {
+        let (up, down) = {
+            let c = self.cfg.read().unwrap();
+            (c.sync.upload_limit_kbps, c.sync.download_limit_kbps)
+        };
+        for c in self.clients.lock().unwrap().values() {
+            c.set_limits(up, down);
+        }
     }
 
     /// Forgets cached connections (the device name or a credential changed).
@@ -330,12 +368,18 @@ impl SyncManager {
             let pending: Vec<(String, bool, i64)> =
                 MemberDb::open(&db_path).map(|d| d.conflicts().into_iter().map(|(e, s)| (e.path, e.deleted, s)).collect()).unwrap_or_default();
             let (state, detail) = match r {
-                Err(e) => ("error".to_string(), format!("{e:#}")),
+                Err(e) => {
+                    let msg = format!("{e:#}");
+                    (classify_error(&msg).to_string(), msg)
+                }
                 Ok(rep) if rep.held_deletes.is_some() => {
                     ("held".to_string(), format!("{} deletes are waiting for confirmation", rep.held_deletes.unwrap_or(0)))
                 }
                 Ok(_) if !pending.is_empty() => ("conflict".to_string(), format!("{} conflict(s) need a decision", pending.len())),
-                Ok(rep) if !rep.errors.is_empty() => ("error".to_string(), rep.errors.join("; ")),
+                Ok(rep) if !rep.errors.is_empty() => {
+                    let msg = rep.errors.join("; ");
+                    (classify_error(&msg).to_string(), msg)
+                }
                 Ok(_) => ("idle".to_string(), String::new()),
             };
             let changed = {
@@ -366,7 +410,7 @@ impl SyncManager {
             }
             if changed {
                 let _ = events.send(Event::SyncState { sync_id: sync_id.clone(), name: name.clone(), state: state.clone(), detail: detail.clone() });
-                if state == "error" {
+                if matches!(state.as_str(), "error" | "offline" | "denied" | "disk_full") {
                     let _ = events.send(Event::SyncError { sync_id: sync_id.clone(), message: detail });
                 }
             }
@@ -678,13 +722,17 @@ impl SyncManager {
         tokio::task::spawn_blocking(move || t.snapshots().map_err(|e| format!("{e:#}"))).await.map_err(|e| e.to_string())?
     }
 
-    /// `what`: `{"file": {"path", "rev"}}` or `{"snapshot": {"id", "path"}}`. A restore is a normal new
+    /// `what`: `{"file": {"path", "rev"}}` or `{"snapshot": {"id", "path", "prune"}}`. A restore is a normal new
     /// commit on the host, so it reaches every member (this one at its next round).
     pub async fn restore(&self, sync_id: &str, what: &serde_json::Value, as_copy: bool) -> Result<usize, String> {
         let w = if let Some(f) = what.get("file") {
             RestoreWhat::File { path: f["path"].as_str().ok_or("missing path")?.to_string(), rev: f["rev"].as_u64().ok_or("missing rev")? }
         } else if let Some(s) = what.get("snapshot") {
-            RestoreWhat::Snapshot { id: s["id"].as_u64().ok_or("missing id")?, path: s["path"].as_str().unwrap_or_default().to_string() }
+            RestoreWhat::Snapshot {
+                id: s["id"].as_u64().ok_or("missing id")?,
+                path: s["path"].as_str().unwrap_or_default().to_string(),
+                prune: s["prune"].as_bool().unwrap_or(false),
+            }
         } else {
             return Err("what must be {file:{path,rev}} or {snapshot:{id,path}}".into());
         };
