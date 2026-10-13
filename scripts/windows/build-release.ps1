@@ -1,5 +1,5 @@
-# Builds everything and stages dist\app for the installer:  scripts\windows\build-release.ps1 [-Version 0.2.1] [-Installer]
-param([string]$Version = "0.2.1", [switch]$Installer)
+# Builds everything and stages dist\app for the installer:  scripts\windows\build-release.ps1 [-Version 3.0.0] [-Installer]
+param([string]$Version = "3.0.0", [switch]$Installer)
 $ErrorActionPreference = "Stop"
 $root = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
 Set-Location $root

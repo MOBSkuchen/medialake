@@ -3,7 +3,7 @@
 
 #define AppName "MediaLake"
 #ifndef AppVersion
-  #define AppVersion "0.2.1"
+  #define AppVersion "3.0.0"
 #endif
 #define AppExe "MediaLake.exe"
 [Setup]
