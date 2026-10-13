@@ -91,6 +91,7 @@ public sealed partial class SettingsWindow : Window
         RefreshQualityLabels();
         SelectModelItem();
         _loading = true;
+        SearchSwitch.IsOn = (bool?)_cfg["search_enabled"] ?? true;
         ShowHotkey((string?)_cfg["hotkey"] ?? "");
         AutostartSwitch.IsOn = Registry.CurrentUser.OpenSubKey(RunKey)?.GetValue(RunValue) != null;
 
@@ -128,8 +129,10 @@ public sealed partial class SettingsWindow : Window
         if (core == null || _loading) return;
         try
         {
-            // the welcome window saves its own settings: do not write back an older copy of its flag
+            // the Sync page and the welcome window save their own settings: do not write back an older copy
+            // of them (sync would be switched off again, the welcome flag would come back as false)
             var fresh = await core.CallAsync("get_settings");
+            if (fresh.TryGetProperty("sync", out var sync)) _cfg["sync"] = JsonNode.Parse(sync.GetRawText());
             if (fresh.TryGetProperty("welcome_done", out var wd)) _cfg["welcome_done"] = wd.GetBoolean();
             var res = await core.CallAsync("set_settings", JsonSerializer.Deserialize<JsonElement>(_cfg.ToJsonString()));
             if (res.TryGetProperty("reindex", out var r) && r.GetBoolean()) await RefreshStatsAsync();
@@ -197,6 +200,31 @@ public sealed partial class SettingsWindow : Window
     }
 
     // ---------- General ----------
+
+    /// <summary>Search on or off. Off: MediaLake only syncs, no model is loaded and nothing is indexed.</summary>
+    private async void Search_Toggled(object sender, RoutedEventArgs e)
+    {
+        var core = App.Core;
+        if (_loading || core == null) return;
+        var on = SearchSwitch.IsOn;
+        if (on)
+        {
+            var ready = false;
+            try { ready = (await core.CallAsync("status")).TryGetProperty("model_ready", out var m) && m.GetBoolean(); } catch { }
+            if (!ready)
+            {
+                // there is no model to search with: setting it up is the way to switch search on
+                _loading = true;
+                SearchSwitch.IsOn = false;
+                _loading = false;
+                ((App)Application.Current).ShowWelcome(0);
+                return;
+            }
+        }
+        _cfg["search_enabled"] = on;
+        await SaveAsync();
+        ((App)Application.Current).SearchChanged(reloadSettings: false);
+    }
 
     private bool _recording;
 
@@ -390,7 +418,7 @@ public sealed partial class SettingsWindow : Window
             {
                 var label = tag switch { "heavy" => "Heavy: most precise", "light" => "Light: smallest and fastest", _ => "Normal: recommended" };
                 var size = info.size >= 1L << 30 ? $"{info.size / 1073741824.0:0.0} GB" : $"{info.size / 1048576.0:0} MB";
-                ci.Content = $"{label}  Â·  {size}" + (info.downloaded ? "  Â·  downloaded" : "");
+                ci.Content = $"{label}  ·  {size}" + (info.downloaded ? " (downloaded)" : "");
             }
         }
     }

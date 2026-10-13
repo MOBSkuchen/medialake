@@ -56,23 +56,14 @@
             <StackPanel Spacing="14" Padding="0,8,0,0">
                 <TextBlock Text="Sync" Style="{StaticResource SubtitleTextBlockStyle}" />
                 <TextBlock TextWrapping="Wrap" Opacity="0.8"
-                           Text="Keep folders in step between your computers. Paste the invitation code of a folder that another computer shares." />
-                <StackPanel Orientation="Horizontal" Spacing="8">
-                    <TextBox x:Name="CodeBox" PlaceholderText="Invitation code (SN1-…)" Width="400" />
-                    <Button x:Name="ConnectButton" Content="Connect" Click="Connect_Click" />
-                </StackPanel>
+                           Text="Keep folders in step between your computers. A synced folder appears under your user folder > MediaLake, lists everything at once and loads a file when you open it." />
+                <Button Content="Add a folder from another computer…" Click="Join_Click" />
                 <TextBlock Opacity="0.7" TextWrapping="Wrap"
-                           Text="The code comes from the computer that shares the folder (&quot;Invite a device&quot;). Sharing a folder from this PC is done with medialake-server for now." />
-
-                <StackPanel x:Name="JoinPanel" Spacing="8" Visibility="Collapsed">
-                    <ComboBox x:Name="SyncCombo" MinWidth="440" SelectionChanged="Sync_SelectionChanged" />
-                    <StackPanel Orientation="Horizontal" Spacing="8">
-                        <TextBox x:Name="LocationBox" Width="400" Header="Put it in" />
-                        <Button Content="Choose…" Click="Location_Click" VerticalAlignment="Bottom" />
-                    </StackPanel>
-                    <Button x:Name="JoinButton" Content="Add this folder" Click="Join_Click" />
-                </StackPanel>
-                <TextBlock x:Name="SyncInfo" TextWrapping="Wrap" />
+                           Text="You need an invitation code from the computer that shares the folder (&quot;Invite a device&quot; in its Sync settings)." />
+                <Button Content="Share a folder from this PC…" Click="Share_Click" />
+                <!-- what is set up already -->
+                <StackPanel x:Name="SyncList" Spacing="4" />
+                <TextBlock x:Name="SyncInfo" TextWrapping="Wrap" Foreground="{ThemeResource SystemFillColorCriticalBrush}" />
             </StackPanel>
         </ScrollViewer>
 

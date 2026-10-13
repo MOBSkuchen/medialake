@@ -633,7 +633,8 @@ private struct HistorySheet: View {
                     Text(Date(timeIntervalSince1970: Double(v.created)).formatted(date: .abbreviated, time: .shortened))
                     Text("\(formatBytes(v.size)) · \(v.author)").font(.system(size: 12)).opacity(0.6)
                     Spacer()
-                    Button("Restore as a copy") { Task { await restore(v, asCopy: true) } }.font(.system(size: 11))
+                    // a restore, also as a copy, is a change on the sharing computer: read-only members cannot make one
+                    Button("Restore as a copy") { Task { await restore(v, asCopy: true) } }.font(.system(size: 11)).disabled(folder.readOnly)
                     Button("Restore") { Task { await restore(v, asCopy: false) } }.font(.system(size: 11)).disabled(folder.readOnly)
                 }
             }

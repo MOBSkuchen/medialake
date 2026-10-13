@@ -28,8 +28,8 @@ Supported platforms: Windows (WinUI 3) and macOS 14+ on Apple Silicon (SwiftUI +
 | `crates/medialake-server` | `medialake-server`: embedding server (`--local` child, `serve`, `pair`, `clients`, `bench`) |
 | `crates/medialake-sync` | file sync: host (watched folder, history), member engine, mirror frontend, `medialake-sync` CLI |
 | `crates/medialake-mount` | macOS: synced folders as a mounted volume (NFSv3 on loopback + sparse cache), see `docs/a0-macos-mount.md` |
-| `crates/medialake-cloudapi` | Windows: typed layer over the Cloud Files API (type-checks from any host; spike in `examples/`), see `docs/w0-cloud-files.md` |
-| `crates/medialake-cloud` | Windows: synced folders as a Cloud Files sync root (placeholders that fill in when opened); base version, not yet run on Windows |
+| `crates/medialake-cloudapi` | Windows: typed layer over the Cloud Files API (type-checks from any host; tested against the real platform on Windows; spike in `examples/`), see `docs/w0-cloud-files.md` |
+| `crates/medialake-cloud` | Windows: synced folders as a Cloud Files sync root (placeholders that fill in when opened) |
 | `crates/medialake-core` | client logic + `medialake-cli` (diagnostics) |
 | `crates/medialake-ffi` | C ABI for the UI (`medialake_core_ffi.dll`; a static library on macOS) |
 | `ui/MediaLake.App` | Windows: WinUI 3 app (search window, tray, settings) |
@@ -99,8 +99,10 @@ item, optionally deletes the data folder). Dragging the app to the Trash by hand
 
 Test hooks of the app (the same on Windows): `--selftest`, `--screenshot <png>`, `--background`,
 `MEDIALAKE_TEST_QUERY` / `_WAIT` / `_NOWAIT` / `_SETTINGS=<page>|<png>` / `_WELCOME=<folder>` (renders the welcome
-window's pages); on macOS also `_WELCOME_ACTION=skip|continue` (presses that button and logs the resulting settings)
-and `_SYNC_DEMO=<mount point>`. The log goes to `logs/selftest.log`.
+window's pages) / `_SYNC_DEMO=<folder>` (the app joins the "Docs" folder it hosts itself: a mount on macOS, a
+Cloud Files folder on Windows); on macOS also `_WELCOME_ACTION=skip|continue` (presses that button and logs the
+resulting settings), on Windows `_SYNC_DIALOGS=<folder>` (renders the Sync page's dialogs). The log goes to
+`logs/selftest.log` (Windows: next to the executable).
 
 ## Remote server
 
@@ -139,6 +141,12 @@ installed (the system's NFS client mounts a server inside the app) and falls bac
 mount is refused. Choose "Keep a full copy in a normal folder" to always get a mirror. Why this mechanism and
 what was measured: `docs/a0-macos-mount.md`.
 
+On Windows a joined folder is a **Cloud Files folder under `%USERPROFILE%\MediaLake`** (the mechanism OneDrive
+uses): every file is listed at once as a placeholder and downloaded, whole, when something opens it. Explorer's
+"Always keep on this device" and "Free up space" work, and so does the folder browser in Settings > Sync. It
+needs NTFS and nothing installed; a folder that cannot be a sync root (not empty, another file system) becomes
+a mirror. What a real run showed: `docs/w0-cloud-files.md`.
+
 Conflicts keep both versions (*server wins*: the local one becomes `name (conflict, <device>, <date>).ext`
 and is shared; *ask*: it waits for `resolve … mine|server|both`). History lives on the host
 (`medialake-server sync versions|snapshots|restore`). Sync is off by default in the app (`[sync] enabled`),
@@ -148,6 +156,8 @@ Tests that need no model: `cargo test -p medialake-proto -p medialake-sync`; soa
 transfers are `--ignored` in `crates/medialake-sync/tests/network.rs`. On macOS
 `cargo test -p medialake-mount` really mounts (no root needed) and drives the volume with ordinary file calls
 and a Cocoa process; `cargo test -p medialake-core --test sync` does the same through the app's core.
+On Windows `cargo test -p medialake-cloudapi -p medialake-cloud` registers real Cloud Files sync roots in the
+temp folder (NTFS) and lets Windows fetch through them; the core test does the same with two cores over TLS.
 
 ## Data locations
 

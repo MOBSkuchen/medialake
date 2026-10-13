@@ -7,7 +7,6 @@ using Microsoft.UI.Xaml.Input;
 using Microsoft.Win32;
 using MediaLake.Native;
 using Windows.Graphics;
-using Windows.Storage.Pickers;
 using Windows.System;
 
 namespace MediaLake;
@@ -24,14 +23,13 @@ public sealed partial class WelcomeWindow : Window
 
     private readonly Dictionary<string, List<(string Quality, long Size, bool Downloaded)>> _models = new();
     private readonly Dictionary<string, string> _modelNames = new();
-    private readonly List<(string Id, string Name)> _available = new();
     private bool _loading = true;
     private bool _recording;
     private bool _searchReady;
     private bool _downloading;
+    /// A folder is synced or shared already: page 2 says "Done" instead of "Skip for now".
     private bool _joined;
     private string _shortcut = "";
-    private string _host = "";
     private int _page;
 
     public WelcomeWindow()
@@ -104,7 +102,7 @@ public sealed partial class WelcomeWindow : Window
             DownloadText.Text = ex.Message;
         }
         _loading = false;
-        ShowPage(_page);
+        await RefreshSyncListAsync();
     }
 
     private static string QualityLabel(string name) => name switch
@@ -319,92 +317,49 @@ public sealed partial class WelcomeWindow : Window
         DownloadText.Text = $"Downloading the search model… {FormatSize((long)d)} of {FormatSize((long)t)}. You can close this window: the download continues in the background.";
     }
 
-    // ---------- page 2: sync ----------
+    // ---------- page 2: sync (the dialogs are the Sync page's) ----------
 
-    private async void Connect_Click(object sender, RoutedEventArgs e)
+    private async void Join_Click(object sender, RoutedEventArgs e) =>
+        await SyncActionAsync(() => SyncDialogs.JoinAsync(Content.XamlRoot, WinRT.Interop.WindowNative.GetWindowHandle(this)));
+
+    private async void Share_Click(object sender, RoutedEventArgs e) =>
+        await SyncActionAsync(() => SyncDialogs.ShareAsync(Content.XamlRoot, WinRT.Interop.WindowNative.GetWindowHandle(this)));
+
+    private async Task SyncActionAsync(Func<Task<bool>> dialog)
+    {
+        if (App.Core == null) return;
+        SyncInfo.Text = "";
+        try { await dialog(); }
+        catch (Exception ex) { SyncInfo.Text = ex.Message; }
+        await RefreshSyncListAsync();
+    }
+
+    /// <summary>What is synced and shared already; with anything there, the page's button says "Done".</summary>
+    private async Task RefreshSyncListAsync()
     {
         var core = App.Core;
-        var code = CodeBox.Text.Trim();
-        if (core == null || code.Length == 0) return;
-        ConnectButton.IsEnabled = false;
-        SyncInfo.Text = "Connecting…";
+        if (core == null) return;
+        var lines = new List<string>();
         try
         {
-            // sync has to be on before anything can be paired or joined
-            await core.CallAsync("sync_enable", new { enabled = true });
-            var paired = await core.CallAsync("sync_pair", new { code });
-            _host = paired.GetProperty("host_id").GetString()!;
-            var res = await core.CallAsync("sync_available", new { host = _host });
-            _available.Clear();
-            SyncCombo.Items.Clear();
-            foreach (var s in res.GetProperty("syncs").EnumerateArray())
-            {
-                if (s.GetProperty("joined").GetBoolean()) continue;
-                var id = s.GetProperty("id").GetString()!;
-                var name = s.GetProperty("name").GetString()!;
-                _available.Add((id, name));
-                SyncCombo.Items.Add(new ComboBoxItem
-                {
-                    Content = $"{name}  ·  {s.GetProperty("files").GetInt64():N0} files, {FormatSize(s.GetProperty("bytes").GetInt64())}",
-                    Tag = id,
-                });
-            }
-            if (SyncCombo.Items.Count == 0)
-            {
-                JoinPanel.Visibility = Visibility.Collapsed;
-                SyncInfo.Text = "This computer shares nothing new with you.";
-            }
-            else
-            {
-                SyncCombo.SelectedIndex = 0;
-                JoinPanel.Visibility = Visibility.Visible;
-                SyncInfo.Text = "";
-            }
+            var st = await core.CallAsync("sync_status");
+            if (st.TryGetProperty("syncs", out var syncs) && syncs.ValueKind == JsonValueKind.Array)
+                foreach (var s in syncs.EnumerateArray())
+                    lines.Add($"{s.GetProperty("name").GetString()} is synced to {s.GetProperty("path").GetString()}");
+            if (st.TryGetProperty("hosting", out var h) && h.TryGetProperty("syncs", out var hosted) && hosted.ValueKind == JsonValueKind.Array)
+                foreach (var s in hosted.EnumerateArray())
+                    lines.Add($"{s.GetProperty("name").GetString()} is shared from this PC");
         }
-        catch (Exception ex)
+        catch { /* sync is off: nothing to list */ }
+        SyncList.Children.Clear();
+        foreach (var l in lines)
         {
-            SyncInfo.Text = ex.Message;
+            var t = new TextBlock { Text = "✓  " + l, FontSize = 12, TextWrapping = TextWrapping.Wrap };
+            if (Application.Current.Resources.TryGetValue("SystemFillColorSuccessBrush", out var ok)) t.Foreground = (Microsoft.UI.Xaml.Media.Brush)ok;
+            SyncList.Children.Add(t);
         }
-        ConnectButton.IsEnabled = true;
-    }
-
-    private void Sync_SelectionChanged(object sender, SelectionChangedEventArgs e)
-    {
-        if (SyncCombo.SelectedItem is not ComboBoxItem { Tag: string id }) return;
-        var name = _available.FirstOrDefault(a => a.Id == id).Name ?? "";
-        LocationBox.Text = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "MediaLake", name);
-    }
-
-    private async void Location_Click(object sender, RoutedEventArgs e)
-    {
-        var picker = new FolderPicker { SuggestedStartLocation = PickerLocationId.DocumentsLibrary };
-        picker.FileTypeFilter.Add("*");
-        WinRT.Interop.InitializeWithWindow.Initialize(picker, WinRT.Interop.WindowNative.GetWindowHandle(this));
-        var folder = await picker.PickSingleFolderAsync();
-        if (folder == null) return;
-        var name = _available.FirstOrDefault(a => SyncCombo.SelectedItem is ComboBoxItem { Tag: string id } && a.Id == id).Name ?? "";
-        LocationBox.Text = Path.Combine(folder.Path, name);
-    }
-
-    private async void Join_Click(object sender, RoutedEventArgs e)
-    {
-        var core = App.Core;
-        if (core == null || SyncCombo.SelectedItem is not ComboBoxItem { Tag: string id }) return;
-        JoinButton.IsEnabled = false;
-        try
-        {
-            var path = LocationBox.Text.Trim();
-            await core.CallAsync("sync_join", new { host = _host, sync_id = id, path, frontend = "auto", conflict = "server_wins" });
-            _joined = true;
-            JoinPanel.Visibility = Visibility.Collapsed;
-            SyncInfo.Text = $"{_available.First(a => a.Id == id).Name} is synced to {path}.";
-            ShowPage(1);
-        }
-        catch (Exception ex)
-        {
-            SyncInfo.Text = ex.Message;
-        }
-        JoinButton.IsEnabled = true;
+        _joined = lines.Count > 0;
+        ShowPage(_page);
     }
 
     // ---------- leaving ----------

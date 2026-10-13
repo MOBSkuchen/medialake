@@ -38,6 +38,21 @@ fn platform_api() -> Result<Arc<dyn CloudApi>> {
     bail!("Cloud Files needs Windows")
 }
 
+/// Writes the marker once. Hidden on Windows: Explorer shows dot files, and this one is not the user's.
+fn write_marker(path: &Path, sync_id: &str) {
+    use std::io::Write;
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true).create_new(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        o.attributes(0x2); // FILE_ATTRIBUTE_HIDDEN
+    }
+    if let Ok(mut f) = o.open(path) {
+        let _ = f.write_all(sync_id.as_bytes());
+    }
+}
+
 /// A GUID for the provider from the sync id (a sync id is 32 hex digits = 16 bytes).
 fn provider_id(sync_id: &str) -> [u8; 16] {
     let mut out = [0u8; 16];
@@ -81,7 +96,7 @@ impl CloudSession {
             provider_id: provider_id(&cfg.sync_id),
         };
         api.register(&root, &reg).map_err(|e| anyhow::anyhow!("{e}"))?;
-        let _ = std::fs::write(&marker, cfg.sync_id.as_bytes());
+        write_marker(&marker, &cfg.sync_id);
         let conn = api.connect(&root, Arc::new(HostProvider::new(tr))).map_err(|e| anyhow::anyhow!("{e}"))?;
         let frontend = Arc::new(CloudFrontend::new(api.clone(), &root, cfg.read_only));
         frontend.reconcile_pins();
@@ -134,11 +149,15 @@ pub fn leave_root(api: &dyn CloudApi, root: &Path, keep_downloaded: bool) -> Res
     }
     all.sort_by_key(|(p, _)| std::cmp::Reverse(p.components().count()));
     let mut first_error = None;
+    let marker = root.join(MARKER);
+    let dirs: Vec<PathBuf> = all.iter().filter(|(_, d)| *d).map(|(p, _)| p.clone()).collect();
     for (p, is_dir) in all {
+        if p == marker {
+            continue; // goes last: until then the folder is still ours if this is interrupted
+        }
         if is_dir {
-            if !keep_downloaded {
-                let _ = std::fs::remove_dir(&p);
-            }
+            // goes if nothing was kept in it: a tree of empty folders is not something to leave behind
+            let _ = std::fs::remove_dir(&p);
             continue;
         }
         let st = api.state(&p).unwrap_or_default();
@@ -154,6 +173,12 @@ pub fn leave_root(api: &dyn CloudApi, root: &Path, keep_downloaded: bool) -> Res
         }
     }
     api.unregister(root).map_err(|e| anyhow::anyhow!("{e}"))?;
+    // an ordinary folder again, with nothing of ours in it. Unregistering removes what was still a
+    // placeholder (and a folder that something had open a moment ago can go now): empty folders once more
+    for d in &dirs {
+        let _ = std::fs::remove_dir(d);
+    }
+    let _ = std::fs::remove_file(&marker);
     match first_error {
         Some(e) => bail!("{e}"),
         None => Ok(()),

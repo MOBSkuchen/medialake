@@ -5,20 +5,18 @@ using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Media;
 using MediaLake.Native;
 using Windows.ApplicationModel.DataTransfer;
-using Windows.Storage.Pickers;
 
 namespace MediaLake;
 
 /// <summary>
 /// Settings > Sync: joined folders, conflicts, folders shared from this PC, devices, speed limits.
-/// Mirrors the macOS page; everything goes through the core's <c>sync_*</c> calls. Pinning files and
-/// freeing space are done in Explorer (the folder buttons here are shortcuts for a whole sync).
+/// Mirrors the macOS page; everything goes through the core's <c>sync_*</c> calls. Files are kept on this
+/// PC or freed in Explorer as well as in the folder browser here (<see cref="SyncDialogs"/>).
 /// </summary>
 public sealed partial class SyncPage : UserControl
 {
     private bool _building;
     private string _message = "";
-    private DateTime _lastEvent;
     private bool _refreshQueued;
 
     // what the limit controls show (0 = unlimited); remembered so that the switch brings the number back
@@ -100,13 +98,18 @@ public sealed partial class SyncPage : UserControl
     private static bool Flag(JsonElement e, string name) =>
         e.ValueKind == JsonValueKind.Object && e.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.True;
 
-    private static string Bytes(long b) => b switch
+    private static string Bytes(long b) => SyncDialogs.Bytes(b);
+
+    /// <summary>"just now", "5 minutes ago", "yesterday", then the date.</summary>
+    private static string Ago(DateTimeOffset t)
     {
-        < 1024 => $"{b} B",
-        < 1 << 20 => $"{b / 1024.0:0} KB",
-        < 1 << 30 => $"{b / 1048576.0:0.0} MB",
-        _ => $"{b / 1073741824.0:0.0} GB",
-    };
+        var d = DateTimeOffset.Now - t;
+        if (d < TimeSpan.FromMinutes(1)) return "just now";
+        if (d < TimeSpan.FromHours(1)) return (int)d.TotalMinutes == 1 ? "a minute ago" : $"{(int)d.TotalMinutes} minutes ago";
+        if (d < TimeSpan.FromDays(1)) return (int)d.TotalHours == 1 ? "an hour ago" : $"{(int)d.TotalHours} hours ago";
+        if (d < TimeSpan.FromDays(2)) return "yesterday";
+        return t.LocalDateTime.ToString("d");
+    }
 
     /// <summary>One line for a sync's state (the tray menu uses it too).</summary>
     internal static string StateText(JsonElement s)
@@ -174,7 +177,7 @@ public sealed partial class SyncPage : UserControl
         return p;
     }
 
-    private static Task Call(string method, object? args = null) => App.Core!.CallAsync(method, args);
+    private static Task<JsonElement> Call(string method, object? args = null) => App.Core!.CallAsync(method, args);
 
     private void Draw(JsonElement st, bool enabled, JsonElement conflicts, JsonElement clients)
     {
@@ -199,11 +202,7 @@ public sealed partial class SyncPage : UserControl
         var syncs = st.TryGetProperty("syncs", out var sy) && sy.ValueKind == JsonValueKind.Array ? sy.EnumerateArray().ToList() : new List<JsonElement>();
         if (syncs.Count == 0) Host.Children.Add(Text("No synced folders yet", opacity: 0.6));
         foreach (var s in syncs) Host.Children.Add(FolderCard(s));
-        var addRow = Row(Btn("Add a folder…", () =>
-        {
-            ((App)Application.Current).ShowWelcome(1);
-            return Task.CompletedTask;
-        }));
+        var addRow = Row(Btn("Add a folder…", () => SyncDialogs.JoinAsync(XamlRoot, OwnerHwnd)));
         if (syncs.Count > 1)
         {
             var allPaused = syncs.All(s => Flag(s, "paused"));
@@ -254,7 +253,7 @@ public sealed partial class SyncPage : UserControl
                 Btn("Stop sharing", () => Call("sync_host_remove", new { sync = id }))));
             Host.Children.Add(Card(inner));
         }
-        var shareRow = Row(Btn("Share a folder…", ShareFolderAsync));
+        var shareRow = Row(Btn("Share a folder…", () => SyncDialogs.ShareAsync(XamlRoot, OwnerHwnd)));
         var inviteBtn = Btn("Invite a device…", () => InviteAsync(hosted));
         inviteBtn.IsEnabled = hosted.Count > 0;
         shareRow.Children.Add(inviteBtn);
@@ -269,7 +268,11 @@ public sealed partial class SyncPage : UserControl
             {
                 var cid = Str(c, "id");
                 var inner = new StackPanel { Spacing = 6 };
-                inner.Children.Add(Row(Text(Str(c, "name"), semibold: true), Btn("Remove device", () => Call("sync_revoke", new { client = cid }))));
+                var title = Row(Text(Str(c, "name"), semibold: true));
+                // this device may also use this PC's search model (a pairing code that granted both)
+                if (Flag(c, "embed")) title.Children.Add(Text("search", opacity: 0.6, size: 12));
+                title.Children.Add(Btn("Remove device", () => Call("sync_revoke", new { client = cid })));
+                inner.Children.Add(title);
                 var access = new Dictionary<string, string>();
                 if (c.TryGetProperty("syncs", out var cs2) && cs2.ValueKind == JsonValueKind.Object)
                     foreach (var p in cs2.EnumerateObject()) access[p.Name] = p.Value.GetString() ?? "";
@@ -343,21 +346,23 @@ public sealed partial class SyncPage : UserControl
         inner.Children.Add(head);
         inner.Children.Add(Text(path, opacity: 0.7, size: 12));
         var host = Str(s, "host_name");
-        if (host.Length > 0) inner.Children.Add(Text($"From {host}", opacity: 0.6, size: 12));
+        var last = Num(s, "last_sync") is > 0 and var t ? $"last synced {Ago(DateTimeOffset.FromUnixTimeSeconds(t))}" : "";
+        if (host.Length > 0 || last.Length > 0)
+            inner.Children.Add(Text(host.Length == 0 ? last : last.Length == 0 ? $"From {host}" : $"From {host} · {last}", opacity: 0.6, size: 12));
         if (Str(s, "notice") is { Length: > 0 } notice) inner.Children.Add(Text(notice, caution: true, size: 12));
         if (Str(s, "state") == "held" && s.TryGetProperty("held_deletes", out var hd) && hd.ValueKind == JsonValueKind.Number)
             inner.Children.Add(Row(Text($"{hd.GetInt64()} files would be deleted on the other computer."), Btn("Allow", () => Call("sync_confirm_deletes", new { sync_id = id }))));
+        // a folder that loads files when they are opened has something to keep or to free; a plain copy has not
+        var onDemand = Str(s, "frontend") == "cloud";
+        var verify = Btn("Check again", () => Call("sync_verify", new { sync_id = id }));
+        verify.IsEnabled = !paused;
         inner.Children.Add(Row(
             Btn("Open in Explorer", () =>
             {
                 ShellActions.OpenFile(path);
                 return Task.CompletedTask;
             }),
-            Btn("Always keep on this PC", () => Call("sync_pin", new { sync_id = id, path = "" })),
-            Btn("Free up space", () => Call("sync_unpin", new { sync_id = id, path = "", evict = true }))));
-        var verify = Btn("Check again", () => Call("sync_verify", new { sync_id = id }));
-        verify.IsEnabled = !paused;
-        inner.Children.Add(Row(
+            Btn(onDemand ? "Keep on this PC…" : "Browse…", () => SyncDialogs.BrowseAsync(XamlRoot, id, Str(s, "name"), onDemand, Str(s, "access") != "rw")),
             Btn(paused ? "Resume" : "Pause", () => Call(paused ? "sync_resume" : "sync_pause", new { sync_id = id })),
             verify,
             Btn("Leave…", () => LeaveAsync(id, Str(s, "name")))));
@@ -392,35 +397,6 @@ public sealed partial class SyncPage : UserControl
         var r = await dlg.ShowAsync();
         if (r == ContentDialogResult.None) return;
         await Call("sync_leave", new { sync_id = id, keep_files = r == ContentDialogResult.Primary });
-    }
-
-    private async Task ShareFolderAsync()
-    {
-        var picker = new FolderPicker { SuggestedStartLocation = PickerLocationId.DocumentsLibrary };
-        picker.FileTypeFilter.Add("*");
-        WinRT.Interop.InitializeWithWindow.Initialize(picker, OwnerHwnd);
-        var folder = await picker.PickSingleFolderAsync();
-        if (folder == null) return;
-        var name = new TextBox { Header = "Name", Text = folder.Name };
-        var backup = new ComboBox { Header = "Backups", MinWidth = 320 };
-        foreach (var (label, tag) in new[]
-                 {
-                     ("Keep the last 10 versions of each file", "file:10"),
-                     ("Keep the last 50 versions of each file", "file:50"),
-                     ("Daily snapshots, keep 14", "time:24:14"),
-                     ("None", "none"),
-                 })
-            backup.Items.Add(new ComboBoxItem { Content = label, Tag = tag });
-        backup.SelectedIndex = 0;
-        var panel = new StackPanel { Spacing = 12 };
-        panel.Children.Add(Text(folder.Path, opacity: 0.7, size: 12));
-        panel.Children.Add(name);
-        panel.Children.Add(backup);
-        panel.Children.Add(Text("The folder stays an ordinary folder. Versions and deleted files are kept inside .medialake-sync next to it.", opacity: 0.7, size: 12));
-        var dlg = new ContentDialog { Title = "Share a folder", Content = panel, PrimaryButtonText = "Share", CloseButtonText = "Cancel", XamlRoot = XamlRoot };
-        if (await dlg.ShowAsync() != ContentDialogResult.Primary) return;
-        var tag = (backup.SelectedItem as ComboBoxItem)?.Tag as string ?? "file:10";
-        await Call("sync_host_add", new { name = name.Text.Trim(), root = folder.Path, backup = tag });
     }
 
     private async Task InviteAsync(List<JsonElement> hosted)

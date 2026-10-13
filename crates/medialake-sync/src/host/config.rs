@@ -142,7 +142,7 @@ impl SyncsFile {
         if self.syncs.iter().any(|s| s.name == name) {
             anyhow::bail!("a sync named {name:?} already exists");
         }
-        let root = root.canonicalize().map_err(|e| anyhow::anyhow!("{}: {e}", root.display()))?;
+        let root = crate::util::plain_path(&root.canonicalize().map_err(|e| anyhow::anyhow!("{}: {e}", root.display()))?);
         if !root.is_dir() {
             anyhow::bail!("{} is not a folder", root.display());
         }

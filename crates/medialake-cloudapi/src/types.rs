@@ -108,6 +108,8 @@ pub struct FetchRequest {
     /// The range that must be delivered. More may be sent; the platform accepts what it did not ask for.
     pub offset: u64,
     pub length: u64,
+    /// The program that reads the file (its image path; empty if the platform does not say).
+    pub process: String,
 }
 
 /// Where a provider puts the bytes of a [`FetchRequest`].

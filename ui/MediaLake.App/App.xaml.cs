@@ -164,7 +164,30 @@ public partial class App : Application
             return;
         }
         if (background) return;
-        if (!ready || IsFirstRun()) _main?.ShowSearch();
+        if (ready)
+        {
+            if (IsFirstRun()) _main?.ShowSearch();
+        }
+        else if (!await HasSyncedFoldersAsync())
+        {
+            _main?.ShowSearch(); // the search window explains what is missing
+        }
+        else
+        {
+            // MediaLake is used for syncing only: opening it shows the folders, not an empty search
+            ShowSettings();
+            _settings?.SelectSync();
+        }
+    }
+
+    private static async Task<bool> HasSyncedFoldersAsync()
+    {
+        try
+        {
+            var st = await Core!.CallAsync("sync_status");
+            return st.TryGetProperty("syncs", out var s) && s.ValueKind == JsonValueKind.Array && s.GetArrayLength() > 0;
+        }
+        catch { return false; }
     }
 
     // ---------- sync: tray lines and notifications ----------
@@ -242,16 +265,16 @@ public partial class App : Application
         catch { /* the next event tries again */ }
     }
 
-    /// <summary>The uninstaller's step: no window, no single-instance check; the core does the work.</summary>
+    /// <summary>
+    /// The uninstaller's step: no window, no single-instance check, and no core either. Starting it would
+    /// start the model server and the syncs of an app that is being removed.
+    /// </summary>
     private static void UnregisterSyncRootsAndExit()
     {
         try
         {
-            var opts = new { server_exe = Path.Combine(AppContext.BaseDirectory, "medialake-server.exe") };
-            var core = CoreClient.Create(Environment.GetEnvironmentVariable("MEDIALAKE_HOME"), opts);
-            var r = core.Call("sync_unregister_roots");
+            var r = CoreClient.UnregisterSyncRoots(Environment.GetEnvironmentVariable("MEDIALAKE_HOME"));
             LogLine("unregister sync roots: " + r);
-            core.Dispose();
         }
         catch (Exception ex)
         {
@@ -277,11 +300,11 @@ public partial class App : Application
     }
 
     /// <summary>Search was set up or switched off: the search window re-reads its state.</summary>
-    public void SearchChanged()
+    public void SearchChanged(bool reloadSettings = true)
     {
         _ = _main?.RefreshSearchStateAsync();
         // an open Settings window holds an older copy of the shortcut, the model and the search switch
-        if (_settings != null) _ = _settings.ReloadAsync();
+        if (reloadSettings && _settings != null) _ = _settings.ReloadAsync();
     }
 
     private static bool IsFirstRun()
@@ -344,6 +367,27 @@ public partial class App : Application
             foreach (var it in main.Items) log.Add($"  {it.ScoreText} {it.Modality} {it.Path}");
             log.Add("status=" + Core!.Call("status"));
             if (shotPath != null) await SaveScreenshotAsync(main.RootElement, shotPath);
+            // MEDIALAKE_TEST_SYNC_DEMO=<folder>: this app hosts "Docs" (config.toml) and joins it itself as a
+            // Cloud Files folder, so that the Sync page has something real to show
+            if (Environment.GetEnvironmentVariable("MEDIALAKE_TEST_SYNC_DEMO") is { } point)
+            {
+                try
+                {
+                    var inv = await Core.CallAsync("sync_invite", new { grants = new[] { new { sync = "Docs", access = "rw" } } });
+                    var paired = await Core.CallAsync("sync_pair", new { code = inv.GetProperty("code").GetString() });
+                    var joined = await Core.CallAsync("sync_join", new { host = paired.GetProperty("host_id").GetString(), sync_id = "Docs", path = point, frontend = "auto", conflict = "ask" });
+                    log.Add("joined=" + joined);
+                    await Task.Delay(3000);
+                    log.Add("browse=" + await Core.CallAsync("sync_browse", new { sync_id = "Docs", path = "" }));
+                    // reading through Windows is what fetches a file
+                    log.Add("read hello.txt=" + await Task.Run(() => File.ReadAllText(Path.Combine(point, "hello.txt"))));
+                    await File.WriteAllTextAsync(Path.Combine(point, "from-pc.txt"), "made on this PC");
+                    await Task.Delay(4000);
+                    log.Add("browse after=" + await Core.CallAsync("sync_browse", new { sync_id = "Docs", path = "" }));
+                    log.Add("sync_status=" + await Core.CallAsync("sync_status"));
+                }
+                catch (Exception ex) { log.Add("sync demo failed: " + ex.Message); }
+            }
             if (Environment.GetEnvironmentVariable("MEDIALAKE_TEST_SETTINGS") is { } pagePath)
             {
                 var parts = pagePath.Split('|');
@@ -352,6 +396,22 @@ public partial class App : Application
                 _settings!.SelectPage(int.Parse(parts[0]));
                 await Task.Delay(1500);
                 await SaveScreenshotAsync(_settings.RootElement, parts[1]);
+                // MEDIALAKE_TEST_SYNC_DIALOGS=<folder>: the Sync page's dialogs, for the first synced folder
+                if (Environment.GetEnvironmentVariable("MEDIALAKE_TEST_SYNC_DIALOGS") is { } shots)
+                {
+                    var root = _settings.RootElement.XamlRoot;
+                    var hwnd = WinRT.Interop.WindowNative.GetWindowHandle(_settings);
+                    var st = await Core.CallAsync("sync_status");
+                    if (st.TryGetProperty("syncs", out var syncs) && syncs.GetArrayLength() > 0)
+                    {
+                        var s = syncs[0];
+                        var cloud = s.GetProperty("frontend").GetString() == "cloud";
+                        _ = SyncDialogs.BrowseAsync(root, s.GetProperty("sync_id").GetString()!, s.GetProperty("name").GetString()!, cloud, false);
+                        log.Add("browse dialog=" + await ShootDialogAsync(root, Path.Combine(shots, "sync-browse.png")));
+                    }
+                    _ = SyncDialogs.JoinAsync(root, hwnd);
+                    log.Add("join dialog=" + await ShootDialogAsync(root, Path.Combine(shots, "sync-join.png")));
+                }
             }
             // MEDIALAKE_TEST_WELCOME=<folder>: the two pages of the welcome window
             if (Environment.GetEnvironmentVariable("MEDIALAKE_TEST_WELCOME") is { } dir)
@@ -367,6 +427,22 @@ public partial class App : Application
         catch (Exception ex) { log.Add("FAIL " + ex); }
         File.WriteAllLines(Path.Combine(AppContext.BaseDirectory, "selftest.log"), log);
         Quit();
+    }
+
+    /// <summary>Renders the dialog that is open on <paramref name="root"/> and closes it. Returns what it found.</summary>
+    private static async Task<string> ShootDialogAsync(Microsoft.UI.Xaml.XamlRoot root, string path)
+    {
+        await Task.Delay(1500);
+        var found = new List<string>();
+        foreach (var p in Microsoft.UI.Xaml.Media.VisualTreeHelper.GetOpenPopupsForXamlRoot(root))
+        {
+            found.Add(p.Child?.GetType().Name ?? "null");
+            if (p.Child is not Microsoft.UI.Xaml.Controls.ContentDialog dlg) continue;
+            await SaveScreenshotAsync(dlg, path);
+            dlg.Hide();
+            await Task.Delay(500);
+        }
+        return found.Count == 0 ? "no dialog" : string.Join(",", found);
     }
 
     private static async Task SaveScreenshotAsync(FrameworkElement el, string path)

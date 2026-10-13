@@ -828,6 +828,13 @@ impl SyncManager {
                 .await
                 .map_err(|e| e.to_string())?
                 .map_err(|e| format!("leaving {}: {e:#}", f.name))?;
+        } else if cfg!(windows) && self.resolved_frontend(&f) == "cloud" {
+            // a root that is registered but not connected right now (it could not be started this time):
+            // it must not stay behind as a folder of placeholders that nothing serves
+            let root = f.path.clone();
+            if let Ok(Err(e)) = tokio::task::spawn_blocking(move || medialake_cloud::leave_root_default(&root, keep_files)).await {
+                tracing::warn!("leaving {}: {e:#}", f.name);
+            }
         }
         // a mount goes away; what was downloaded is kept as plain files if asked for
         #[cfg(target_os = "macos")]
@@ -863,8 +870,8 @@ impl SyncManager {
             }
         }
         if let Some(p) = patch["frontend"].as_str() {
-            if !matches!(p, "auto" | "mirror" | "mount") {
-                return Err("frontend must be auto, mirror or mount".into());
+            if !matches!(p, "auto" | "mirror" | "mount" | "cloud") {
+                return Err("frontend must be auto, mirror, mount or cloud".into());
             }
             if p != f.frontend {
                 return Err("changing how a sync is shown means leaving and joining it again".into());

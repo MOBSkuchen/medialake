@@ -34,6 +34,22 @@ internal sealed unsafe class CoreClient : IDisposable
         return c;
     }
 
+    /// <summary>
+    /// The uninstaller's step: the synced folders of the configuration in <paramref name="configDir"/> go back
+    /// to plain folders. Needs no running core (nothing is started). Returns the core's answer.
+    /// </summary>
+    public static JsonElement UnregisterSyncRoots(string? configDir)
+    {
+        var dir = Encoding.UTF8.GetBytes((configDir ?? "") + "\0");
+        string json;
+        fixed (byte* d = dir)
+            json = Take(NativeMethods.sn_unregister_sync_roots(d));
+        using var doc = JsonDocument.Parse(json);
+        var root = doc.RootElement;
+        if (root.TryGetProperty("error", out var err)) throw new CoreException(err.GetString() ?? "error");
+        return root.GetProperty("ok").Clone();
+    }
+
     [UnmanagedCallersOnly(CallConvs = [typeof(System.Runtime.CompilerServices.CallConvCdecl)])]
     private static void OnEvent(byte* msg)
     {

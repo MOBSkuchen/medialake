@@ -22,6 +22,16 @@ pub fn random_id() -> String {
     medialake_proto::pairing::hex(&random_bytes::<16>())
 }
 
+/// A path as people write it: without the `\\?\` that `canonicalize` puts in front of a drive path on
+/// Windows (it would be stored in the configuration and shown in every list). UNC paths keep theirs.
+pub fn plain_path(p: &Path) -> std::path::PathBuf {
+    let s = p.to_string_lossy();
+    match s.strip_prefix(r"\\?\") {
+        Some(rest) if !rest.starts_with("UNC\\") => std::path::PathBuf::from(rest),
+        _ => p.to_path_buf(),
+    }
+}
+
 pub fn mtime_ms(m: &std::fs::Metadata) -> i64 {
     m.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map(|d| d.as_millis() as i64).unwrap_or(0)
 }

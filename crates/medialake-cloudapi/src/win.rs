@@ -1,5 +1,5 @@
-//! The Windows implementation of [`CloudApi`] over cfapi. Everything here is unverified on a real machine:
-//! it type-checks, and `docs/w0-cloud-files.md` lists what to confirm.
+//! The Windows implementation of [`CloudApi`] over cfapi. `tests/win.rs` runs it against the real platform;
+//! `docs/w0-cloud-files.md` says what that showed.
 
 use std::ffi::c_void;
 use std::mem::{offset_of, size_of};
@@ -7,12 +7,14 @@ use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 use std::sync::Arc;
 
-use windows::Win32::Foundation::{CloseHandle, HANDLE, NTSTATUS, STATUS_CLOUD_FILE_NETWORK_UNAVAILABLE, STATUS_CLOUD_FILE_UNSUCCESSFUL};
+use windows::Win32::Foundation::{
+    CloseHandle, ERROR_ACCESS_DENIED, HANDLE, NTSTATUS, STATUS_CLOUD_FILE_NETWORK_UNAVAILABLE, STATUS_CLOUD_FILE_UNSUCCESSFUL,
+};
 use windows::Win32::Storage::CloudFilters::*;
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_READONLY, FILE_BASIC_INFO, FILE_FLAG_BACKUP_SEMANTICS,
-    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES, FindClose, FindFirstFileW, GetVolumeInformationW,
-    OPEN_EXISTING, WIN32_FIND_DATAW,
+    FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES, FindClose, FindFirstFileW,
+    GetVolumeInformationW, OPEN_EXISTING, WIN32_FIND_DATAW,
 };
 use windows::core::{GUID, PCWSTR};
 
@@ -21,9 +23,10 @@ use crate::types::*;
 
 // ---- policy choices (see docs/w0-cloud-files.md for why, and what to try instead) ----
 
-/// Partial hydration: only the ranges that are read are fetched (a thumbnail of a 2 GB video does not pull
-/// 2 GB). The plan said "full"; this is the deviation to check first on a real machine.
-const HYDRATION: CF_HYDRATION_POLICY_PRIMARY = CF_HYDRATION_POLICY_PARTIAL;
+/// Full hydration, as planned: a file is a placeholder or it is all here. Measured on Windows 11 26200,
+/// PARTIAL and PROGRESSIVE ask for the whole file on the first read just the same, so they bring nothing
+/// but a third state; see docs/w0-cloud-files.md.
+const HYDRATION: CF_HYDRATION_POLICY_PRIMARY = CF_HYDRATION_POLICY_FULL;
 /// Largest piece of one TRANSFER_DATA.
 pub const MAX_CHUNK: u64 = 4 << 20;
 
@@ -46,50 +49,44 @@ fn to_filetime(ms: i64) -> i64 {
     (ms.saturating_add(EPOCH_DELTA_MS)).max(0).saturating_mul(10_000)
 }
 
-/// A handle from `CfOpenFileWithOplock`: protected, only for Cf* calls.
-struct CfHandle(HANDLE);
+/// An ordinary handle without data access, for the Cf* calls. `CfOpenFileWithOplock` is deliberately not
+/// used: opening a placeholder that way from the provider's own process makes the platform fetch the whole
+/// file (seen on Windows 11 26200), so merely asking for a file's state would download the sync.
+struct Handle(HANDLE);
 
-impl Drop for CfHandle {
-    fn drop(&mut self) {
-        // SAFETY: the handle came from CfOpenFileWithOplock and is closed once.
-        unsafe { CfCloseHandle(self.0) }
-    }
-}
-
-fn open_cf(path: &Path, write: bool) -> CloudResult<CfHandle> {
-    let w = wide(path);
-    let flags = if write { CF_OPEN_FILE_FLAG_WRITE_ACCESS } else { CF_OPEN_FILE_FLAG_NONE };
-    // SAFETY: `w` is NUL-terminated and outlives the call.
-    let h = unsafe { CfOpenFileWithOplock(PCWSTR(w.as_ptr()), flags) }.map_err(|e| fail(&format!("opening {}", path.display()), e))?;
-    Ok(CfHandle(h))
-}
-
-/// An ordinary handle, for the calls that want one (`CfConvertToPlaceholder`).
-struct PlainHandle(HANDLE);
-
-impl Drop for PlainHandle {
+impl Drop for Handle {
     fn drop(&mut self) {
         // SAFETY: the handle came from CreateFileW and is closed once.
         let _ = unsafe { CloseHandle(self.0) };
     }
 }
 
-fn open_plain(path: &Path) -> CloudResult<PlainHandle> {
+const WRITE_DAC: u32 = 0x0004_0000;
+
+fn open_with(path: &Path, access: u32) -> windows::core::Result<Handle> {
     let w = wide(path);
-    // SAFETY: `w` is NUL-terminated and outlives the call.
-    let h = unsafe {
-        CreateFileW(
-            PCWSTR(w.as_ptr()),
-            FILE_WRITE_ATTRIBUTES.0,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            None,
-            OPEN_EXISTING,
-            FILE_FLAG_BACKUP_SEMANTICS,
-            None,
-        )
+    // SAFETY: `w` is NUL-terminated and outlives the call. BACKUP_SEMANTICS lets folders be opened.
+    unsafe {
+        CreateFileW(PCWSTR(w.as_ptr()), access, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, None, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, None)
     }
-    .map_err(|e| fail(&format!("opening {}", path.display()), e))?;
-    Ok(PlainHandle(h))
+    .map(Handle)
+}
+
+/// For reading a placeholder's information.
+fn open_query(path: &Path) -> CloudResult<Handle> {
+    open_with(path, FILE_READ_ATTRIBUTES.0).map_err(|e| fail(&format!("opening {}", path.display()), e))
+}
+
+/// For changing a placeholder (update, convert, pin, hydrate, free, revert). The documentation asks for
+/// WRITE_DAC (or data access, which a read-only file does not give); where the user may not change the
+/// access list, attribute access is what is left, and it is enough for most of the calls.
+fn open_change(path: &Path) -> CloudResult<Handle> {
+    let attrs = FILE_READ_ATTRIBUTES.0 | FILE_WRITE_ATTRIBUTES.0;
+    match open_with(path, WRITE_DAC | attrs) {
+        Err(e) if e.code() == ERROR_ACCESS_DENIED.to_hresult() => open_with(path, attrs),
+        r => r,
+    }
+    .map_err(|e| fail(&format!("opening {}", path.display()), e))
 }
 
 fn metadata(info: &PlaceholderInfo) -> CF_FS_METADATA {
@@ -206,7 +203,12 @@ unsafe extern "system" fn on_fetch_data(info: *const CF_CALLBACK_INFO, params: *
         // SAFETY: the platform guarantees `FileIdentityLength` readable bytes.
         Identity::decode(unsafe { std::slice::from_raw_parts(info.FileIdentity.cast::<u8>(), info.FileIdentityLength as usize) })
     };
-    let req = FetchRequest { rel, identity, file_size: info.FileSize.max(0) as u64, offset, length };
+    // SAFETY: with REQUIRE_PROCESS_INFO the platform passes a valid block (or null) for the callback's duration.
+    let process = match unsafe { info.ProcessInfo.as_ref() } {
+        Some(p) => unsafe { pcwstr_to_string(p.ImagePath) },
+        None => String::new(),
+    };
+    let req = FetchRequest { rel, identity, file_size: info.FileSize.max(0) as u64, offset, length, process };
     // a panic must not unwind into the system's callback dispatcher
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ctx.provider.fetch(&req, &t)));
     match r {
@@ -290,10 +292,9 @@ impl CloudApi for WinCloud {
             StructSize: size_of::<CF_SYNC_POLICIES>() as u32,
             Hydration: CF_HYDRATION_POLICY {
                 Primary: HYDRATION,
-                // Storage Sense may free space again; streaming reads are served as they arrive
-                Modifier: CF_HYDRATION_POLICY_MODIFIER(
-                    CF_HYDRATION_POLICY_MODIFIER_AUTO_DEHYDRATION_ALLOWED.0 | CF_HYDRATION_POLICY_MODIFIER_STREAMING_ALLOWED.0,
-                ),
+                // Storage Sense may free space again. Not STREAMING_ALLOWED: with it a read waited a full
+                // minute for a whole-file request that the platform then threw away.
+                Modifier: CF_HYDRATION_POLICY_MODIFIER_AUTO_DEHYDRATION_ALLOWED,
             },
             // every placeholder is created from the host's listing: browsing needs no network
             Population: CF_POPULATION_POLICY { Primary: CF_POPULATION_POLICY_ALWAYS_FULL, Modifier: CF_POPULATION_POLICY_MODIFIER_NONE },
@@ -320,8 +321,11 @@ impl CloudApi for WinCloud {
             CF_CALLBACK_REGISTRATION { Type: CF_CALLBACK_TYPE_NONE, Callback: None },
         ];
         let w = wide(root);
+        // without REQUIRE_FULL_FILE_PATH the callbacks get no `NormalizedPath`, and every fetch would be
+        // refused as "not below the sync root"; the process is for the log ("who downloaded this?")
+        let flags = CF_CONNECT_FLAG_REQUIRE_FULL_FILE_PATH | CF_CONNECT_FLAG_REQUIRE_PROCESS_INFO;
         // SAFETY: the table and path are valid for the call; the context lives until the connection drops.
-        let key = unsafe { CfConnectSyncRoot(PCWSTR(w.as_ptr()), table.as_ptr(), Some(ctx as *const c_void), CF_CONNECT_FLAG_NONE) };
+        let key = unsafe { CfConnectSyncRoot(PCWSTR(w.as_ptr()), table.as_ptr(), Some(ctx as *const c_void), flags) };
         match key {
             Ok(key) => Ok(Box::new(WinConnection { key, ctx })),
             Err(e) => {
@@ -340,7 +344,8 @@ impl CloudApi for WinCloud {
 
     fn create_placeholder(&self, parent: &Path, name: &str, info: &PlaceholderInfo) -> CloudResult<()> {
         let (parent_w, name_w) = (wide(parent), wide_str(name));
-        let ident = info.identity.as_ref().map(Identity::encode);
+        // the platform refuses a placeholder without an identity ("invalid request"), folders included
+        let ident = Some(info.identity.clone().unwrap_or(Identity { rev: 0, hash: String::new() }).encode());
         let mut flags = CF_PLACEHOLDER_CREATE_FLAG_NONE;
         if info.in_sync {
             flags |= CF_PLACEHOLDER_CREATE_FLAG_MARK_IN_SYNC;
@@ -369,7 +374,7 @@ impl CloudApi for WinCloud {
     }
 
     fn update_placeholder(&self, path: &Path, info: &PlaceholderInfo, dehydrate: bool) -> CloudResult<()> {
-        let h = open_cf(path, true)?;
+        let h = open_change(path)?;
         let md = metadata(info);
         let ident = info.identity.as_ref().map(Identity::encode);
         let mut flags = CF_UPDATE_FLAG_NONE;
@@ -397,14 +402,18 @@ impl CloudApi for WinCloud {
 
     fn mark_synced(&self, path: &Path, identity: &Identity) -> CloudResult<()> {
         let id = identity.encode();
-        if self.state(path)?.placeholder {
-            let h = open_cf(path, true)?;
-            // SAFETY: as in `update_placeholder`; no metadata change.
-            unsafe { CfUpdatePlaceholder(h.0, None, Some(id.as_ptr().cast::<c_void>()), id.len() as u32, None, CF_UPDATE_FLAG_MARK_IN_SYNC, None, None) }
+        let h = open_change(path)?;
+        let st = self.state_light(path)?;
+        if st.placeholder {
+            // The placeholder has to learn the size the file has now: with the size it was created with,
+            // a file that grew here comes back cut off (zeros after the old end) the next time it is
+            // fetched. Zero times and attributes mean "leave them".
+            let md = CF_FS_METADATA { BasicInfo: FILE_BASIC_INFO::default(), FileSize: st.size as i64 };
+            // SAFETY: as in `update_placeholder`.
+            unsafe { CfUpdatePlaceholder(h.0, Some(&md), Some(id.as_ptr().cast::<c_void>()), id.len() as u32, None, CF_UPDATE_FLAG_MARK_IN_SYNC, None, None) }
                 .map_err(|e| fail(&format!("updating {}", path.display()), e))
         } else {
             // a file that was created here (or downloaded): it becomes a placeholder that can be freed later
-            let h = open_plain(path)?;
             // SAFETY: `h` is an open handle; `id` is valid for the call.
             unsafe { CfConvertToPlaceholder(h.0, Some(id.as_ptr().cast::<c_void>()), id.len() as u32, CF_CONVERT_FLAG_MARK_IN_SYNC, None, None) }
                 .map_err(|e| fail(&format!("converting {}", path.display()), e))
@@ -420,20 +429,20 @@ impl CloudApi for WinCloud {
     }
 
     fn hydrate(&self, path: &Path) -> CloudResult<()> {
-        let h = open_cf(path, true)?;
+        let h = open_change(path)?;
         // SAFETY: `h` is an open handle; length -1 = to the end of the file.
         unsafe { CfHydratePlaceholder(h.0, 0, -1, CF_HYDRATE_FLAG_NONE, None) }.map_err(|e| fail(&format!("hydrating {}", path.display()), e))
     }
 
     fn dehydrate(&self, path: &Path) -> CloudResult<()> {
-        let h = open_cf(path, true)?;
+        let h = open_change(path)?;
         // SAFETY: as in `hydrate`.
         unsafe { CfDehydratePlaceholder(h.0, 0, -1, CF_DEHYDRATE_FLAG_NONE, None) }
             .map_err(|e| fail(&format!("freeing {}", path.display()), e))
     }
 
     fn set_pin(&self, path: &Path, pin: Pin) -> CloudResult<()> {
-        let h = open_cf(path, true)?;
+        let h = open_change(path)?;
         let state = match pin {
             Pin::Unspecified => CF_PIN_STATE_UNSPECIFIED,
             Pin::Pinned => CF_PIN_STATE_PINNED,
@@ -446,7 +455,7 @@ impl CloudApi for WinCloud {
     }
 
     fn revert(&self, path: &Path) -> CloudResult<()> {
-        let h = open_cf(path, true)?;
+        let h = open_change(path)?;
         // SAFETY: `h` is an open handle.
         unsafe { CfRevertPlaceholder(h.0, CF_REVERT_FLAG_NONE, None) }.map_err(|e| fail(&format!("reverting {}", path.display()), e))
     }
@@ -479,7 +488,7 @@ fn state_of(path: &Path, with_identity: bool) -> CloudResult<FileState> {
         attributes: attrs,
     };
     if placeholder && with_identity {
-        if let Ok(h) = open_cf(path, false) {
+        if let Ok(h) = open_query(path) {
             // 4 KiB of identity plus the header, 8-byte aligned
             let mut buf = [0u64; 640];
             let mut returned = 0u32;

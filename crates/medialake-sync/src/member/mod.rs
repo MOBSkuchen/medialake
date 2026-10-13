@@ -249,7 +249,7 @@ pub async fn join(store: &MemberStore, host: &HostCreds, device: &str, sync: &st
         bail!("already joined {:?}", info.name);
     }
     std::fs::create_dir_all(path).with_context(|| format!("creating {}", path.display()))?;
-    let path = path.canonicalize()?;
+    let path = crate::util::plain_path(&path.canonicalize()?);
     let m = MemberConfig {
         sync_id: info.id.clone(),
         host_id: host.id.clone(),

@@ -371,11 +371,56 @@ fn vanished_root_pauses_instead_of_deleting() {
     assert!(!h.hs.entry("a.txt").unwrap().deleted);
 }
 
+/// Makes `p` unreadable for as long as the returned guard lives (a program that has the file open and
+/// shares nothing on Windows; no read permission elsewhere).
+#[cfg(windows)]
+fn make_unreadable(p: &std::path::Path) -> Box<dyn std::any::Any> {
+    use std::os::windows::fs::OpenOptionsExt;
+    Box::new(std::fs::OpenOptions::new().read(true).share_mode(0).open(p).unwrap())
+}
+
+#[cfg(unix)]
+fn make_unreadable(p: &std::path::Path) -> Box<dyn std::any::Any> {
+    use std::os::unix::fs::PermissionsExt;
+    struct Restore(std::path::PathBuf);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o644));
+        }
+    }
+    std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o000)).unwrap();
+    Box::new(Restore(p.to_path_buf()))
+}
+
+#[test]
+fn a_renamed_file_that_cannot_be_read_yet_is_not_deleted_on_the_host() {
+    let h = host(none());
+    let mut m = member(&h, "PC", ConflictPolicy::ServerWins, Access::ReadWrite);
+    m.write("a.txt", "the only good copy may be the host's");
+    m.write("gone.txt", "really deleted");
+    m.sync();
+    std::fs::rename(m.root.join("a.txt"), m.root.join("b.txt")).unwrap();
+    m.remove("gone.txt");
+    let guard = make_unreadable(&m.root.join("b.txt"));
+    if std::fs::read(m.root.join("b.txt")).is_ok() {
+        return; // running as root: nothing is unreadable
+    }
+    m.sync();
+    // the delete of the old name waits for the new name; other deletes do not
+    assert!(!h.hs.entry("a.txt").unwrap().deleted, "half a rename must not reach the host");
+    assert!(h.hs.entry("b.txt").is_none());
+    assert!(h.hs.entry("gone.txt").unwrap().deleted);
+    drop(guard);
+    m.sync();
+    assert!(h.hs.entry("a.txt").unwrap().deleted);
+    assert_eq!(std::fs::read_to_string(h.root.join("b.txt")).unwrap(), "the only good copy may be the host's");
+}
+
 /// A transport whose host can be swapped, to simulate a host that lost its database.
-struct Switch(std::sync::Mutex<medialake_sync::member::transport::LocalTransport>);
+struct Switch(std::sync::Mutex<Option<medialake_sync::member::transport::LocalTransport>>);
 
 macro_rules! delegate {
-    ($self:ident, $m:ident($($a:expr),*)) => { $self.0.lock().unwrap().$m($($a),*) };
+    ($self:ident, $m:ident($($a:expr),*)) => { $self.0.lock().unwrap().as_ref().expect("no host").$m($($a),*) };
 }
 
 impl medialake_sync::member::transport::Transport for Switch {
@@ -417,7 +462,7 @@ fn rebuilt_host_database_is_reconciled() {
     use std::sync::Arc;
 
     let h = host(none());
-    let sw = Arc::new(Switch(std::sync::Mutex::new(LocalTransport { host: h.hs.clone(), access: Access::ReadWrite, author: "Mac".into() })));
+    let sw = Arc::new(Switch(std::sync::Mutex::new(Some(LocalTransport { host: h.hs.clone(), access: Access::ReadWrite, author: "Mac".into() }))));
     let dir = tempfile::tempdir().unwrap();
     let base = dir.path().canonicalize().unwrap();
     let root = base.join("files");
@@ -441,6 +486,8 @@ fn rebuilt_host_database_is_reconciled() {
     let store = h.hs.store_dir().to_path_buf();
     let cfg = h.hs.config();
     let old_epoch = h.hs.epoch();
+    // every handle on the old host has to go first: Windows does not delete an open database
+    *sw.0.lock().unwrap() = None;
     drop(h.hs);
     std::fs::remove_file(store.join("state.db")).unwrap();
     let _ = std::fs::remove_file(store.join("state.db-wal"));
@@ -450,7 +497,7 @@ fn rebuilt_host_database_is_reconciled() {
     let hs2 = HostedSync::open(cfg, None).unwrap();
     hs2.scan().unwrap();
     assert_ne!(hs2.epoch(), old_epoch);
-    *sw.0.lock().unwrap() = LocalTransport { host: hs2.clone(), access: Access::ReadWrite, author: "Mac".into() };
+    *sw.0.lock().unwrap() = Some(LocalTransport { host: hs2.clone(), access: Access::ReadWrite, author: "Mac".into() });
 
     let r = engine.sync_once().unwrap();
     assert_eq!(r.conflicts, 0, "{:?}", r.errors);

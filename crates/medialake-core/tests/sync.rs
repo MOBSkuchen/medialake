@@ -48,7 +48,7 @@ bind = "127.0.0.1:0"
 [[sync.hosted]]
 id = "{}"
 name = "Docs"
-root = "{}"
+root = '{}'
 backup = {{ strategy = "file", keep = 5 }}
 "#,
             "0123456789abcdef0123456789abcdef",
@@ -214,7 +214,7 @@ async fn sync_can_be_enabled_at_runtime_and_limits_apply() {
 }
 
 /// A hosts a folder; B pairs. Returns (A, B, shared dir, home of B's folders, the temp dir guard).
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 async fn host_and_member(files: &[(&str, Vec<u8>)]) -> (std::sync::Arc<Core>, std::sync::Arc<Core>, std::path::PathBuf, std::path::PathBuf, tempfile::TempDir, String) {
     let tmp = tempfile::tempdir().unwrap();
     let base = tmp.path().canonicalize().unwrap();
@@ -229,7 +229,8 @@ async fn host_and_member(files: &[(&str, Vec<u8>)]) -> (std::sync::Arc<Core>, st
     write_config(
         &home_a,
         &format!(
-            "search_enabled = false\n[sync]\nenabled = true\ndevice_name = \"Device A\"\n[sync.hosting]\nbind = \"127.0.0.1:0\"\n[[sync.hosted]]\nid = \"fedcba9876543210fedcba9876543210\"\nname = \"Docs\"\nroot = \"{}\"\nbackup = {{ strategy = \"none\" }}\n",
+            // a literal string: a Windows path is full of backslashes
+            "search_enabled = false\n[sync]\nenabled = true\ndevice_name = \"Device A\"\n[sync.hosting]\nbind = \"127.0.0.1:0\"\n[[sync.hosted]]\nid = \"fedcba9876543210fedcba9876543210\"\nname = \"Docs\"\nroot = '{}'\nbackup = {{ strategy = \"none\" }}\n",
             shared.display()
         ),
     );
@@ -338,6 +339,112 @@ async fn a_cache_that_does_not_belong_to_the_engine_state_is_set_aside() {
     let st = &m.status()[0];
     assert!(st.notice.contains("set aside"), "{st:?}");
     assert_eq!(st.pending_conflicts, 0);
+    a.shutdown().await;
+    b.shutdown().await;
+}
+
+/// The Windows counterpart of the mount test: two cores over TLS, the member's folder is a Cloud Files
+/// sync root. Windows fetches through the app's own connection to the host when a file is opened.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cloud_sync_loads_on_demand_pins_and_leaves() {
+    let big: Vec<u8> = (0..3 * 1024 * 1024 + 11).map(|i| ((i * 7) % 251) as u8).collect();
+    let (a, b, shared, base, _tmp, host_id) = host_and_member(&[("hello.txt", b"hello".to_vec()), ("big.bin", big.clone()), ("docs/a.md", b"# a".to_vec())]).await;
+    let root = base.join("MediaLake").join("Docs");
+    // "auto" is Cloud Files on Windows
+    let f = b.sync_join(&host_id, "Docs", &root, "auto", "server_wins").await.unwrap();
+    assert_eq!(f.frontend, "auto");
+    let m = b.sync().unwrap();
+
+    until("placeholders appear", Duration::from_secs(30), || m.browse("Docs", "").map(|i| i.len() == 3).unwrap_or(false)).await;
+    let st = m.status();
+    assert_eq!(st[0].frontend, "cloud", "{:?}", st[0]);
+    assert_eq!(st[0].notice, "");
+    // nothing downloaded yet: names and sizes are there, content is not
+    let items = m.browse("Docs", "").unwrap();
+    let big_item = items.iter().find(|i| i.name == "big.bin").unwrap();
+    assert_eq!((big_item.size, big_item.state.as_str(), big_item.cached_bytes), (big.len() as u64, "cloud", 0));
+    assert_eq!(std::fs::metadata(root.join("big.bin")).unwrap().len(), big.len() as u64);
+
+    // opening one file loads it (and only it); the read runs off the runtime's threads, like a program's
+    let p = root.join("hello.txt");
+    assert_eq!(tokio::task::spawn_blocking(move || std::fs::read_to_string(p)).await.unwrap().unwrap(), "hello");
+    let items = m.browse("Docs", "").unwrap();
+    assert_eq!(items.iter().find(|i| i.name == "hello.txt").unwrap().state, "cached");
+    assert_eq!(items.iter().find(|i| i.name == "big.bin").unwrap().state, "cloud");
+
+    // keep the whole sync on this device
+    m.pin("Docs", "").unwrap();
+    until("pinned files arrive", Duration::from_secs(30), || {
+        let top = m.browse("Docs", "").unwrap();
+        let inner = m.browse("Docs", "docs").unwrap();
+        top.iter().filter(|i| !i.is_dir).all(|i| i.state == "cached") && inner.iter().all(|i| i.state == "cached")
+    })
+    .await;
+    let p = root.join("big.bin");
+    assert_eq!(tokio::task::spawn_blocking(move || std::fs::read(p)).await.unwrap().unwrap(), big);
+
+    // a file written into the folder reaches the host, and a change on the host reaches the folder
+    std::fs::write(root.join("from-b.txt"), "written into the sync root").unwrap();
+    until("upload", Duration::from_secs(30), || shared.join("from-b.txt").exists()).await;
+    assert_eq!(std::fs::read_to_string(shared.join("from-b.txt")).unwrap(), "written into the sync root");
+    std::fs::write(shared.join("docs/new.md"), "# new on the host").unwrap();
+    until("the host's new file is listed", Duration::from_secs(30), || root.join("docs/new.md").exists()).await;
+
+    // pausing keeps the files reachable
+    m.set_folder("Docs", &serde_json::json!({ "paused": true })).await.unwrap();
+    let p = root.join("docs/new.md");
+    assert_eq!(tokio::task::spawn_blocking(move || std::fs::read_to_string(p)).await.unwrap().unwrap(), "# new on the host");
+    m.set_folder("Docs", &serde_json::json!({ "paused": false })).await.unwrap();
+
+    // leaving keeps what was downloaded as ordinary files; the folder is an ordinary folder again
+    b.sync_leave("Docs", true).await.unwrap();
+    assert_eq!(std::fs::read(root.join("big.bin")).unwrap(), big);
+    assert_eq!(std::fs::read_to_string(root.join("docs/a.md")).unwrap(), "# a");
+    assert!(b.sync().unwrap().status().is_empty());
+    let (n, errors) = b.sync_unregister_roots().await;
+    assert_eq!((n, errors.len()), (0, 0), "nothing is left to unregister");
+    a.shutdown().await;
+    b.shutdown().await;
+}
+
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_folder_that_cannot_be_a_sync_root_becomes_a_mirror() {
+    let (a, b, _shared, base, _tmp, host_id) = host_and_member(&[("hello.txt", b"hello".to_vec())]).await;
+    let point = base.join("occupied");
+    std::fs::create_dir_all(&point).unwrap();
+    std::fs::write(point.join("mine.txt"), "already here").unwrap();
+    let f = b.sync_join(&host_id, "Docs", &point, "auto", "server_wins").await.unwrap();
+    let m = b.sync().unwrap();
+    until("downloaded as a mirror", Duration::from_secs(30), || point.join("hello.txt").exists()).await;
+    let st = &m.status()[0];
+    assert_eq!(st.frontend, "mirror", "{st:?}");
+    assert!(st.notice.contains("not empty"), "notice={:?} full={st:?}", st.notice);
+    assert_eq!(std::fs::read_to_string(point.join("mine.txt")).unwrap(), "already here");
+    assert_eq!(f.frontend, "auto");
+    // a mirror has nothing to pin
+    assert!(m.pin("Docs", "").is_err());
+    a.shutdown().await;
+    b.shutdown().await;
+}
+
+/// The uninstaller's call on Windows: every Cloud Files root goes back to a plain folder, without the
+/// sync running.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn uninstall_turns_sync_roots_back_into_folders() {
+    let (a, b, _shared, base, _tmp, host_id) = host_and_member(&[("seen.txt", b"seen".to_vec()), ("unseen.txt", b"unseen".to_vec())]).await;
+    let root = base.join("Docs");
+    b.sync_join(&host_id, "Docs", &root, "cloud", "server_wins").await.unwrap();
+    let m = b.sync().unwrap();
+    until("placeholders appear", Duration::from_secs(30), || m.browse("Docs", "").map(|i| i.len() == 2).unwrap_or(false)).await;
+    let p = root.join("seen.txt");
+    assert_eq!(tokio::task::spawn_blocking(move || std::fs::read_to_string(p)).await.unwrap().unwrap(), "seen");
+    let (n, errors) = b.sync_unregister_roots().await;
+    assert_eq!((n, errors.len()), (1, 0), "{errors:?}");
+    assert_eq!(std::fs::read_to_string(root.join("seen.txt")).unwrap(), "seen");
+    assert!(!root.join("unseen.txt").exists(), "a placeholder without content cannot stay");
     a.shutdown().await;
     b.shutdown().await;
 }

@@ -277,11 +277,7 @@ impl Paths {
 
 /// Strips the verbatim path prefix that `canonicalize` adds on Windows.
 pub fn normalize_path(p: &Path) -> PathBuf {
-    let s = p.to_string_lossy();
-    match s.strip_prefix(r"\\?\") {
-        Some(rest) if !rest.starts_with("UNC\\") => PathBuf::from(rest),
-        _ => p.to_path_buf(),
-    }
+    medialake_sync::util::plain_path(p)
 }
 
 #[cfg(test)]

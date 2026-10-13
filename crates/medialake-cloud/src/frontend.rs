@@ -288,7 +288,11 @@ impl Frontend for CloudFrontend {
 
     fn content_hash(&self, rel: &str) -> Option<String> {
         let st = self.inner.api.state(&self.inner.path(rel)).ok()?;
-        if st.placeholder && st.in_sync && !st.is_dir { st.identity.map(|i| i.hash) } else { None }
+        // In sync: untouched since it was marked. Not all here: nothing can have changed the content (a
+        // write makes Windows fetch the file first), whatever a rename or a new timestamp did to the
+        // mark. Reading such a file to hash it would download it, and after a rename the host does not
+        // even know it under the new name yet.
+        if st.placeholder && !st.is_dir && (st.in_sync || st.dehydrated) { st.identity.map(|i| i.hash) } else { None }
     }
 
     fn note_content(&self, rel: &str, hash: &str, rev: u64, size: u64, mtime: i64) {

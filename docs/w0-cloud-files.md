@@ -1,105 +1,114 @@
-# W0–W2: Cloud Files on Windows — what is built, what is assumed, what to check
+# W0–W2: Cloud Files on Windows — what runs, what it showed, what is left to check by hand
 
-This is a **base version**. It was written on a Mac, against the `windows` crate's bindings: the code
-type-checks for `x86_64-pc-windows-msvc` and its platform-independent logic is tested, but **none of it has
-run on Windows**. This note is the list of things to confirm (and the first things to fix) on a Windows
-machine. Plan: `post-plan3.md` §8.2, §10, §11.
+The Windows side was written on a Mac against the `windows` crate's bindings. It has since been built and
+run on Windows 11 (build 26200, NTFS, an unpackaged process). This note says what that showed: the bugs
+that only a real run could find, the answers to the questions the first version left open, and the checks
+that still need a person in front of Explorer. Plan: `post-plan3.md` §8.2, §10, §11.
 
-## What exists
+## What exists and how it is verified
 
 | Piece | Where | Verified how |
 |---|---|---|
-| Typed layer over cfapi (`CfRegisterSyncRoot`, `CfConnectSyncRoot`, `CfCreatePlaceholders`, `CfExecute` TRANSFER_DATA, `CfUpdatePlaceholder`, `CfConvertToPlaceholder`, pin, hydrate, dehydrate, revert) | `crates/medialake-cloudapi/src/win.rs` | **type-checks**: `cargo check -p medialake-cloudapi --target x86_64-pc-windows-msvc --all-targets` (works from a Mac) |
-| Platform-neutral half: identity blob, 4 KiB transfer planner, callback-path mapping, recall-attribute test, the `CloudApi` / `Provider` traits | `…/cloudapi/src/{types,plan}.rs` | unit tests (host) |
-| **W0 spike**: registers a root, creates placeholders, serves FETCH_DATA from a slow source, reacts to pin / unpin | `crates/medialake-cloudapi/examples/spike.rs` | type-checks; **not run** |
-| **W1 frontend**: the sync engine's `Frontend` over a Cloud Files root; the provider that serves FETCH_DATA from the host | `crates/medialake-cloud/` | 11 integration tests against the real engine and host over a *stand-in* platform (sparse files + a read that calls the provider) |
-| Core wiring: frontend kind `cloud` (auto on Windows, mirror fallback with a notice), browse / pin / unpin / leave, `sync_unregister_roots` | `medialake-core/src/sync.rs`, `core.rs`, `medialake-ffi/src/dispatch.rs` | core test for the refusal off Windows; the Windows branch is not runnable here |
-| **X1**: the indexer treats any file with `RECALL_ON_DATA_ACCESS` / `RECALL_ON_OPEN` / `OFFLINE` as "would download": name only, content once it is local (this also covers OneDrive folders). Search hits carry `available`, so that UIs show an icon instead of a thumbnail that would download the file | `medialake-core/src/indexer.rs`, `search.rs`; `ui/*/…` | logic is the same code path as the macOS gate (not model-tested); the Windows attribute read is untested |
-| **W2**: WinUI Settings > Sync page, tray lines + "Pause all syncing" + balloon notifications, uninstall leaves the syncs and unregisters the roots (`--unregister-sync-roots`) | `ui/MediaLake.App/SyncPage.xaml(.cs)`, `Native/Shell.cs`, `App.xaml.cs`, `installer/medialake.iss` | **never compiled** (no .NET SDK on the dev Mac) |
-| **X2** (Windows UI half): speed limits as switch + number, Check again (verify), the error states, welcome window | same | never compiled |
+| Typed layer over cfapi (register, connect, placeholders, TRANSFER_DATA, update, convert, pin, hydrate, dehydrate, revert) | `crates/medialake-cloudapi/src/win.rs` | **10 tests against the real platform** (`tests/win.rs`): each registers a sync root in a temporary folder and lets Windows fetch through it |
+| Platform-neutral half: identity blob, 4 KiB transfer planner, callback-path mapping, recall-attribute test | `…/cloudapi/src/{types,plan}.rs` | unit tests (any host) |
+| **W0 spike** | `crates/medialake-cloudapi/examples/spike.rs` | run, driven from a second process (reads, pin / free through `attrib`, copy in, rename, delete, disconnect, unregister) |
+| **W1 frontend** | `crates/medialake-cloud/` | **16 tests on the real platform with the real engine and host** (`tests/windows.rs`), next to the 11 over the stand-in (`tests/frontend.rs`, any host) |
+| Core wiring: frontend kind `cloud` (auto on Windows, mirror fallback with a notice), browse / pin / unpin / leave, `sync_unregister_roots` | `medialake-core/src/sync.rs`, `core.rs`, `medialake-ffi/src/dispatch.rs` | `medialake-core/tests/sync.rs`: two cores over TLS, the member's folder a Cloud Files root (load on open, pin all, upload, host change, pause, leave, uninstall, fallback to a mirror) |
+| **W2**: WinUI Settings > Sync, welcome window, tray lines and balloons, uninstall step | `ui/MediaLake.App/` | builds without warnings; the real `MediaLake.exe` driven with `--selftest` against a scratch data folder (it hosts a folder, joins it as a Cloud Files root, reads and writes through Explorer's file system, renders the Sync page and its dialogs), then `--unregister-sync-roots` |
+| **X1**: files with `RECALL_ON_DATA_ACCESS` / `RECALL_ON_OPEN` / `OFFLINE` are indexed by name only | `medialake-core/src/indexer.rs`, `search.rs` | the attributes are asserted on real placeholders, and reading them with `symlink_metadata` fetches nothing; an index run with a model over a root of placeholders was **not** done |
 
-What the engine side guarantees (tested with the stand-in): a clean placeholder is never read; its
-`{rev, hash}` identity answers `content_hash`, so a lost `state.db` re-adopts the tree without downloading it;
-pushed or downloaded files become in-sync placeholders; a remote change to a clean placeholder updates and
-frees it unless it is pinned; leaving keeps hydrated files and removes placeholders.
+## What the first real run found
+
+All of these type-checked and passed the stand-in tests. Each is fixed, and the tests on the real platform
+cover it.
+
+1. **No file could be opened.** `CfConnectSyncRoot` was called without `CF_CONNECT_FLAG_REQUIRE_FULL_FILE_PATH`, so
+   callbacks carried no `NormalizedPath` and every fetch was refused as "not below the sync root".
+2. **Asking for a file's state downloaded the file.** `CfOpenFileWithOplock`, opened from the provider's own
+   process, makes the platform fetch the whole file. The engine asks for the state of every file in every
+   scan: the first scan would have downloaded the sync. All calls use ordinary handles without data access
+   now (`open_query` / `open_change`). `CfUpdatePlaceholder` also refused the oplock handle unless it was
+   exclusive ("invalid handle").
+3. **Folder placeholders were refused** (`ERROR_CLOUD_FILE_INVALID_REQUEST`): the platform wants an identity
+   blob for directories too.
+4. **A read waited a full minute.** With the hydration modifier `STREAMING_ALLOWED`, a small read from another
+   process produced a whole-file request whose data the platform threw away, then the real request 60 s later.
+5. **A file that changed size came back cut off.** A placeholder edited here, pushed, freed and opened again
+   returned its old length followed by zeros: marking it in sync has to tell the placeholder the new size.
+6. **A rename could delete the file on the host.** Windows clears the "in sync" mark of a renamed
+   placeholder. The engine then tried to hash it, which asks the host for a name it does not know yet; the
+   read failed, the new name was skipped, and the old name was pushed as a delete. With nothing kept in
+   backups that would have been the only copy. Fixed twice over: a placeholder whose content is not here
+   answers with the hash it stands for (so the rename is pushed as a move), and the engine never pushes the
+   delete of a file while a new file of the same size cannot be read (`medialake-sync`, all platforms).
+
+Smaller things: the marker file is hidden and goes when the sync is left; folders that end up empty are
+removed on leaving; `sync_set` accepts `cloud`; leaving a sync whose root is registered but not connected
+unregisters it; the uninstaller's step (`sn_unregister_sync_roots`) reads the configuration and starts
+nothing, where it used to start the whole core, model server and syncs included, of an app that is being
+removed.
 
 ## Design in one page
 
-* **Sync root** per sync, default `%USERPROFILE%\MediaLake\<name>`, registered with plain `CfRegisterSyncRoot`
-  (no package identity, no `StorageProviderSyncRootManager`; see question 1). A marker file
-  `.medialake-sync` (an ignored name) says the folder is ours; a non-empty folder without it is refused and
-  the sync falls back to a mirror with a notice.
+* **Sync root** per sync, default `%USERPROFILE%\MediaLake\<name>`, registered with plain `CfRegisterSyncRoot`.
+  A hidden marker file `.medialake-sync` (an ignored name) says the folder is ours; a non-empty folder
+  without it is refused and the sync runs as a mirror with a notice.
 * **Population** is *always full*: every placeholder is created from the host's listing, so Explorer never
   asks the provider to enumerate and browsing needs no network.
-* **Hydration** is *partial*: only the ranges that are read are fetched (a thumbnail of a 2 GB video does not
-  pull 2 GB). The plan said "full"; see question 2.
+* **Hydration** is *full*, as planned: a file is a placeholder or it is all here. Auto-dehydration is
+  allowed (Storage Sense may free space).
 * **Callbacks**: `FETCH_DATA` (served from the engine's transport with the revision from the placeholder's
-  identity, in 4 KiB-aligned pieces of at most 4 MiB, with progress) and `CANCEL_FETCH_DATA`. A failed fetch
-  is answered at once with an error status (`NETWORK_UNAVAILABLE` for an unreachable host) instead of leaving
-  Explorer to time out.
-* **No `NOTIFY_DELETE` / `NOTIFY_RENAME`**: registering them would oblige us to acknowledge every delete and
-  rename; the file watcher sees them as it does for a mirror.
+  identity, in 4 KiB-aligned pieces of at most 4 MiB, with progress; the log names the program that reads)
+  and `CANCEL_FETCH_DATA`. A failed fetch is answered at once with an error status.
+* **No `NOTIFY_DELETE` / `NOTIFY_RENAME`**: the file watcher sees deletes and renames as it does for a mirror.
 * **Pinning**: Explorer's "Always keep on this device" / "Free up space" only set attributes. The frontend
-  watches attribute changes (and walks the tree once at start) and hydrates / dehydrates accordingly.
-* **Read-only members**: placeholders carry the read-only attribute; edits that happen anyway are handled by
-  the engine's existing revert-and-keep-a-copy rule.
+  watches attribute changes (and walks the tree once at start) and hydrates / dehydrates accordingly. The
+  app's folder browser does the same per file and folder.
+* **Read-only members**: placeholders carry the read-only attribute; edits that happen anyway are reverted
+  and kept as a copy by the engine's existing rule.
 
-## Questions to answer on a Windows machine
+## The questions of the first version, answered
 
-Run the spike first (`cargo run -p medialake-cloudapi --example spike -- C:\Users\you\MediaLakeSpike`), then
-the app. Each item says what the code assumes.
+1. **An unpackaged process and `CfRegisterSyncRoot` alone:** registers and connects. Placeholders show the
+   reparse attribute to our own process (no compatibility-mode call needed). There is no navigation-pane
+   entry and no "Status" column; those need `StorageProviderSyncRootManager`. *By hand:* the overlay icons.
+2. **Hydration policy:** measured with a second process reading 1000 bytes at 5 MB of a 48 MiB file.
+   `PARTIAL`, `PROGRESSIVE` and `FULL` all produced one request for the whole file, and the file was then
+   marked as fully here. `PARTIAL` therefore buys nothing on this build; `FULL` is what the code uses.
+   Reading a large file means fetching all of it first. *By hand:* a media player seeking in a large video.
+3. **Transfer alignment:** an unaligned final piece is accepted (files of 11, 10 001 and 3 MiB + 17 bytes).
+   Requests arrive for the whole file, so an unaligned start did not occur.
+4. **Failing a request:** a read fails within milliseconds, with `ERROR_CLOUD_FILE_NETWORK_UNAVAILABLE` (388)
+   for an unreachable host and `ERROR_CLOUD_FILE_UNSUCCESSFUL` (389) otherwise; the next read works. With the
+   provider disconnected, a placeholder fails at once with "the cloud file provider is not running".
+5. **Callback threading:** the blocking transport runs inside the callback and serves single opens over TLS.
+   *Not measured:* many large files opened at once.
+6. **`std::fs` and reparse points:** `read_dir`, `symlink_metadata` and `metadata` list every placeholder and
+   fetch nothing; `is_symlink()` is false for them.
+7. **Attribute changes reach the watcher:** `attrib +P -U` on a placeholder is noticed and the file fetched;
+   `-P +U` frees it again.
+8. **Files in use:** a conversion that fails is retried on the next scan. *By hand:* a document open in Word
+   while it is pushed.
+9. **Convert after push:** a file created in the root becomes an in-sync placeholder, can be freed, and comes
+   back with the right content.
+10. **Replacing a placeholder:** `CfUpdatePlaceholder` with `DEHYDRATE` replaces a hydrated clean file with a
+    placeholder of the new size; a pinned file is downloaded and renamed over instead.
+11. **In-sync tracking:** an edit clears the mark and a push sets it again. A **rename** and a new timestamp
+    clear it too (see bug 6); pinning does not.
+12. **Leaving:** hydrated files become ordinary files, placeholders without content go, the folder is an
+    ordinary folder again. `CfUnregisterSyncRoot` alone already removes dehydrated placeholders and keeps
+    hydrated files.
+13. **Who fetches:** nothing read the test roots by itself (no fetch within seconds of creating
+    placeholders, Defender active). *By hand:* Windows Search over a real root, third-party antivirus and
+    backup tools, and MediaLake's own index run with a model.
+14. **Volumes:** UNC and relative paths are refused; a non-NTFS volume was not at hand. Paths longer than
+    260 characters work (the root is a `\\?\` path internally).
+15. **Uninstall:** `MediaLake.exe --unregister-sync-roots` leaves hydrated files as plain files and removes
+    placeholders and the registration. *Not run:* the Inno Setup uninstaller around it.
 
-1. **Does an unpackaged process get a usable sync root from `CfRegisterSyncRoot` alone?** The code assumes it
-   registers and connects. It does *not* create the navigation-pane entry or the "Status" column
-   (those come from `StorageProviderSyncRootManager.Register`, which may need package identity). Look for the
-   cloud / check overlay icons on files. If the pane entry is wanted and WinRT registration works unpackaged,
-   add it next to `register`.
-2. **Hydration policy.** `win.rs::HYDRATION` is `PARTIAL`. Open a large file's thumbnail in Explorer and
-   watch the spike log: do the requests stay small? Try `PROGRESSIVE` (streaming reads) and `FULL` (the
-   plan's choice) and compare. Does a media player seek correctly?
-3. **Transfer alignment.** The code sends 4 KiB-aligned offsets and lengths, except for the piece that ends
-   at the end of the file. Confirm that unaligned final pieces are accepted and that a request that starts
-   unaligned (Office does this) is answered correctly. The failing case would show as
-   `CfExecute` errors in the log.
-4. **Failing a request.** `abort()` ends a FETCH_DATA with `STATUS_CLOUD_FILE_NETWORK_UNAVAILABLE` /
-   `…_UNSUCCESSFUL` and a null buffer. Disconnect the network (or stop the host) and open a placeholder:
-   Explorer must show an error at once, and the next open after the host is back must work.
-5. **Callback threading.** The fetch runs the engine's *blocking* transport inside the system's callback.
-   Open several large files at once and watch for stalls: if Explorer hangs, move the work to a thread pool
-   and keep the callback short (the platform waits for TRANSFER_DATA by `RequestKey`).
-6. **`std::fs` and reparse points.** The scan uses `read_dir` / `symlink_metadata`, which must not open file
-   data, and `FileType::is_symlink()` must be false for cloud placeholders (the mirror's walk skips
-   symlinks). Scan a root with 1 000 placeholders and check that nothing is hydrated (the spike log stays
-   silent) and that every file is listed.
-7. **Attribute changes reach the watcher.** Pin and free up a file in Explorer. The frontend relies on the
-   `notify` crate reporting attribute changes; if it does not, pins are only noticed at the next start
-   (`reconcile_pins`). A periodic walk is the fallback.
-8. **`CfOpenFileWithOplock` on files that are in use**, and on directories. Edit a file in Word and let the
-   sync push it: `mark_synced` may hit a sharing violation; the frontend retries on the next scan. Confirm
-   that it succeeds eventually and that the file ends up shown as synced.
-9. **Convert after push.** A file created in the root becomes a placeholder with `CfConvertToPlaceholder`
-   (`MARK_IN_SYNC`). Check that "Free up space" then works on it and that the file is re-fetched correctly.
-10. **Replacing a placeholder.** `place_placeholder` for a changed file uses `CfUpdatePlaceholder` with
-    `DEHYDRATE`; a plain file in the way is deleted and the placeholder created. Check both, and
-    `place_file` (rename over a placeholder) for pinned files.
-11. **In-sync tracking.** `InSync = TRACK_ALL`. Edit a hydrated file and check that its state flips to "not in
-    sync" (the engine uses it to decide whether to hash) and back after the push.
-12. **Leaving.** `leave_root` reverts hydrated files (`CfRevertPlaceholder`), deletes the placeholders without
-    content and unregisters the root. Check that nothing is left that Explorer shows as a broken cloud file,
-    and that unregistering a root whose placeholders were not reverted behaves as expected.
-13. **Windows Search, antivirus, backup tools.** Do they hydrate the root? (They are the usual cause of "the
-    whole sync downloaded".) The indexer of MediaLake itself must not: with a model, run an index over a
-    root of placeholders and confirm that the status stays `deferred` and nothing is fetched.
-14. **Volumes.** Roots on a non-NTFS or network drive are refused (`available`). Confirm the message and the
-    fallback to a mirror. Long paths (`\\?\`) are not handled yet in the mirror either.
-15. **Uninstall.** Run the uninstaller with a synced root: `MediaLake.exe --unregister-sync-roots` must run
-    after the app is killed, leave the hydrated files in place and remove the registration.
+## Still to check by hand
 
-## WinUI notes (first compile)
-
-Expect compile errors in the files under `ui/MediaLake.App` that are new or changed since the last build
-(`WelcomeWindow`, `SyncPage`, `App.xaml.cs`, `Native/Shell.cs`, `SettingsWindow`, `MainWindow`):
-`SyncPage` builds its content in code from the core's JSON, using `Application.Current.Resources` brushes
-and styles by name (`CardBackgroundFillColorDefaultBrush`, `SystemFillColorCautionBrush`, …); a missing key
-only means a plainer look. The tray balloon is `NIF_INFO` on the existing notification icon, so it needs no
-registration; a click raises `BalloonClicked` and opens Settings > Sync.
+Explorer's overlay icons and the "Always keep on this device" / "Free up space" menu entries on a real root;
+thumbnails and previews (each is a full download of the file); an Office application and a media player on a
+synced folder; Windows Search; Storage Sense freeing space; a second user account; Windows 10 1809.
+The WinUI windows were rendered by the test hooks, not clicked through.

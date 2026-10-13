@@ -658,6 +658,8 @@ impl Engine {
         let mut mkdirs: Vec<Change> = vec![];
         let mut puts: Vec<Change> = vec![];
         let mut deletes: Vec<(Base, Change)> = vec![];
+        // sizes of new files that could not be read (locked by a program, or content that is not here)
+        let mut unread_new: HashSet<u64> = HashSet::new();
 
         for it in &items {
             let p = it.path.as_str();
@@ -681,7 +683,13 @@ impl Engine {
                     }
                     let hash = match self.file_hash(p, it.size, it.mtime) {
                         Ok(h) => h,
-                        Err(_) => continue, // vanished while scanning
+                        Err(_) => {
+                            // vanished while scanning, or it cannot be read right now
+                            if b.is_none() && self.fe.meta_path(p).exists() {
+                                unread_new.insert(it.size);
+                            }
+                            continue;
+                        }
                     };
                     if self.rejected.contains(&(p.to_string(), hash.clone())) {
                         continue;
@@ -704,6 +712,12 @@ impl Engine {
         }
         for b in bases.iter().rev() {
             if present.contains_key(b.path.as_str()) || self.db.conflict(&b.path).is_some() {
+                continue;
+            }
+            // A missing file and an unreadable new one of the same size may be one file that was renamed.
+            // Its delete waits until the new one can be read: where the content is not on this device,
+            // the host's copy is the only one.
+            if b.kind == EntryKind::File && unread_new.contains(&b.size) {
                 continue;
             }
             deletes.push((b.clone(), Change::Delete { path: b.path.clone(), base_rev: b.rev }));

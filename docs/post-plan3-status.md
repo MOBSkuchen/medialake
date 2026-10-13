@@ -1,11 +1,12 @@
 # File sync: implementation status
 
-Implements `post-plan3.md`: the engine and host (**S0–S5**), the backend half of **X2**, and the macOS
-side (**A0–A2**, with the macOS half of **X1**), and a **base version of the Windows side** (**W0–W2**,
-the Windows half of **X1** and **X2**): Cloud Files frontend, WinUI Sync page, tray, uninstall. The Windows
-side has never run: `w0-cloud-files.md` is its checklist.
-Everything below runs and is tested on a Mac, with no model loaded. Wire format: `sync-protocol.md`; the
-mount decision and measurements: `a0-macos-mount.md`.
+Implements `post-plan3.md`: the engine and host (**S0–S5**), the backend half of **X2**, the macOS side
+(**A0–A2**, with the macOS half of **X1**), and the Windows side (**W0–W2**, the Windows half of **X1** and
+**X2**): Cloud Files frontend, WinUI Sync page, tray, uninstall.
+The engine, the host and the macOS side run and are tested on a Mac; the engine, the host, the CLIs and the
+Windows side run and are tested on Windows 11. No model was loaded on either. What the first run on Windows
+found and what is still unchecked there: `w0-cloud-files.md`. Wire format: `sync-protocol.md`; the mount
+decision and measurements: `a0-macos-mount.md`.
 
 | Phase | State | Where |
 |---|---|---|
@@ -19,10 +20,10 @@ mount decision and measurements: `a0-macos-mount.md`.
 | A0 spike: macOS mount | Done: built-in NFSv3 loopback chosen; macFUSE / FUSE-T not installed here, so not measured | `a0-macos-mount.md`, `crates/medialake-mount/spike/` |
 | A1 mount frontend | Done: browse offline, load on open (block-wise), upload on save, evict under the limit, pin, crash cleanup, fallback to a mirror. Finder / Office checks by hand are not done (see below) | `crates/medialake-mount/`, `medialake-core/src/sync.rs` |
 | A2 macOS UI + installer | Done: Sync page, status item, notifications, two-page welcome window (search with optional shortcut, then sync), uninstall. Verified by building and by driving the real app binary; not clicked through by a person. A pkg was built, not notarised | `ui/MediaLake.Mac/Sources/MediaLake/Sync*.swift`, `installer/macos/` |
-| W0 spike: Cloud Files | Base version: spike program written (`examples/spike.rs`), cfapi layer type-checks for `windows-msvc`; **not run on Windows** | `crates/medialake-cloudapi/`, `w0-cloud-files.md` |
-| W1 Cloud Files frontend | Base version: placeholders from the host's listing, FETCH_DATA from the transport, pin / free up, in-sync marking, leave; engine contract tested over a stand-in platform. **Not run on Windows** | `crates/medialake-cloud/` |
-| W2 WinUI Sync page, tray, toasts, uninstall | Base version, **never compiled** (no .NET SDK on the dev Mac) | `ui/MediaLake.App/SyncPage.xaml(.cs)`, `Native/Shell.cs`, `App.xaml.cs`, `installer/medialake.iss` |
-| X1 search integration (Windows) | Recall-attribute check in the indexer for every folder (OneDrive too) and `available` on search hits (no thumbnail that downloads); unrun on Windows | `indexer.rs` (`os_would_download`), `search.rs` |
+| W0 spike: Cloud Files | Done: the spike and the cfapi layer run on Windows 11 (unpackaged process); six bugs that only a real run could show are fixed | `crates/medialake-cloudapi/`, `w0-cloud-files.md` |
+| W1 Cloud Files frontend | Done: placeholders from the host's listing, FETCH_DATA from the transport, pin / free up (Explorer and the app), in-sync marking, renames, read-only members, long paths, leave; tested on the real platform with the real engine and host. Explorer checks by hand are not done (see below) | `crates/medialake-cloud/` |
+| W2 WinUI Sync page, tray, balloons, uninstall | Done: builds without warnings; the real app was driven against a scratch data folder and its windows rendered. Not clicked through by a person; the installer was not rebuilt | `ui/MediaLake.App/Sync*.cs`, `Native/Shell.cs`, `App.xaml.cs`, `installer/medialake.iss` |
+| X1 search integration (Windows) | Done in code: recall-attribute check in the indexer for every folder (OneDrive too) and `available` on search hits (no thumbnail that downloads). The attributes are verified on real placeholders; an index run with a model was not done | `indexer.rs` (`os_would_download`), `search.rs` |
 | X1 search integration (macOS) | Done in code: indexing never downloads, name-only entries are upgraded once fetched. Needs a model to exercise end to end, which was not run | `indexer.rs` (`ContentGate`), `watcher.rs`, `sync.rs` (`would_download`) |
 
 ## Try it
@@ -92,10 +93,10 @@ runs inside the app when `[[sync.hosted]]` has entries.
 7. **Conflict names use UTC** (`name (conflict, <device>, 2026-10-11 14-03).ext`).
 8. **Bandwidth limits are in kilobits per second** and enforced client-side (one limiter per host for
    uploads, one for downloads). The host does not throttle.
-9. **`frontend = "auto"`** means the mount on macOS and the mirror elsewhere, decided once per sync and
-   then remembered (`<state dir>/frontend`): a sync never changes where its files are by itself. Syncs that
-   predate mounts stay mirrors. A mount that cannot start (folder not empty, mount refused) runs as a mirror
-   with a notice. `sync_pin` / `sync_unpin` error for mirrors.
+9. **`frontend = "auto"`** means the mount on macOS, Cloud Files on Windows and the mirror elsewhere,
+   decided once per sync and then remembered (`<state dir>/frontend`): a sync never changes where its files
+   are by itself. Syncs that predate on-demand folders stay mirrors. One that cannot start (folder not empty,
+   mount refused, not NTFS) runs as a mirror with a notice. `sync_pin` / `sync_unpin` error for mirrors.
 10. **Search integration (X1)**: joined folders with `index_for_search` are indexed through the mount point.
     The watcher watches the cache tree behind it (FSEvents is silent inside NFS), and the indexer asks the sync
     manager before reading: a file that would first be downloaded is indexed by name only (`status =
@@ -106,16 +107,22 @@ runs inside the app when `[[sync.hosted]]` has entries.
     "keep on this Mac" / "free up space" live in the app's folder browser, as planned.
 13. The CLI keeps host secrets in `hosts.json` (mode 0600); the app uses the Keychain / DPAPI like the
     embedding credentials.
+14. **Windows hydrates whole files** (the plan's choice; `PARTIAL` and `PROGRESSIVE` were measured and asked for
+    the whole file just the same), where the macOS mount fetches block by block. There is no cache limit on
+    Windows: Explorer's "Free up space" and Storage Sense do that job.
+15. **A file's delete waits while a new file of the same size cannot be read** (it may be the same file,
+    renamed, and where content is not on the device the host's copy is the only one).
 
 ## Still open
 
-- **Windows**: everything W0–W2 has to be built and run on a Windows machine: the cfapi layer and the
-  frontend have never executed, the WinUI files (welcome window, search hint, optional shortcut, Sync
-  page, tray, uninstall step, installer without a shortcut page) have never been compiled. Start with
-  `w0-cloud-files.md`. Known gaps: no navigation-pane entry / "Status" column (that needs
-  `StorageProviderSyncRootManager`), no `NOTIFY_DELETE` / `NOTIFY_RENAME` callbacks, no browse dialog (pin
-  and free up are done in Explorer), the mirror uses plain `std::fs` and adds no `\\?\` long paths.
-  Linux should work as is for the mirror.
+- **By-hand checks on Windows** (W1's acceptance list): Explorer's overlay icons and menu entries on a real
+  root, thumbnails and previews, an Office application and a media player on a synced folder, Windows Search,
+  Storage Sense, Windows 10 1809; the WinUI windows clicked through; the installer rebuilt and its uninstaller
+  run. The list with what is already answered: `w0-cloud-files.md`. Known gaps: no navigation-pane entry /
+  "Status" column (that needs `StorageProviderSyncRootManager`), no `NOTIFY_DELETE` / `NOTIFY_RENAME`
+  callbacks, no badge on the tray icon (its tooltip and menu carry the state), no "kept on this PC" size per
+  folder, and a placeholder that was only touched or renamed keeps Explorer's "pending" mark until its next
+  push. Linux should work as is for the mirror.
 - **By-hand checks on a Mac** (A1's acceptance list): Finder copy in and out, Quick Look and column-view
   previews (does browsing read more than the first block?), TextEdit / Pages / Preview / an Office app saving
   on the volume, Spotlight staying out, macOS 14 and 15, Intel. The Cocoa save patterns that can be scripted
@@ -132,8 +139,9 @@ runs inside the app when `[[sync.hosted]]` has entries.
 `cargo test -p medialake-proto -p medialake-sync` (needs no model, no cmake) and
 `cargo test -p medialake-core --test sync`:
 
-- `tests/basic.rs` (30): host scan, moves, both policies and every case of §5, read-only, guards, rebuilt
-  host database, purged tombstones, resume, backups, snapshots, restore (+ prune), path rules.
+- `tests/basic.rs` (31): host scan, moves, both policies and every case of §5, read-only, guards, rebuilt
+  host database, purged tombstones, resume, backups, snapshots, restore (+ prune), path rules, a rename whose
+  new name cannot be read yet.
 - `tests/convergence.rs`: one host, three members, random concurrent edits (writes, deletes, moves,
   copies, direct host edits); all trees equal and every content that reached a sync point is current or in
   history. `CONV_SEEDS=150` runs green for both policies.
@@ -143,16 +151,23 @@ runs inside the app when `[[sync.hosted]]` has entries.
 - `medialake-core/tests/sync.rs`: two cores (one hosting from the app, one joining with an invite code),
   search toggling at runtime, sync enabling at runtime, error-state mapping, config compatibility; on macOS a
   mounted sync (placeholders, load on open, pin, write-through, leave keeping the downloaded files) and the
-  fallback to a mirror.
+  fallback to a mirror; on Windows the same with a Cloud Files folder, plus the uninstall step.
 - `medialake-cloud/tests/frontend.rs` (any host): the frontend with the real engine and host over a
   stand-in for Cloud Files: placeholders without fetching, a lost state database not downloading anything,
   edits and new files pushed and converted, remote changes freeing clean placeholders, pins, renames and
   deletes, leaving (with and without keeping), refusing a non-empty folder, uninstall without a connection.
   `medialake-cloudapi`: identity blob, transfer planner, callback paths, recall attributes.
-  Windows layer: `cargo check -p medialake-cloudapi --target x86_64-pc-windows-msvc --all-targets`.
+- `medialake-cloud/tests/windows.rs` and `medialake-cloudapi/tests/win.rs` (Windows, real sync roots in the
+  temp folder): the same scenarios with Windows deciding what a placeholder is and when it is fetched, and
+  what only Windows can show: a second program reading through the provider, a failing host, attribute
+  pins from Explorer, a file that changed size, renames of placeholders, read-only placeholders, paths
+  beyond 260 characters, a session that stops and comes back.
+  From a Mac: `cargo check -p medialake-cloudapi --target x86_64-pc-windows-msvc --all-targets`.
 - `medialake-mount/tests/mount.rs` (macOS, really mounts): browsing fetches nothing, a read fetches a block,
   writes / rename-over / delete / junk files, host changes replace cached content, eviction and pins,
   read-only, conflicts keep both, offline, parallel readers, `touch` does not download, a Cocoa process's
   save patterns, stale-mount cleanup and the process registry.
 
-Only macOS (arm64) was exercised.
+Exercised on macOS (arm64) and on Windows 11 (x64); the macOS-only and Windows-only suites each on their own
+system. The changes made while bringing up Windows (the engine's rename guard, the Windows UI) were not
+rebuilt on a Mac.

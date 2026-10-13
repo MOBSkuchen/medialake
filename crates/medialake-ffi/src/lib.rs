@@ -160,6 +160,31 @@ pub unsafe extern "C" fn sn_call(h: *mut Handle, method: *const c_char, args_jso
     to_c(out.to_string())
 }
 
+/// The uninstaller's step (Windows): every Cloud Files folder of the configuration in `config_dir` (empty =
+/// the default data folder) goes back to being a plain folder. Starts nothing: no core, no model server, no
+/// sync, no network. Returns `{"ok":{"unregistered":n,"errors":[{"path","error"}]}}` or `{"error":"..."}`.
+///
+/// # Safety
+/// `config_dir` must be null or a valid NUL-terminated UTF-8 string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sn_unregister_sync_roots(config_dir: *const c_char) -> *mut c_char {
+    let dir = unsafe { from_c(config_dir) };
+    let out = catch_unwind(AssertUnwindSafe(|| {
+        let root = if dir.is_empty() { Paths::default_root() } else { PathBuf::from(dir) };
+        let paths = Paths::new(root);
+        match medialake_core::config::Config::load(&paths.config_file) {
+            Ok(cfg) => {
+                let (n, errors) = medialake_core::sync::unregister_cloud_roots(&cfg, &paths.root);
+                let errors: Vec<_> = errors.into_iter().map(|(p, e)| serde_json::json!({ "path": p, "error": e })).collect();
+                serde_json::json!({ "ok": { "unregistered": n, "errors": errors } })
+            }
+            Err(e) => serde_json::json!({ "error": format!("{e:#}") }),
+        }
+    }))
+    .unwrap_or_else(|_| serde_json::json!({ "error": "internal panic" }));
+    to_c(out.to_string())
+}
+
 /// # Safety
 /// `p` must come from this library (or be null).
 #[unsafe(no_mangle)]

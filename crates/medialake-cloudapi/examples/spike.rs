@@ -29,7 +29,8 @@ fn main() {
     impl Provider for Slow {
         fn fetch(&self, req: &FetchRequest, out: &dyn Transfer) -> CloudResult<()> {
             let started = Instant::now();
-            println!("FETCH {} required {}+{} of {} (identity {:?})", req.rel, req.offset, req.length, req.file_size, req.identity.as_ref().map(|i| i.rev));
+            let who = req.process.rsplit('\\').next().unwrap_or("?");
+            println!("FETCH {} required {}+{} of {} (identity {:?}) for {who}", req.rel, req.offset, req.length, req.file_size, req.identity.as_ref().map(|i| i.rev));
             let pieces = plan_chunks(req.offset, req.length, req.file_size, MAX_CHUNK);
             let total: u64 = pieces.iter().map(|(_, l)| l).sum();
             let mut done = 0u64;

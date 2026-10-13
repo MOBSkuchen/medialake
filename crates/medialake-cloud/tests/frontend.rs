@@ -86,7 +86,7 @@ impl Fake {
         }
         let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
         let mtime = mtime_ms(&std::fs::metadata(path).unwrap());
-        let req = FetchRequest { rel: self.rel(path), identity: e.identity.clone(), file_size: size, offset: 0, length: size };
+        let req = FetchRequest { rel: self.rel(path), identity: e.identity.clone(), file_size: size, offset: 0, length: size, process: String::new() };
         let out = FileOut { file: Mutex::new(std::fs::OpenOptions::new().write(true).open(path).unwrap()), fetched: self.fetched.clone() };
         let provider = self.provider.lock().unwrap().clone().expect("connected");
         self.fetches.fetch_add(1, Ordering::SeqCst);

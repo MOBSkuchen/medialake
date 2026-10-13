@@ -27,6 +27,12 @@
                 <StackPanel Padding="32,24" Spacing="20" MaxWidth="720" HorizontalAlignment="Left">
                     <TextBlock Text="General" Style="{StaticResource TitleTextBlockStyle}" />
 
+                    <StackPanel Spacing="4">
+                        <ToggleSwitch x:Name="SearchSwitch" Header="Search my files by content" Toggled="Search_Toggled" />
+                        <TextBlock Opacity="0.7" TextWrapping="Wrap"
+                                   Text="Turn this off to use MediaLake only for syncing: no search model is loaded and nothing is indexed." />
+                    </StackPanel>
+
                     <StackPanel Spacing="6">
                         <TextBlock Text="Global shortcut (optional)" FontWeight="SemiBold" />
                         <TextBlock Text="Press this shortcut anywhere to open the search window. Without one, use the icon in the notification area." Opacity="0.7" />
