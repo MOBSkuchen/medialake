@@ -23,9 +23,17 @@ public sealed partial class SyncPage : UserControl
     private long _up, _down;
     private long _rememberedUp = 8000, _rememberedDown = 8000;
     private string _deviceName = "";
+    /// What this device is called while no name is chosen (the name field's placeholder).
+    private string _systemName = "";
+    /// What is typed into the name field and not saved yet. The page is drawn again whenever the core
+    /// reports something; that must not wipe a half-typed name.
+    private string? _nameDraft;
 
     /// The window this page sits in (the folder picker needs it).
     public nint OwnerHwnd { get; set; }
+
+    /// Everything on the page, also what is scrolled out of view (the test hook renders it).
+    internal FrameworkElement Everything => Host;
 
     public SyncPage()
     {
@@ -60,6 +68,7 @@ public sealed partial class SyncPage : UserControl
         {
             var st = await core.CallAsync("sync_status");
             var enabled = st.TryGetProperty("enabled", out var en) && en.GetBoolean();
+            _systemName = Str(st, "system_name");
             JsonElement conflicts = default, clients = default;
             if (enabled)
             {
@@ -177,6 +186,19 @@ public sealed partial class SyncPage : UserControl
         return p;
     }
 
+    /// <summary>One line with something at each end: a name on the left, what is done with it on the right.</summary>
+    private static Grid Ends(FrameworkElement left, FrameworkElement right)
+    {
+        var g = new Grid { ColumnSpacing = 12 };
+        g.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        g.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        left.VerticalAlignment = right.VerticalAlignment = VerticalAlignment.Center;
+        Grid.SetColumn(right, 1);
+        g.Children.Add(left);
+        g.Children.Add(right);
+        return g;
+    }
+
     private static Task<JsonElement> Call(string method, object? args = null) => App.Core!.CallAsync(method, args);
 
     private void Draw(JsonElement st, bool enabled, JsonElement conflicts, JsonElement clients)
@@ -243,14 +265,14 @@ public sealed partial class SyncPage : UserControl
         {
             var id = Str(hsync, "id");
             var inner = new StackPanel { Spacing = 4 };
-            inner.Children.Add(Text(Str(hsync, "name"), semibold: true));
+            inner.Children.Add(Ends(
+                Text(Str(hsync, "name"), semibold: true),
+                Row(Btn("Snapshot now", () => Call("sync_host_snapshot", new { sync = id })),
+                    Btn("Stop sharing", () => Call("sync_host_remove", new { sync = id })))));
             inner.Children.Add(Text(Str(hsync, "root"), opacity: 0.7, size: 12));
             inner.Children.Add(Text($"{Num(hsync, "files"):N0} files · {Bytes(Num(hsync, "bytes"))} · backups: {Str(hsync, "backup")}", opacity: 0.7, size: 12));
             if (hsync.TryGetProperty("issues", out var iss) && iss.ValueKind == JsonValueKind.Array)
                 foreach (var i in iss.EnumerateArray()) inner.Children.Add(Text(i.GetString() ?? "", caution: true, size: 12));
-            inner.Children.Add(Row(
-                Btn("Snapshot now", () => Call("sync_host_snapshot", new { sync = id })),
-                Btn("Stop sharing", () => Call("sync_host_remove", new { sync = id }))));
             Host.Children.Add(Card(inner));
         }
         var shareRow = Row(Btn("Share a folder…", () => SyncDialogs.ShareAsync(XamlRoot, OwnerHwnd)));
@@ -271,15 +293,14 @@ public sealed partial class SyncPage : UserControl
                 var title = Row(Text(Str(c, "name"), semibold: true));
                 // this device may also use this PC's search model (a pairing code that granted both)
                 if (Flag(c, "embed")) title.Children.Add(Text("search", opacity: 0.6, size: 12));
-                title.Children.Add(Btn("Remove device", () => Call("sync_revoke", new { client = cid })));
-                inner.Children.Add(title);
+                inner.Children.Add(Ends(title, Btn("Remove device", () => Call("sync_revoke", new { client = cid }))));
                 var access = new Dictionary<string, string>();
                 if (c.TryGetProperty("syncs", out var cs2) && cs2.ValueKind == JsonValueKind.Object)
                     foreach (var p in cs2.EnumerateObject()) access[p.Name] = p.Value.GetString() ?? "";
                 foreach (var hsync in hosted)
                 {
                     var name = Str(hsync, "name");
-                    var combo = new ComboBox { MinWidth = 160 };
+                    var combo = new ComboBox { Width = 180 };
                     foreach (var (label, tag) in new[] { ("No access", "none"), ("Read only", "ro"), ("Read and write", "rw") })
                         combo.Items.Add(new ComboBoxItem { Content = label, Tag = tag });
                     var current = access.TryGetValue(name, out var a) ? a : "none";
@@ -291,7 +312,7 @@ public sealed partial class SyncPage : UserControl
                         catch (Exception ex) { _message = ex.Message; }
                         await RefreshAsync();
                     };
-                    inner.Children.Add(Row(new TextBlock { Text = name, MinWidth = 140, VerticalAlignment = VerticalAlignment.Center, Opacity = 0.8 }, combo));
+                    inner.Children.Add(Ends(new TextBlock { Text = name, Opacity = 0.8, TextTrimming = TextTrimming.CharacterEllipsis }, combo));
                 }
                 Host.Children.Add(Card(inner));
             }
@@ -299,8 +320,18 @@ public sealed partial class SyncPage : UserControl
 
         // ---- this device ----
         Host.Children.Add(Text("This device", semibold: true));
-        var nameBox = new TextBox { Header = "Name shown to others", Text = _deviceName, Width = 320 };
+        // a fixed width needs an alignment: a stretched control with a width is centred
+        var nameBox = new TextBox
+        {
+            Header = "Name shown to others",
+            Text = _nameDraft ?? _deviceName,
+            PlaceholderText = _systemName,
+            Width = 320,
+            HorizontalAlignment = HorizontalAlignment.Left,
+        };
+        nameBox.TextChanged += (_, _) => _nameDraft = nameBox.Text == _deviceName ? null : nameBox.Text;
         Host.Children.Add(nameBox);
+        Host.Children.Add(Text("Other computers list this device under this name, and it is part of the names of conflict copies. Empty means this computer's own name.", opacity: 0.7, size: 12));
         var (upSwitch, upBox) = LimitControls("Limit upload speed", _up, _rememberedUp);
         var (downSwitch, downBox) = LimitControls("Limit download speed", _down, _rememberedDown);
         Host.Children.Add(Row(upSwitch, upBox));
@@ -309,10 +340,11 @@ public sealed partial class SyncPage : UserControl
         {
             var s = JsonNode.Parse((await Call("get_settings")).GetRawText())!.AsObject();
             var sync = s["sync"]!.AsObject();
-            sync["device_name"] = nameBox.Text;
+            sync["device_name"] = nameBox.Text.Trim();
             sync["upload_limit_kbps"] = upSwitch.IsOn ? (long)Math.Max(upBox.Value, 1) : 0;
             sync["download_limit_kbps"] = downSwitch.IsOn ? (long)Math.Max(downBox.Value, 1) : 0;
             await Call("set_settings", JsonSerializer.Deserialize<JsonElement>(s.ToJsonString()));
+            _nameDraft = null;
         }));
     }
 
@@ -349,6 +381,8 @@ public sealed partial class SyncPage : UserControl
         var last = Num(s, "last_sync") is > 0 and var t ? $"last synced {Ago(DateTimeOffset.FromUnixTimeSeconds(t))}" : "";
         if (host.Length > 0 || last.Length > 0)
             inner.Children.Add(Text(host.Length == 0 ? last : last.Length == 0 ? $"From {host}" : $"From {host} · {last}", opacity: 0.6, size: 12));
+        if (Str(s, "access") != "rw")
+            inner.Children.Add(Text("This device may only read this folder: files open as usual, changing and deleting them is refused.", opacity: 0.6, size: 12));
         if (Str(s, "notice") is { Length: > 0 } notice) inner.Children.Add(Text(notice, caution: true, size: 12));
         if (Str(s, "state") == "held" && s.TryGetProperty("held_deletes", out var hd) && hd.ValueKind == JsonValueKind.Number)
             inner.Children.Add(Row(Text($"{hd.GetInt64()} files would be deleted on the other computer."), Btn("Allow", () => Call("sync_confirm_deletes", new { sync_id = id }))));

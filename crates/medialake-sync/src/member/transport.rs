@@ -191,6 +191,27 @@ pub async fn resolve(address: &str) -> Result<SocketAddr> {
 
 type Rpc = RpcClient<Action, StreamAction>;
 
+/// An RPC failure in words. The error type only has a debug form (`IoError { err: Os { code: … } }`), and
+/// these texts end up in front of people. The wording of the common cases is what the callers key on
+/// ("connection refused", "timed out", …).
+pub fn rpc_text(e: &bierpc::error::RpcError) -> String {
+    use bierpc::error::RpcError;
+    use std::io::ErrorKind as K;
+    match e {
+        RpcError::IoError { err } => match err.kind() {
+            K::ConnectionRefused => "connection refused".into(),
+            K::TimedOut => "timed out".into(),
+            K::ConnectionReset | K::ConnectionAborted => "connection reset".into(),
+            K::BrokenPipe => "broken pipe".into(),
+            K::UnexpectedEof => "the connection was closed".into(),
+            _ => err.to_string(),
+        },
+        RpcError::CallTypeRejected { reason } => format!("the request was refused ({reason})"),
+        RpcError::ConnectionPoisoned => "the connection broke".into(),
+        RpcError::TimedOut { phase, after } => format!("timed out after {} s ({phase})", after.as_secs()),
+    }
+}
+
 async fn connect(addr: SocketAddr, fp: [u8; 32], transfer: bool) -> Result<Rpc> {
     let cfg = ClientConfig {
         max_message_bytes: MAX_MESSAGE_BYTES,
@@ -202,7 +223,7 @@ async fn connect(addr: SocketAddr, fp: [u8; 32], transfer: bool) -> Result<Rpc> 
         write_timeout: if transfer { Some(Duration::from_secs(120)) } else { None },
         ..Default::default()
     };
-    Rpc::new_with_config(addr, cfg).await.map_err(|e| anyhow!("cannot connect to {addr}: {e:?}"))
+    Rpc::new_with_config(addr, cfg).await.map_err(|e| anyhow!("cannot connect to {addr}: {}", rpc_text(&e)))
 }
 
 /// What pairing found out.
@@ -226,7 +247,7 @@ pub async fn pair_ex(code_text: &str, device_name: &str) -> Result<Paired> {
     let r: Response = c
         .call(Action::Pair { token: hex(&code.token), client_name: device_name.to_string() })
         .await
-        .map_err(|e| anyhow!("pairing failed: {e:?}"))?;
+        .map_err(|e| anyhow!("pairing failed: {}", rpc_text(&e)))?;
     let client_id = match r {
         Response::Paired { client_id, .. } => client_id,
         Response::Rejected(m) => bail!("the host refused pairing: {m}"),
@@ -337,7 +358,7 @@ impl HostClient {
             Ok(other) => bail!("unexpected answer from the host: {other:?}"),
             Err(e) => {
                 *g = None;
-                bail!("{e:?}")
+                bail!("the connection to {} failed: {}", self.creds.address, rpc_text(&e))
             }
         }
     }
@@ -402,7 +423,7 @@ impl HostClient {
                     match r {
                         Ok(StreamResponse::Denied(m)) => bail!("access denied: {m}"),
                         Ok(_) => Ok(()),
-                        Err(e) => bail!("{e:?}"),
+                        Err(e) => bail!("{}", rpc_text(&e)),
                     }
                 }
                 .await;
@@ -503,7 +524,7 @@ impl Transport for RemoteTransport {
                         },
                     )
                     .await
-                    .map_err(|e| anyhow!("download failed: {e:?}"))?;
+                    .map_err(|e| anyhow!("download failed: {}", rpc_text(&e)))?;
                 file.flush().await?;
                 let reuse = resp == StreamResponse::Done;
                 let out = match (resp, status) {
@@ -553,7 +574,7 @@ impl Transport for RemoteTransport {
                         },
                     )
                     .await
-                    .map_err(|e| anyhow!("download failed: {e:?}"))?;
+                    .map_err(|e| anyhow!("download failed: {}", rpc_text(&e)))?;
                 let reuse = resp == StreamResponse::Done;
                 let r = match (resp, status) {
                     (StreamResponse::Done, DL_OK) => RangeFetch::Data(std::mem::take(&mut out)),
@@ -596,7 +617,7 @@ impl Transport for RemoteTransport {
                         },
                     )
                     .await
-                    .map_err(|e| anyhow!("upload failed: {e:?}"))?;
+                    .map_err(|e| anyhow!("upload failed: {}", rpc_text(&e)))?;
                 let reuse = matches!(resp, StreamResponse::Done | StreamResponse::HashMismatch);
                 let out = match resp {
                     StreamResponse::Done => Upload::Done,

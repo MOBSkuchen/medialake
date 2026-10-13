@@ -399,6 +399,8 @@ public partial class App : Application
                 // MEDIALAKE_TEST_SYNC_DIALOGS=<folder>: the Sync page's dialogs, for the first synced folder
                 if (Environment.GetEnvironmentVariable("MEDIALAKE_TEST_SYNC_DIALOGS") is { } shots)
                 {
+                    // the whole Sync page, including what the window's height cuts off
+                    await SaveScreenshotAsync(_settings.SyncContent, Path.Combine(shots, "sync-page.png"));
                     var root = _settings.RootElement.XamlRoot;
                     var hwnd = WinRT.Interop.WindowNative.GetWindowHandle(_settings);
                     var st = await Core.CallAsync("sync_status");
@@ -447,7 +449,7 @@ public partial class App : Application
 
     private static async Task SaveScreenshotAsync(FrameworkElement el, string path)
     {
-        if (el is Microsoft.UI.Xaml.Controls.Grid g && Application.Current.Resources.TryGetValue("SolidBackgroundFillColorBaseBrush", out var bg)) g.Background = (Microsoft.UI.Xaml.Media.Brush)bg;
+        if (el is Microsoft.UI.Xaml.Controls.Panel g && Application.Current.Resources.TryGetValue("SolidBackgroundFillColorBaseBrush", out var bg)) g.Background = (Microsoft.UI.Xaml.Media.Brush)bg;
         else if (el is Microsoft.UI.Xaml.Controls.NavigationView nv && Application.Current.Resources.TryGetValue("SolidBackgroundFillColorBaseBrush", out var bg2)) nv.Background = (Microsoft.UI.Xaml.Media.Brush)bg2;
         await Task.Delay(300);
         var rtb = new RenderTargetBitmap();

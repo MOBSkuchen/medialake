@@ -91,6 +91,10 @@ pub struct Report {
     pub held_deletes: Option<usize>,
     /// Something was skipped for now (still being written, host stale): run again soon.
     pub retry: bool,
+    /// The host refused a change because this device may only read now. The engine goes on as a
+    /// read-only member; whoever runs it should ask the host what the access is and set the folder up
+    /// accordingly.
+    pub became_read_only: bool,
     pub errors: Vec<String>,
 }
 
@@ -879,8 +883,11 @@ impl Engine {
                 Ok(true)
             }
             ChangeResult::Denied => {
+                // not an error: the access was changed on the host. The next round puts back what was
+                // changed here (the changed files are kept as copies).
                 self.cfg.access = Access::ReadOnly;
-                rep.errors.push("the host no longer allows changes from this device".into());
+                rep.became_read_only = true;
+                rep.retry = true;
                 Ok(false)
             }
         }

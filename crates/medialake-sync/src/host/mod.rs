@@ -29,7 +29,8 @@ struct Live {
 /// All syncs a host serves, plus authentication and notification fan-out.
 pub struct SyncHost {
     state: Arc<StateDir>,
-    host_name: String,
+    /// What members see this host as (the app's "name shown to others"; it can change while running).
+    host_name: RwLock<String>,
     syncs: RwLock<HashMap<String, Live>>,
     cfg_mtime: Mutex<Option<SystemTime>>,
     notices: broadcast::Sender<Notice>,
@@ -46,13 +47,22 @@ impl SyncHost {
         let (notices, _) = broadcast::channel(256);
         let host = Arc::new(SyncHost {
             state,
-            host_name: host_name.to_string(),
+            host_name: RwLock::new(host_name.to_string()),
             syncs: RwLock::new(HashMap::new()),
             cfg_mtime: Mutex::new(None),
             notices,
         });
         host.reload(true);
         host
+    }
+
+    /// The name was changed in the settings: members learn it with their next hello.
+    pub fn set_name(&self, name: &str) {
+        *self.host_name.write().unwrap() = name.to_string();
+    }
+
+    pub fn name(&self) -> String {
+        self.host_name.read().unwrap().clone()
     }
 
     pub fn state(&self) -> &Arc<StateDir> {
@@ -167,6 +177,11 @@ impl SyncHost {
             return SyncResponse::Denied("authentication failed".into());
         };
         let author = sanitize_device(device, &rec.name);
+        // the device was renamed on its side: the list of devices here should say so too
+        if author != rec.name {
+            let (state, id, name) = (self.state.clone(), client_id.clone(), author.clone());
+            let _ = tokio::task::spawn_blocking(move || state.rename_client(&id, &name)).await;
+        }
         let grant = |sync: &str| -> Result<(Arc<HostedSync>, Access), SyncResponse> {
             match (rec.access(sync), self.sync(sync)) {
                 (Some(a), Some(s)) => Ok((s, a)),
@@ -195,7 +210,7 @@ impl SyncHost {
                 if version != SYNC_PROTO_VERSION {
                     SyncResponse::Error(format!("sync protocol version {version} not supported (host speaks {SYNC_PROTO_VERSION})"))
                 } else {
-                    SyncResponse::Host { host_id: self.state.host_id(), name: self.host_name.clone(), version: SYNC_PROTO_VERSION }
+                    SyncResponse::Host { host_id: self.state.host_id(), name: self.name(), version: SYNC_PROTO_VERSION }
                 }
             }
             SyncRequest::ListSyncs => {

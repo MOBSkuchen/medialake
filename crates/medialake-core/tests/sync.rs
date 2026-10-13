@@ -213,8 +213,56 @@ async fn sync_can_be_enabled_at_runtime_and_limits_apply() {
     core.shutdown().await;
 }
 
+/// What the user saw on a German Windows when a computer had stopped sharing: the debug form of a refused
+/// connection, with the hint at the very end.
+const SEEN: &str = r#"cannot connect to 192.168.178.70:47900: IoError { err: Os { code: 10061, kind: ConnectionRefused, message: "Es konnte keine Verbindung hergestellt werden, da der Zielcomputer die Verbindung verweigerte." } } (is this host a MediaLake host with sync enabled?)"#;
+
+#[test]
+fn errors_become_one_plain_sentence() {
+    use medialake_core::sync::{classify_error, user_message as u};
+    let unreachable = "NAS cannot be reached. It may be switched off, on another network, or no longer sharing folders.";
+    assert_eq!(u(SEEN, "NAS"), unreachable);
+    assert_eq!(classify_error(SEEN), "offline");
+    // what the transport writes now, with and without a name for the other side
+    assert_eq!(u("cannot connect to 10.0.0.2:47900: connection refused (is this host a MediaLake host with sync enabled?)", "NAS"), unreachable);
+    assert!(u("the connection to nas.local:47900 failed: timed out", "").starts_with("The other computer cannot be reached"));
+    assert_eq!(classify_error("the connection to nas.local:47900 failed: connection reset"), "offline");
+    // removed on the other side, a folder taken away, a reader trying to restore
+    assert_eq!(u("access denied: authentication failed", "NAS"), "NAS no longer accepts this device. Ask for a new invitation code there.");
+    assert_eq!(u("access denied: no access to sync 9f2c", "NAS"), "NAS no longer shares this folder with this device.");
+    assert!(u("access denied: read-only access", "NAS").starts_with("This folder is read only"));
+    // invitation codes
+    assert!(u("the host refused pairing: invalid or expired pairing token", "").contains("no longer valid"));
+    assert!(u("the pairing code has a typo (checksum mismatch); copy it again", "").contains("typo"));
+    assert!(u("this is not a MediaLake pairing code", "").contains("not an invitation code"));
+    // the remote search server (Settings > Model) speaks the same way, without the words about folders
+    use medialake_core::sync::server_message as s;
+    assert_eq!(s("cannot connect to 10.0.0.9:47900: connection refused"), "The server cannot be reached. It may be switched off or on another network.");
+    assert!(s("invalid or expired pairing token").contains("no longer valid"));
+    assert_eq!(s(r#"unexpected response Embeddings([])"#), "Something went wrong. The details are in the log.");
+    // sharing
+    assert_eq!(
+        u(r#"cannot listen on 0.0.0.0:47900: IoError { err: Os { code: 10048, kind: AddrInUse, message: "Normalerweise darf jede Socketadresse nur einmal verwendet werden." } }"#, ""),
+        "Sharing could not start: port 47900 is used by another program."
+    );
+    // a full disk is told by its number, whatever language the system speaks
+    let full = if cfg!(windows) { "a.bin: Es steht nicht genug Speicherplatz zur Verfügung. (os error 112)" } else { "a.bin: Kein Speicherplatz mehr (os error 28)" };
+    assert_eq!(classify_error(full), "disk_full");
+    assert_eq!(u(full, ""), "This computer's disk is full.");
+    // the inside of the program never reaches the user
+    assert_eq!(u(r#"unexpected answer to hello: Changes { epoch: "x", seq: 3 }"#, ""), "Something went wrong. The details are in the log.");
+    // what is written for people stays, without the part for developers
+    assert_eq!(u(r"C:\x\a.txt: Zugriff verweigert (os error 5)", ""), r"C:\x\a.txt: Zugriff verweigert");
+    assert_eq!(u("another sync already uses this folder", ""), "another sync already uses this folder");
+    // and a sentence that went through once is not changed by a second pass (the UI's last line of defence)
+    for raw in [SEEN, "access denied: authentication failed", "the host refused pairing: invalid or expired pairing token", full] {
+        let once = u(raw, "NAS");
+        assert_eq!(u(&once, ""), once, "{raw}");
+        assert!(once.len() < 130, "short enough to be read: {once}");
+    }
+}
+
 /// A hosts a folder; B pairs. Returns (A, B, shared dir, home of B's folders, the temp dir guard).
-#[cfg(any(target_os = "macos", windows))]
 async fn host_and_member(files: &[(&str, Vec<u8>)]) -> (std::sync::Arc<Core>, std::sync::Arc<Core>, std::path::PathBuf, std::path::PathBuf, tempfile::TempDir, String) {
     let tmp = tempfile::tempdir().unwrap();
     let base = tmp.path().canonicalize().unwrap();
@@ -310,7 +358,7 @@ async fn a_folder_that_cannot_be_mounted_becomes_a_mirror() {
     until("downloaded as a mirror", Duration::from_secs(30), || point.join("hello.txt").exists()).await;
     let st = &m.status()[0];
     assert_eq!(st.frontend, "mirror", "{st:?}");
-    assert!(st.notice.contains("not empty"), "notice={:?} full={st:?}", st.notice);
+    assert!(st.notice.contains("already had files"), "notice={:?} full={st:?}", st.notice);
     assert_eq!(std::fs::read_to_string(point.join("mine.txt")).unwrap(), "already here");
     assert_eq!(f.frontend, "auto");
     a.shutdown().await;
@@ -339,6 +387,120 @@ async fn a_cache_that_does_not_belong_to_the_engine_state_is_set_aside() {
     let st = &m.status()[0];
     assert!(st.notice.contains("set aside"), "{st:?}");
     assert_eq!(st.pending_conflicts, 0);
+    a.shutdown().await;
+    b.shutdown().await;
+}
+
+/// "Name shown to others" is the name everywhere: what a member calls its host, what a host lists its
+/// devices as, and both follow a rename. The computer's own name is not used once a name is chosen.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_chosen_name_is_the_name_everywhere() {
+    let (a, b, _shared, _base, _tmp, host_id) = host_and_member(&[("hello.txt", b"hello".to_vec())]).await;
+    let (ma, mb) = (a.sync().unwrap(), b.sync().unwrap());
+    assert_eq!(mb.hosts()[0].name, "Device A", "the host is known by its chosen name, not the computer's");
+    assert_eq!(ma.clients().await[0].name, "Device B");
+
+    // the member renames itself: the host's list of devices follows
+    let mut c = b.config();
+    c.sync.device_name = "Laptop".into();
+    b.set_config(c).await.unwrap();
+    let t = Instant::now();
+    while ma.clients().await[0].name != "Laptop" {
+        assert!(t.elapsed() < Duration::from_secs(20), "the host still lists {:?}", ma.clients().await[0].name);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    // the host renames itself: the member's list of computers follows
+    let mut c = a.config();
+    c.sync.device_name = "NAS".into();
+    a.set_config(c).await.unwrap();
+    let hosts = mb.check_hosts().await; // what the member does by itself every half minute
+    assert_eq!((hosts[0].name.as_str(), hosts[0].state.as_str()), ("NAS", "ok"));
+    assert_eq!(b.config().sync.hosts[0].name, "NAS", "and it is remembered");
+    assert_eq!(hosts[0].id, host_id);
+    a.shutdown().await;
+    b.shutdown().await;
+}
+
+/// "Remove device" on the host: the member must not go on offering that computer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_removed_device_no_longer_offers_the_computer() {
+    let (a, b, shared, base, _tmp, host_id) = host_and_member(&[("hello.txt", b"hello".to_vec())]).await;
+    let (ma, mb) = (a.sync().unwrap(), b.sync().unwrap());
+    assert_eq!(mb.available(&host_id).await.unwrap().len(), 1);
+
+    // nothing is joined from it: picking it says why it does not work, and it is gone from the list
+    ma.revoke_client("Device B").await.unwrap();
+    let e = mb.available(&host_id).await.unwrap_err();
+    assert_eq!(e, "Device A no longer accepts this device. Ask for a new invitation code there.");
+    assert!(mb.hosts().is_empty(), "{:?}", mb.hosts());
+    assert!(b.config().sync.hosts.is_empty());
+
+    // a new code brings it back
+    let code = ma.invite(&[("Docs".into(), "rw".into())]).await.unwrap();
+    let paired = b.sync_pair(&code).await.unwrap();
+    assert_eq!(paired.host_id, host_id);
+    let mirror = base.join("mirror");
+    b.sync_join(&host_id, "Docs", &mirror, "mirror", "server_wins").await.unwrap();
+    until("first sync", Duration::from_secs(30), || mirror.join("hello.txt").exists()).await;
+
+    // with a folder joined the computer stays (its folder says what happened) but is marked, so that the
+    // "add a folder" dialog leaves it out
+    let id = ma.clients().await[0].id.clone();
+    ma.revoke_client(&id).await.unwrap();
+    let hosts = mb.check_hosts().await;
+    assert_eq!((hosts.len(), hosts[0].state.as_str(), hosts[0].folders), (1, "revoked", 1), "{hosts:?}");
+    until("the folder says that access was withdrawn", Duration::from_secs(40), || mb.status()[0].state == "denied").await;
+    assert_eq!(mb.status()[0].detail, "Device A no longer accepts this device. Ask for a new invitation code there.");
+    assert!(mirror.join("hello.txt").exists(), "the downloaded files stay");
+
+    // "ask for a new invitation code": pairing again revives the folder, which runs with the new credentials
+    let code = ma.invite(&[("Docs".into(), "rw".into())]).await.unwrap();
+    b.sync_pair(&code).await.unwrap();
+    until("the folder syncs again", Duration::from_secs(40), || matches!(mb.status()[0].state.as_str(), "idle" | "syncing")).await;
+    assert_eq!(mb.hosts()[0].state, "", "no longer marked");
+    std::fs::write(mirror.join("after.txt"), "after pairing again").unwrap();
+    until("member -> host", Duration::from_secs(40), || shared.join("after.txt").exists()).await;
+    std::fs::write(shared.join("from-host.txt"), "x").unwrap();
+    until("host -> member", Duration::from_secs(40), || mirror.join("from-host.txt").exists()).await;
+
+    // leaving the folder lets the computer be forgotten
+    b.sync_leave("Docs", true).await.unwrap();
+    mb.forget_host(&host_id).await.unwrap();
+    assert!(mb.hosts().is_empty());
+    a.shutdown().await;
+    b.shutdown().await;
+}
+
+/// The host turns a device into a reader (and back): the member follows without being restarted, puts
+/// back what is changed on it meanwhile, and does not call it an error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_change_of_access_on_the_host_reaches_the_member() {
+    let (a, b, shared, base, _tmp, host_id) = host_and_member(&[("keep.txt", b"keep me".to_vec()), ("other.txt", b"x".to_vec())]).await;
+    let (ma, mb) = (a.sync().unwrap(), b.sync().unwrap());
+    let mirror = base.join("mirror");
+    b.sync_join(&host_id, "Docs", &mirror, "mirror", "server_wins").await.unwrap();
+    until("first sync", Duration::from_secs(30), || mirror.join("keep.txt").exists() && mirror.join("other.txt").exists()).await;
+    assert_eq!(mb.status()[0].access, "rw");
+
+    // read-only on the host; the member finds out when its next change is refused
+    ma.grant("Device B", "Docs", "ro").await.unwrap();
+    std::fs::write(mirror.join("attempt.txt"), "written by a reader").unwrap();
+    until("the member runs the folder as read-only", Duration::from_secs(40), || mb.status()[0].access == "ro").await;
+    assert_eq!(b.config().sync.folders[0].access, "ro");
+    assert!(!shared.join("attempt.txt").exists(), "a reader's file does not reach the host");
+    // a file deleted on the reader comes back, and the host keeps it
+    std::fs::remove_file(mirror.join("keep.txt")).unwrap();
+    until("the deleted file is back", Duration::from_secs(40), || mirror.join("keep.txt").exists()).await;
+    assert_eq!(std::fs::read_to_string(shared.join("keep.txt")).unwrap(), "keep me");
+    let st = &mb.status()[0];
+    assert!(matches!(st.state.as_str(), "idle" | "syncing" | "starting"), "a change of access is not an error: {st:?}");
+
+    // and read-write again: the member is told by its regular question to the host
+    ma.grant("Device B", "Docs", "rw").await.unwrap();
+    mb.check_hosts().await;
+    assert_eq!(mb.status()[0].access, "rw");
+    std::fs::write(mirror.join("new.txt"), "from B").unwrap();
+    until("changes travel again", Duration::from_secs(40), || shared.join("new.txt").exists()).await;
     a.shutdown().await;
     b.shutdown().await;
 }
@@ -408,6 +570,74 @@ async fn cloud_sync_loads_on_demand_pins_and_leaves() {
     b.shutdown().await;
 }
 
+/// A device that the host has made a reader cannot delete or move the host's files in its Cloud Files
+/// folder (Windows refuses on the app's behalf), and can again once the host lets it write.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reader_cannot_delete_from_its_cloud_folder() {
+    use std::os::windows::process::CommandExt;
+    let (a, b, shared, base, _tmp, host_id) = host_and_member(&[("keep.txt", b"keep me".to_vec()), ("d/inner.txt", b"x".to_vec())]).await;
+    let (ma, mb) = (a.sync().unwrap(), b.sync().unwrap());
+    let root = base.join("Docs");
+    b.sync_join(&host_id, "Docs", &root, "auto", "server_wins").await.unwrap();
+    until("placeholders appear", Duration::from_secs(30), || root.join("keep.txt").exists() && root.join("d/inner.txt").exists()).await;
+    let plain = |rel: &str| root.join(rel).to_string_lossy().trim_start_matches(r"\\?\").replace('/', "\\");
+    let run = |line: String| {
+        let out = std::process::Command::new("cmd").raw_arg(format!("/s /c \"{line}\"")).output().expect("cmd");
+        format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr))
+    };
+
+    ma.grant("Device B", "Docs", "ro").await.unwrap();
+    mb.check_hosts().await;
+    let st = mb.status();
+    assert_eq!((st[0].access.as_str(), st[0].frontend.as_str()), ("ro", "cloud"), "{:?}", st[0]);
+    let said = run(format!("del \"{}\"", plain("keep.txt"))) + &run(format!("rmdir /s /q \"{}\"", plain("d")));
+    assert!(root.join("keep.txt").exists() && root.join("d/inner.txt").exists(), "a reader deleted the host's files: {said}");
+    // the file still opens, and nothing reached the host
+    let p = root.join("keep.txt");
+    assert_eq!(tokio::task::spawn_blocking(move || std::fs::read_to_string(p)).await.unwrap().unwrap(), "keep me");
+    assert!(shared.join("keep.txt").exists());
+
+    ma.grant("Device B", "Docs", "rw").await.unwrap();
+    mb.check_hosts().await;
+    assert_eq!(mb.status()[0].access, "rw");
+    let said = run(format!("del \"{}\"", plain("d\\inner.txt")));
+    assert!(!root.join("d/inner.txt").exists(), "a writer may delete: {said}");
+    until("the delete reaches the host", Duration::from_secs(40), || !shared.join("d/inner.txt").exists()).await;
+    b.sync_leave("Docs", false).await.unwrap();
+    a.shutdown().await;
+    b.shutdown().await;
+}
+
+/// Removed on the host and invited again: the files of a Cloud Files folder open again (what serves them
+/// talks to the host with the new credentials).
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pairing_again_revives_a_cloud_folder() {
+    let (a, b, _shared, base, _tmp, host_id) = host_and_member(&[("one.txt", b"one".to_vec()), ("two.txt", b"two".to_vec())]).await;
+    let (ma, mb) = (a.sync().unwrap(), b.sync().unwrap());
+    let root = base.join("Docs");
+    b.sync_join(&host_id, "Docs", &root, "auto", "server_wins").await.unwrap();
+    until("placeholders appear", Duration::from_secs(30), || root.join("one.txt").exists() && root.join("two.txt").exists()).await;
+    let read = |name: &'static str| {
+        let p = root.join(name);
+        tokio::task::spawn_blocking(move || std::fs::read_to_string(p))
+    };
+    assert_eq!(read("one.txt").await.unwrap().unwrap(), "one");
+
+    ma.revoke_client("Device B").await.unwrap();
+    assert_eq!(mb.check_hosts().await[0].state, "revoked");
+    assert!(read("two.txt").await.unwrap().is_err(), "a removed device gets no content");
+
+    let code = ma.invite(&[("Docs".into(), "rw".into())]).await.unwrap();
+    b.sync_pair(&code).await.unwrap();
+    assert_eq!(read("two.txt").await.unwrap().unwrap(), "two");
+    until("the folder syncs again", Duration::from_secs(40), || matches!(mb.status()[0].state.as_str(), "idle" | "syncing")).await;
+    b.sync_leave("Docs", false).await.unwrap();
+    a.shutdown().await;
+    b.shutdown().await;
+}
+
 #[cfg(windows)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_folder_that_cannot_be_a_sync_root_becomes_a_mirror() {
@@ -420,7 +650,7 @@ async fn a_folder_that_cannot_be_a_sync_root_becomes_a_mirror() {
     until("downloaded as a mirror", Duration::from_secs(30), || point.join("hello.txt").exists()).await;
     let st = &m.status()[0];
     assert_eq!(st.frontend, "mirror", "{st:?}");
-    assert!(st.notice.contains("not empty"), "notice={:?} full={st:?}", st.notice);
+    assert!(st.notice.contains("already had files"), "notice={:?} full={st:?}", st.notice);
     assert_eq!(std::fs::read_to_string(point.join("mine.txt")).unwrap(), "already here");
     assert_eq!(f.frontend, "auto");
     // a mirror has nothing to pin

@@ -7,6 +7,7 @@ use std::time::Duration;
 use bierpc::rpc::{ClientConfig, RpcClient};
 use medialake_proto::pairing::{PairingCode, hex, unhex};
 use medialake_proto::{Action, MAX_MESSAGE_BYTES, PROTO_VERSION, Response, ServerInfo, pinning};
+use medialake_sync::member::transport::rpc_text;
 use tokio::sync::{Notify, watch};
 
 use crate::config::RemoteCreds;
@@ -132,7 +133,7 @@ async fn connect(addr: SocketAddr, fp: [u8; 32]) -> Result<RpcClient<Action>, St
         call_timeout: Some(Duration::from_secs(30)),
         ..Default::default()
     };
-    RpcClient::<Action>::new_with_config(addr, cfg).await.map_err(|e| format!("cannot connect to {addr}: {e:?}"))
+    RpcClient::<Action>::new_with_config(addr, cfg).await.map_err(|e| format!("cannot connect to {addr}: {}", rpc_text(&e)))
 }
 
 pub struct Paired {
@@ -149,7 +150,7 @@ pub async fn pair(code_text: &str, client_name: &str) -> Result<Paired, String> 
     let r = c
         .call::<Response>(Action::Pair { token: hex(&code.token), client_name: client_name.to_string() })
         .await
-        .map_err(|e| format!("pairing failed: {e:?}"))?;
+        .map_err(|e| format!("pairing failed: {}", rpc_text(&e)))?;
     let client_id = match r {
         Response::Paired { client_id, .. } => client_id,
         Response::Rejected(m) => return Err(m),
@@ -160,7 +161,7 @@ pub async fn pair(code_text: &str, client_name: &str) -> Result<Paired, String> 
         Ok(Response::Info(i)) => i,
         Ok(Response::Rejected(m)) => return Err(m),
         Ok(other) => return Err(format!("unexpected response {other:?}")),
-        Err(e) => return Err(format!("handshake failed: {e:?}")),
+        Err(e) => return Err(format!("handshake failed: {}", rpc_text(&e))),
     };
     Ok(Paired {
         creds: RemoteCreds {

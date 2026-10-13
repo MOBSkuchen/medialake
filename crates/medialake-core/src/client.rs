@@ -6,6 +6,7 @@ use std::time::Duration;
 use bierpc::rpc::{ClientConfig, RpcClient};
 use medialake_proto::models::Model;
 use medialake_proto::{Action, Embedding, MAX_MESSAGE_BYTES, PROTO_VERSION, Response, ServerInfo, TextItem, TextKind, VideoFrames};
+use medialake_sync::member::transport::rpc_text;
 use tokio::sync::{Mutex, watch};
 
 use crate::supervisor::{Backend, ConnTarget, ServerState};
@@ -127,12 +128,12 @@ impl EmbedClient {
             call_timeout: Some(Duration::from_secs(600)),
             ..Default::default()
         };
-        let mut c = Conn::new_with_config(target.addr, cfg).await.map_err(|e| format!("connect {}: {e:?}", target.addr))?;
+        let mut c = Conn::new_with_config(target.addr, cfg).await.map_err(|e| format!("connect {}: {}", target.addr, rpc_text(&e)))?;
         match c.call::<Response>(Action::Hello { proto_version: PROTO_VERSION, auth: target.auth.clone() }).await {
             Ok(Response::Info(i)) => Ok((c, i)),
             Ok(Response::Rejected(m)) => Err(format!("server rejected handshake: {m}")),
             Ok(other) => Err(format!("unexpected handshake response: {other:?}")),
-            Err(e) => Err(format!("handshake failed: {e:?}")),
+            Err(e) => Err(format!("handshake failed: {}", rpc_text(&e))),
         }
     }
 
@@ -175,7 +176,7 @@ impl EmbedClient {
             match conn.call::<Response>(build(target.auth.clone())).await {
                 Ok(r) => return Ok(r),
                 Err(e) => {
-                    last_err = format!("{e:?}");
+                    last_err = rpc_text(&e);
                     g.conn = None;
                     drop(g);
                     if let Some(s) = self.backend() {

@@ -38,7 +38,11 @@ pub async fn call(core: &std::sync::Arc<Core>, method: &str, args: Value) -> Res
         }
         "pair_remote" => {
             let code = args["code"].as_str().ok_or("missing code")?;
-            let r = core.pair_remote(code).await?;
+            // the same plain sentences as for sync (Settings > Model shows this next to "Connect")
+            let r = core.pair_remote(code).await.map_err(|e| {
+                tracing::warn!("pair_remote: {e}");
+                medialake_core::sync::server_message(&e)
+            })?;
             Ok(serde_json::to_value(r).unwrap())
         }
         "use_local" => {
@@ -80,7 +84,14 @@ pub async fn call(core: &std::sync::Arc<Core>, method: &str, args: Value) -> Res
             core.cancel_download();
             Ok(json!({}))
         }
-        m if m.starts_with("sync_") => sync_call(core, m, args).await,
+        // whatever a sync call fails with is shown to a person: one plain sentence, the original in the log
+        m if m.starts_with("sync_") => sync_call(core, m, args).await.map_err(|e| {
+            let msg = medialake_core::sync::user_message(&e, "");
+            if msg != e {
+                tracing::warn!("{m}: {e}");
+            }
+            msg
+        }),
         other => Err(format!("unknown method '{other}'")),
     }
 }
@@ -108,10 +119,17 @@ async fn sync_call(core: &std::sync::Arc<Core>, method: &str, args: Value) -> Re
             let (n, errors) = core.sync_unregister_roots().await;
             Ok(json!({ "unregistered": n, "errors": errors.into_iter().map(|(p, e)| json!({ "path": p, "error": e })).collect::<Vec<_>>() }))
         }
-        "sync_status" => match core.sync() {
-            Ok(m) => Ok(json!({ "enabled": true, "syncs": m.status(), "conflicts": m.conflicts().len(), "hosting": m.hosting_status().await })),
-            Err(_) => Ok(json!({ "enabled": false, "syncs": [], "conflicts": 0 })),
-        },
+        // `system_name`: what this device is called when no name is chosen (the field's placeholder)
+        "sync_status" => {
+            let system_name = medialake_proto::platform::host_name("");
+            match core.sync() {
+                Ok(m) => Ok(json!({
+                    "enabled": true, "syncs": m.status(), "conflicts": m.conflicts().len(), "hosting": m.hosting_status().await,
+                    "system_name": system_name,
+                })),
+                Err(_) => Ok(json!({ "enabled": false, "syncs": [], "conflicts": 0, "system_name": system_name })),
+            }
+        }
         _ => {
             let m = core.sync()?;
             match method {
@@ -121,7 +139,9 @@ async fn sync_call(core: &std::sync::Arc<Core>, method: &str, args: Value) -> Re
                 })).collect::<Vec<_>>() })),
                 // hosts
                 "sync_pair" => val(core.sync_pair(arg(&args, "code")?).await?),
-                "sync_hosts" => Ok(json!({ "hosts": m.hosts() })),
+                // `check`: ask each computer now (a few seconds at most); one that removed this device
+                // drops out of the list
+                "sync_hosts" => Ok(json!({ "hosts": if args["check"].as_bool().unwrap_or(false) { m.check_hosts().await } else { m.hosts() } })),
                 "sync_forget_host" => {
                     m.forget_host(arg(&args, "id")?).await?;
                     Ok(json!({}))

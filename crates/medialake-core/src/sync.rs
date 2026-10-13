@@ -80,6 +80,11 @@ pub struct HostSummary {
     pub id: String,
     pub name: String,
     pub address: String,
+    /// `ok`, `unreachable` (off, away, or no longer sharing), `revoked` (it removed this device), or
+    /// empty when it was not asked.
+    pub state: String,
+    /// Folders of this computer that are joined here (it cannot be forgotten while there are any).
+    pub folders: usize,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -167,6 +172,13 @@ pub struct SyncManager {
     status: Arc<Mutex<HashMap<String, SyncStatus>>>,
     hosting: tokio::sync::Mutex<Option<Hosting>>,
     hosting_error: Mutex<String>,
+    /// Hosts that answered "authentication failed": they removed this device. Not offered any more.
+    revoked: Mutex<HashSet<String>>,
+    /// Asks the hosts now what they call themselves and what this device may do (see `watch_hosts`).
+    recheck: Arc<tokio::sync::Notify>,
+    watcher: Mutex<Option<JoinHandle<()>>>,
+    /// One round of questions to the hosts at a time (the timer and the "add a folder" dialog both ask).
+    checking: tokio::sync::Mutex<()>,
     /// Windows: one connected sync root per cloud sync (and its frontend, for browsing and pinning).
     clouds: Mutex<HashMap<String, CloudSession>>,
     cloud_fes: Mutex<HashMap<String, Arc<CloudFrontend>>>,
@@ -186,23 +198,130 @@ impl crate::indexer::ContentGate for SyncManager {
     }
 }
 
+/// Why a folder is an ordinary folder with full copies although files on demand were asked for. The
+/// reasons a person can do something about are named; the rest is in the log.
+fn fallback_notice(raw: &str) -> String {
+    let m = raw.to_lowercase();
+    let why = if m.contains("is not empty") {
+        "the folder already had files in it"
+    } else if m.contains("ntfs") {
+        "its drive is not formatted with NTFS"
+    } else if m.contains("local drive") {
+        "it is on a network drive"
+    } else if m.contains("not available on this windows") {
+        "this version of Windows cannot do it"
+    } else {
+        "the system refused it (details in the log)"
+    };
+    format!("This folder holds full copies of all files: showing them without downloading was not possible because {why}.")
+}
+
+/// The operating system's own text for a full disk is localised; its error number is not.
+fn is_disk_full(m: &str) -> bool {
+    let codes: &[&str] = if cfg!(windows) { &["(os error 112)", "(os error 39)"] } else { &["(os error 28)", "(os error 69)", "(os error 122)"] };
+    m.contains("no space left") || m.contains("not enough space") || m.contains("disk full") || m.contains("quota exceeded") || codes.iter().any(|c| m.contains(c))
+}
+
+/// The host said that this device is not paired with it any more (it was removed there).
+fn is_revoked(m: &str) -> bool {
+    m.contains("authentication failed") || m.contains("access revoked")
+}
+
+fn is_offline(m: &str) -> bool {
+    [
+        "cannot connect",
+        "cannot resolve",
+        "no address for",
+        "connection refused",
+        "connection reset",
+        "timed out",
+        "broken pipe",
+        "the connection to",
+        "the connection was closed",
+        "the connection broke",
+        "is this host a medialake host",
+    ]
+    .iter()
+    .any(|p| m.contains(p))
+}
+
 pub fn classify_error(msg: &str) -> &'static str {
     let m = msg.to_lowercase();
-    if m.contains("no space left") || m.contains("not enough space") || m.contains("disk full") || m.contains("quota exceeded") {
+    if is_disk_full(&m) {
         "disk_full"
-    } else if m.contains("access denied") || m.contains("authentication failed") || m.contains("no access to sync") || m.contains("no longer allows") {
+    } else if m.contains("access denied") || is_revoked(&m) || m.contains("no access to sync") {
         "denied"
-    } else if m.contains("cannot connect")
-        || m.contains("cannot resolve")
-        || m.contains("connection refused")
-        || m.contains("connection reset")
-        || m.contains("timed out")
-        || m.contains("is this host a medialake host")
-        || m.contains("broken pipe")
-    {
+    } else if is_offline(&m) {
         "offline"
     } else {
         "error"
+    }
+}
+
+/// One sentence for the person in front of the app, from an error as the code produces it. `who` is the
+/// other computer's name (empty = not known). What is recognised is keyed on wording this code base writes
+/// itself, never on the operating system's, which is localised. Callers log the original.
+pub fn user_message(raw: &str, who: &str) -> String {
+    message(raw, if who.trim().is_empty() { "The other computer" } else { who.trim() }, true)
+}
+
+/// Like [`user_message`], for the remote search server (Settings > Model): the same failures, without
+/// the words that are about shared folders.
+pub fn server_message(raw: &str) -> String {
+    message(raw, "The server", false)
+}
+
+fn message(raw: &str, who: &str, sync: bool) -> String {
+    let m = raw.to_lowercase();
+    let has = |p: &str| m.contains(p);
+    if is_revoked(&m) {
+        if sync {
+            format!("{who} no longer accepts this device. Ask for a new invitation code there.")
+        } else {
+            format!("{who} no longer accepts this device. Pair again with a new code.")
+        }
+    } else if has("no access to sync") {
+        format!("{who} no longer shares this folder with this device.")
+    } else if has("read-only access") {
+        "This folder is read only for this device: changes are made on a computer that may write to it.".into()
+    } else if has("invalid or expired pairing token") || has("does not accept pairing") {
+        "This invitation code is no longer valid. A code works once, for ten minutes: ask for a new one.".into()
+    } else if has("not a medialake pairing code") {
+        "This is not an invitation code. Copy all of it, from SN1- to the end.".into()
+    } else if has("checksum mismatch") {
+        "The invitation code has a typo. Copy it again.".into()
+    } else if has("pairing code version") || has("protocol version") {
+        format!("{who} runs another version of MediaLake. Update MediaLake on both computers.")
+    } else if has("does not host syncs") {
+        format!("{who} does not share any folders.")
+    } else if has("cannot listen on") {
+        let port = m.split("cannot listen on ").nth(1).and_then(|r| r.split(": ").next()).and_then(|a| a.rsplit(':').next()).unwrap_or("").to_string();
+        if port.is_empty() {
+            "Sharing could not start: its network port is used by another program.".into()
+        } else {
+            format!("Sharing could not start: port {port} is used by another program.")
+        }
+    } else if is_offline(&m) {
+        // a computer that stopped sharing closes its listener: from here that looks the same as "off"
+        let also = if sync { ", on another network, or no longer sharing folders" } else { " or on another network" };
+        format!("{who} cannot be reached. It may be switched off{also}.")
+    } else if is_disk_full(&m) {
+        "This computer's disk is full.".into()
+    } else if ["os {", "kind:", "ioerror", "custom {", "rpcerror", "panicked", "unexpected answer", "unexpected response", "0x8007"].iter().any(|p| has(p)) {
+        "Something went wrong. The details are in the log.".into()
+    } else {
+        // written for people already; drop what only helps a developer
+        let mut s = raw.replace(" (is this host a MediaLake host with sync enabled?)", "");
+        while let Some(i) = s.find(" (os error ") {
+            match s[i..].find(')') {
+                Some(j) => s.replace_range(i..i + j + 1, ""),
+                None => break,
+            }
+        }
+        if s.chars().count() > 220 {
+            s = s.chars().take(219).collect::<String>() + "…";
+        }
+        s
     }
 }
 
@@ -235,6 +354,10 @@ impl SyncManager {
             status: Arc::new(Mutex::new(HashMap::new())),
             hosting: tokio::sync::Mutex::new(None),
             hosting_error: Mutex::new(String::new()),
+            revoked: Mutex::new(HashSet::new()),
+            recheck: Arc::new(tokio::sync::Notify::new()),
+            watcher: Mutex::new(None),
+            checking: tokio::sync::Mutex::new(()),
             clouds: Mutex::new(HashMap::new()),
             cloud_fes: Mutex::new(HashMap::new()),
             #[cfg(target_os = "macos")]
@@ -313,9 +436,25 @@ impl SyncManager {
         }
     }
 
-    /// Forgets cached connections (the device name or a credential changed).
+    /// Forgets cached connections (a credential or an address changed).
     pub fn reset_clients(&self) {
         self.clients.lock().unwrap().clear();
+    }
+
+    /// "Name shown to others" was changed. Every request carries the name, and the engines carry it into
+    /// conflict names, so the running folders start again with it; the hosts then list this device under
+    /// the new name.
+    pub async fn device_renamed(&self) {
+        self.reset_clients();
+        let running: Vec<String> = self.running.lock().unwrap().keys().cloned().collect();
+        for id in running {
+            self.stop_folder(&id).await;
+            let Ok(f) = self.folder(&id) else { continue };
+            if let Err(e) = self.start_folder(&f).await {
+                self.fail(&f, e);
+            }
+        }
+        self.recheck.notify_one();
     }
 
     fn emit(&self, e: Event) {
@@ -346,13 +485,42 @@ impl SyncManager {
             }
         }
         if let Err(e) = self.ensure_hosting().await {
+            tracing::warn!("hosting: {e}");
+            let e = user_message(&e, "");
             *self.hosting_error.lock().unwrap() = e.clone();
             self.emit(Event::SyncError { sync_id: String::new(), message: e });
+        }
+        self.watch_hosts();
+    }
+
+    /// Keeps what this device knows about its hosts current: the name each one goes by, whether it still
+    /// accepts this device, and what this device may do in each folder (a host can change read-write to
+    /// read-only and back at any time). Asked at start, every half minute, and at once when something
+    /// suggests a change (`recheck`).
+    fn watch_hosts(self: &Arc<Self>) {
+        let me = Arc::downgrade(self);
+        let recheck = self.recheck.clone();
+        let task = self.handle.spawn(async move {
+            loop {
+                let Some(m) = me.upgrade() else { return };
+                m.check_hosts().await;
+                drop(m);
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {}
+                    _ = recheck.notified() => {}
+                }
+            }
+        });
+        if let Some(old) = self.watcher.lock().unwrap().replace(task) {
+            old.abort();
         }
     }
 
     /// Stops everything (engines finish their round first).
     pub async fn stop(&self) {
+        if let Some(w) = self.watcher.lock().unwrap().take() {
+            w.abort();
+        }
         let runs: Vec<RunningSync> = self.running.lock().unwrap().drain().map(|(_, r)| r).collect();
         let _ = tokio::task::spawn_blocking(move || drop(runs)).await;
         // sync roots stay registered (placeholders keep their place); only the connections go
@@ -395,6 +563,8 @@ impl SyncManager {
     }
 
     fn fail(&self, f: &SyncFolderCfg, msg: String) {
+        tracing::warn!("sync {}: {msg}", f.name);
+        let msg = user_message(&msg, &self.host_name(&f.host_id));
         {
             let mut m = self.status.lock().unwrap();
             if let Some(s) = m.get_mut(&f.sync_id) {
@@ -458,7 +628,7 @@ impl SyncManager {
                 Ok(fe) => (fe, "cloud", String::new()),
                 Err(e) => {
                     tracing::warn!("Cloud Files for {} failed: {e}", f.name);
-                    (Arc::new(Mirror::new(&f.path)), "mirror", format!("Could not use Cloud Files for {}: {e}. It is shown as a normal folder instead.", f.path.display()))
+                    (Arc::new(Mirror::new(&f.path)), "mirror", fallback_notice(&e))
                 }
             };
         }
@@ -468,7 +638,7 @@ impl SyncManager {
                 Ok((fe, note)) => (fe, "mount", note.unwrap_or_default()),
                 Err(e) => {
                     tracing::warn!("mount of {} failed: {e}", f.name);
-                    (Arc::new(Mirror::new(&f.path)), "mirror", format!("Could not mount {}: {e}. It is shown as a normal folder instead.", f.path.display()))
+                    (Arc::new(Mirror::new(&f.path)), "mirror", fallback_notice(&e))
                 }
             };
         }
@@ -627,24 +797,43 @@ impl SyncManager {
         let (sync_id, name) = (f.sync_id.clone(), f.name.clone());
         let db_path = self.store.state_dir(&f.sync_id).join("state.db");
         let notified: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+        let recheck = self.recheck.clone();
+        let host_name = self.host_name(&f.host_id);
+        // what the engine said last, as it said it: the log gets each new problem once
+        let last_raw: Mutex<String> = Mutex::new(String::new());
         move |r| {
             let pending: Vec<(String, bool, i64)> =
                 MemberDb::open(&db_path).map(|d| d.conflicts().into_iter().map(|(e, s)| (e.path, e.deleted, s)).collect()).unwrap_or_default();
-            let (state, detail) = match r {
-                Err(e) => {
-                    let msg = format!("{e:#}");
-                    (classify_error(&msg).to_string(), msg)
+            // the state comes from the error as the code wrote it, the text shown from `user_message`
+            let problem = |raw: String| {
+                let mut last = last_raw.lock().unwrap();
+                if *last != raw {
+                    tracing::warn!("sync {name}: {raw}");
+                    *last = raw.clone();
                 }
+                let state = classify_error(&raw);
+                if state == "denied" {
+                    // removed on the host, or this folder taken away: find out which (and act on it)
+                    recheck.notify_one();
+                }
+                (state.to_string(), user_message(&raw, &host_name))
+            };
+            let (state, detail) = match r {
+                Err(e) => problem(format!("{e:#}")),
                 Ok(rep) if rep.held_deletes.is_some() => {
                     ("held".to_string(), format!("{} deletes are waiting for confirmation", rep.held_deletes.unwrap_or(0)))
                 }
                 Ok(_) if !pending.is_empty() => ("conflict".to_string(), format!("{} conflict(s) need a decision", pending.len())),
-                Ok(rep) if !rep.errors.is_empty() => {
-                    let msg = rep.errors.join("; ");
-                    (classify_error(&msg).to_string(), msg)
+                Ok(rep) if !rep.errors.is_empty() => problem(rep.errors.join("; ")),
+                Ok(_) => {
+                    last_raw.lock().unwrap().clear();
+                    ("idle".to_string(), String::new())
                 }
-                Ok(_) => ("idle".to_string(), String::new()),
             };
+            if matches!(r, Ok(rep) if rep.became_read_only) {
+                // the host made this device a reader: set the folder up for that
+                recheck.notify_one();
+            }
             let changed = {
                 let mut m = status.lock().unwrap();
                 let s = m.entry(sync_id.clone()).or_default();
@@ -697,15 +886,188 @@ impl SyncManager {
 
     // ---------------- hosts ----------------
 
+    /// The computers this device is paired with, as last known (nothing is asked over the network).
     pub fn hosts(&self) -> Vec<HostSummary> {
-        self.cfg.read().unwrap().sync.hosts.iter().map(|h| HostSummary { id: h.id.clone(), name: h.name.clone(), address: h.address.clone() }).collect()
+        let c = self.cfg.read().unwrap();
+        let revoked = self.revoked.lock().unwrap();
+        c.sync
+            .hosts
+            .iter()
+            .map(|h| HostSummary {
+                id: h.id.clone(),
+                name: h.name.clone(),
+                address: h.address.clone(),
+                state: if revoked.contains(&h.id) { "revoked".into() } else { String::new() },
+                folders: c.sync.folders.iter().filter(|f| f.host_id == h.id).count(),
+            })
+            .collect()
+    }
+
+    fn host_name(&self, host_id: &str) -> String {
+        self.cfg.read().unwrap().sync.hosts.iter().find(|h| h.id == host_id).map(|h| h.name.clone()).unwrap_or_default()
+    }
+
+    /// A host answered that this device is not paired with it any more. With nothing joined from it the
+    /// pairing is simply dropped; otherwise it stays (its folders say "access withdrawn") but is not
+    /// offered for new folders.
+    async fn note_revoked(&self, host_id: &str) {
+        // Forgetting a pairing throws its secret away, so one answer is not taken for it: the question is
+        // put once more, on a new connection, a moment later.
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        self.clients.lock().unwrap().remove(host_id);
+        let Ok(client) = self.client(host_id) else { return };
+        match client.hello().await {
+            Err(e) if is_revoked(&format!("{e:#}").to_lowercase()) => {}
+            _ => return,
+        }
+        let joined = self.cfg.read().unwrap().sync.folders.iter().any(|f| f.host_id == host_id);
+        if joined {
+            if !self.revoked.lock().unwrap().insert(host_id.to_string()) {
+                return;
+            }
+            // its folders find out now, not at their next look in a minute
+            let ids: Vec<String> = self.cfg.read().unwrap().sync.folders.iter().filter(|f| f.host_id == host_id).map(|f| f.sync_id.clone()).collect();
+            let running = self.running.lock().unwrap();
+            for id in ids {
+                if let Some(r) = running.get(&id) {
+                    r.nudge();
+                }
+            }
+        } else if self.forget_host(host_id).await.is_err() {
+            return;
+        }
+        self.emit(Event::SyncChanged { what: "hosts".into(), sync_id: String::new() });
+    }
+
+    /// Asks every paired computer who it is and what it offers this device, all at once and for a few
+    /// seconds at most, and applies what it learns: a new name, a removed pairing, a changed access.
+    /// Returns the computers that are left, each with how it answered.
+    pub async fn check_hosts(&self) -> Vec<HostSummary> {
+        let _one_at_a_time = self.checking.lock().await;
+        let ids: Vec<String> = self.cfg.read().unwrap().sync.hosts.iter().map(|h| h.id.clone()).collect();
+        let mut asks = vec![];
+        for id in ids {
+            let Ok(client) = self.client(&id) else { continue };
+            asks.push(self.handle.spawn(async move {
+                let ask = async {
+                    let (_, name) = client.hello().await?;
+                    let syncs = client.list_syncs().await?;
+                    anyhow::Ok((name, syncs))
+                };
+                let r = match tokio::time::timeout(std::time::Duration::from_secs(6), ask).await {
+                    Ok(r) => r.map_err(|e| format!("{e:#}")),
+                    Err(_) => Err("timed out".to_string()),
+                };
+                (id, r)
+            }));
+        }
+        let mut states: HashMap<String, &'static str> = HashMap::new();
+        for a in asks {
+            let Ok((id, r)) = a.await else { continue };
+            match r {
+                Ok((name, syncs)) => {
+                    states.insert(id.clone(), "ok");
+                    self.revoked.lock().unwrap().remove(&id);
+                    self.learn_host_name(&id, &name);
+                    for s in syncs {
+                        self.apply_access(&s.id, s.access.as_str()).await;
+                    }
+                }
+                Err(e) if is_revoked(&e.to_lowercase()) => {
+                    tracing::info!("host {id} no longer accepts this device");
+                    self.note_revoked(&id).await;
+                }
+                Err(e) => {
+                    tracing::debug!("host {id}: {e}");
+                    states.insert(id, "unreachable");
+                }
+            }
+        }
+        let mut out = self.hosts();
+        for h in out.iter_mut() {
+            if h.state.is_empty() {
+                h.state = states.get(&h.id).copied().unwrap_or("unreachable").into();
+            }
+        }
+        out
+    }
+
+    /// The host goes by another name now (it was renamed in its settings).
+    fn learn_host_name(&self, host_id: &str, name: &str) {
+        let name = name.trim();
+        if name.is_empty() || self.host_name(host_id) == name {
+            return;
+        }
+        let _ = self.update(|c| {
+            if let Some(h) = c.sync.hosts.iter_mut().find(|h| h.id == host_id) {
+                h.name = name.to_string();
+            }
+        });
+        let folders: Vec<SyncFolderCfg> = self.cfg.read().unwrap().sync.folders.iter().filter(|f| f.host_id == host_id).cloned().collect();
+        let mut st = self.status.lock().unwrap();
+        for f in folders {
+            if let Some(s) = st.get_mut(&f.sync_id) {
+                s.host_name = name.to_string();
+            }
+        }
+        drop(st);
+        self.emit(Event::SyncChanged { what: "hosts".into(), sync_id: String::new() });
+    }
+
+    /// The host gives this device another access to a joined folder than the one it runs with: the
+    /// folder is set up again for it (a read-only folder refuses changes where the system can do that).
+    async fn apply_access(&self, sync_id: &str, access: &str) {
+        let Some(f) = self.cfg.read().unwrap().sync.folders.iter().find(|f| f.sync_id == sync_id).cloned() else { return };
+        if f.access == access || Access::parse(access).is_none() {
+            return;
+        }
+        tracing::info!("{}: access is now {access} (was {})", f.name, f.access);
+        let Ok(updated) = self.update(|c| {
+            let x = c.sync.folders.iter_mut().find(|x| x.sync_id == sync_id).unwrap();
+            x.access = access.to_string();
+            x.clone()
+        }) else {
+            return;
+        };
+        self.restart_folder(&updated).await;
+        self.emit(Event::SyncChanged { what: "access".into(), sync_id: sync_id.to_string() });
+    }
+
+    /// Sets a joined folder up again from its configuration: a new engine, a new connection to the host,
+    /// and what shows its files on demand connected afresh (its access or the credentials changed).
+    async fn restart_folder(&self, f: &SyncFolderCfg) {
+        self.stop_folder(&f.sync_id).await;
+        self.drop_volume(&f.sync_id).await;
+        self.init_status(f);
+        if f.paused {
+            self.ensure_volume_only(f).await;
+        } else if let Err(e) = self.start_folder(f).await {
+            self.fail(f, e);
+        }
+    }
+
+    /// Takes down what shows a folder's files without their content (a Cloud Files connection, a mount),
+    /// so that the next start sets it up afresh. The files stay where they are.
+    async fn drop_volume(&self, sync_id: &str) {
+        self.cloud_fes.lock().unwrap().remove(sync_id);
+        let session = self.clouds.lock().unwrap().remove(sync_id);
+        if let Some(s) = session {
+            let _ = tokio::task::spawn_blocking(move || s.stop()).await;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let _ = self.teardown_mount(sync_id).await;
+        }
     }
 
     /// Redeems a pairing code for sync. If the code also grants embedding, `embedding` is set so the
     /// caller can fill the embedding server credentials from the same secret.
     pub async fn pair(&self, code: &str) -> Result<(SyncPairResult, SyncHostCfg), String> {
         let device = self.device();
-        let paired = pair_ex(code, &device).await.map_err(|e| format!("{e:#}"))?;
+        let paired = pair_ex(code, &device).await.map_err(|e| {
+            tracing::warn!("pairing: {e:#}");
+            user_message(&format!("{e:#}"), "")
+        })?;
         let secret = unhex(&paired.creds.secret_hex).ok_or("corrupt secret")?;
         let host = SyncHostCfg {
             id: paired.creds.id.clone(),
@@ -724,6 +1086,15 @@ impl SyncManager {
             remote::discard(&o.secret_protected);
         }
         self.reset_clients();
+        // paired afresh: whatever this computer said before, it accepts this device now. Folders that are
+        // joined from it still run with the old credentials (their engine, their notification stream, what
+        // serves their files on demand): they start again with the new ones.
+        self.revoked.lock().unwrap().remove(&host.id);
+        let folders: Vec<SyncFolderCfg> = self.cfg.read().unwrap().sync.folders.iter().filter(|f| f.host_id == host.id).cloned().collect();
+        for f in folders {
+            self.restart_folder(&f).await;
+        }
+        self.recheck.notify_one();
         let (quality, backend) = paired.embedding.as_ref().map(|i| (i.quality.clone(), i.backend.clone())).unwrap_or_default();
         Ok((
             SyncPairResult {
@@ -747,15 +1118,31 @@ impl SyncManager {
             Some(o) => {
                 remote::discard(&o.secret_protected);
                 self.reset_clients();
+                self.revoked.lock().unwrap().remove(host_id);
                 Ok(())
             }
             None => Err(format!("host {host_id} is not paired")),
         }
     }
 
+    /// What went wrong when talking to a host, for the user; a host that removed this device is dealt
+    /// with on the way (it is not offered again).
+    async fn host_error(&self, host_id: &str, e: anyhow::Error) -> String {
+        let raw = format!("{e:#}");
+        tracing::warn!("host {host_id}: {raw}");
+        let msg = user_message(&raw, &self.host_name(host_id));
+        if is_revoked(&raw.to_lowercase()) {
+            self.note_revoked(host_id).await;
+        }
+        msg
+    }
+
     pub async fn available(&self, host_id: &str) -> Result<Vec<AvailableSync>, String> {
         let client = self.client(host_id)?;
-        let syncs = client.list_syncs().await.map_err(|e| format!("{e:#}"))?;
+        let syncs = match client.list_syncs().await {
+            Ok(s) => s,
+            Err(e) => return Err(self.host_error(host_id, e).await),
+        };
         let joined: HashSet<String> = self.cfg.read().unwrap().sync.folders.iter().map(|f| f.sync_id.clone()).collect();
         Ok(syncs
             .into_iter()
@@ -787,11 +1174,14 @@ impl SyncManager {
             other => return Err(format!("unknown frontend {other:?}")),
         };
         let client = self.client(host_id)?;
-        let syncs = client.list_syncs().await.map_err(|e| format!("{e:#}"))?;
+        let syncs = match client.list_syncs().await {
+            Ok(s) => s,
+            Err(e) => return Err(self.host_error(host_id, e).await),
+        };
         let info = syncs
             .iter()
             .find(|s| s.id == sync_id || s.name == sync_id)
-            .ok_or_else(|| format!("this host does not offer {sync_id:?} to this device"))?
+            .ok_or_else(|| format!("{} does not share {sync_id:?} with this device (any more).", self.host_name(host_id)))?
             .clone();
         if self.cfg.read().unwrap().sync.folders.iter().any(|f| f.sync_id == info.id) {
             return Err(format!("{:?} is already joined", info.name));
@@ -1232,7 +1622,9 @@ impl SyncManager {
         }
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         SyncsFile { syncs: hosted }.save(&dir).map_err(|e| format!("{e:#}"))?;
-        if g.is_some() {
+        if let Some(h) = g.as_ref() {
+            // the name shown to others may have been changed: members hear it with their next hello
+            h.host.set_name(&self.device());
             *self.hosting_error.lock().unwrap() = String::new();
             return Ok(());
         }
@@ -1241,12 +1633,13 @@ impl SyncManager {
         let state = Arc::new(StateDir::open(&dir).map_err(|e| format!("{e:#}"))?);
         let ident = state.identity().map_err(|e| format!("{e:#}"))?;
         let tls = pinning::server_tls(ident.cert_der.clone(), ident.key_der.clone())?;
-        let host_name = medialake_proto::platform::host_name("MediaLake");
+        // what members see this computer as: the name chosen in the settings, not the system's
+        let host_name = self.device();
         let st2 = state.clone();
         let host = tokio::task::spawn_blocking(move || SyncHost::new(st2, &host_name)).await.map_err(|e| e.to_string())?;
         let server = RpcServer::new(bind, SyncOnlyService { host: host.clone() })
             .await
-            .map_err(|e| format!("cannot listen on {bind}: {e:?}"))?
+            .map_err(|e| format!("cannot listen on {bind}: {}", medialake_sync::member::transport::rpc_text(&e)))?
             .with_persistence(host.persistent())
             .with_config(ServerConfig { max_message_bytes: MAX_MESSAGE_BYTES, tls: Some(tls), ..Default::default() });
         let addr = server.local_addr().map_err(|e| e.to_string())?;

@@ -73,9 +73,16 @@ internal static class SyncDialogs
         var available = new List<JsonElement>();
         var panel = new StackPanel { Spacing = 12, MinWidth = 500 };
 
-        var hostCombo = new ComboBox { Header = "Computer", MinWidth = 420, Visibility = Visibility.Collapsed };
+        var hostCombo = new ComboBox { Header = "Computer", Width = 380 };
+        // a computer that is no longer used (it stopped sharing, it was replaced) can be taken off the list
+        var forget = new Button { Content = "Forget", VerticalAlignment = VerticalAlignment.Bottom, Visibility = Visibility.Collapsed };
+        var hostRow = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8, Visibility = Visibility.Collapsed };
+        hostRow.Children.Add(hostCombo);
+        hostRow.Children.Add(forget);
         var orText = Text("or paste an invitation code", opacity: 0.6, size: 12);
         orText.Visibility = Visibility.Collapsed;
+        var filling = false;
+        var joinedFrom = new Dictionary<string, long>();
         var codeBox = new TextBox { PlaceholderText = "SN1-…  (from \"Invite a device\" on the other computer)", Width = 380 };
         var connect = new Button { Content = "Connect", VerticalAlignment = VerticalAlignment.Bottom };
         var codeRow = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8 };
@@ -107,7 +114,7 @@ internal static class SyncDialogs
         options.Children.Add(copyHint);
         var error = Text("", critical: true, size: 12);
 
-        panel.Children.Add(hostCombo);
+        panel.Children.Add(hostRow);
         panel.Children.Add(orText);
         panel.Children.Add(codeRow);
         panel.Children.Add(folders);
@@ -127,6 +134,52 @@ internal static class SyncDialogs
 
         JsonElement? Selected() => folders.SelectedItem is RadioButton { Tag: string id } ? available.FirstOrDefault(a => Str(a, "id") == id) : null;
         void Update() => dlg.IsPrimaryButtonEnabled = Selected() is { ValueKind: JsonValueKind.Object } && location.Text.Trim().Length > 0;
+        string ChosenHost() => hostCombo.SelectedItem is ComboBoxItem { Tag: string id } ? id : "";
+
+        void ClearFolders()
+        {
+            hostId = "";
+            available.Clear();
+            folders.Items.Clear();
+            folders.Visibility = options.Visibility = Visibility.Collapsed;
+            Update();
+        }
+
+        // The computers this PC is paired with: another of their folders needs no new code. One that has
+        // removed this device is not offered (the core drops it, or marks it if folders of it are still
+        // joined); one that does not answer is offered with a note.
+        void FillHosts(JsonElement answer, string select)
+        {
+            filling = true;
+            hostCombo.Items.Clear();
+            joinedFrom.Clear();
+            hostCombo.Items.Add(new ComboBoxItem { Content = "Choose…", Tag = "" });
+            if (answer.TryGetProperty("hosts", out var hs))
+            {
+                foreach (var h in hs.EnumerateArray())
+                {
+                    if (Str(h, "state") == "revoked") continue;
+                    joinedFrom[Str(h, "id")] = Num(h, "folders");
+                    var note = Str(h, "state") == "unreachable" ? "  ·  not reachable right now" : "";
+                    hostCombo.Items.Add(new ComboBoxItem { Content = $"{Str(h, "name")}  ({Str(h, "address")}){note}", Tag = Str(h, "id") });
+                }
+            }
+            var keep = hostCombo.Items.OfType<ComboBoxItem>().FirstOrDefault(i => (string)i.Tag == select && select.Length > 0);
+            hostCombo.SelectedItem = keep ?? hostCombo.Items[0];
+            filling = false;
+            hostRow.Visibility = orText.Visibility = hostCombo.Items.Count > 1 ? Visibility.Visible : Visibility.Collapsed;
+            // the computer whose folders are listed is not there any more
+            if (keep == null && hostId.Length > 0 && !joinedFrom.ContainsKey(hostId)) ClearFolders();
+            ShowForget();
+        }
+
+        void ShowForget() => forget.Visibility = ChosenHost() is { Length: > 0 } id && joinedFrom.GetValueOrDefault(id) == 0 ? Visibility.Visible : Visibility.Collapsed;
+
+        async Task RefreshHostsAsync(bool ask, string? select = null)
+        {
+            try { FillHosts(await Call("sync_hosts", new { check = ask }), select ?? ChosenHost()); }
+            catch { /* the code field still works */ }
+        }
 
         async Task LoadAsync(string host)
         {
@@ -134,6 +187,7 @@ internal static class SyncDialogs
             hostId = host;
             available.Clear();
             folders.Items.Clear();
+            var failed = false;
             try
             {
                 var res = await Call("sync_available", new { host });
@@ -150,9 +204,16 @@ internal static class SyncDialogs
                 if (first != null) folders.SelectedItem = first;
                 else error.Text = available.Count == 0 ? "This computer shares nothing with this PC." : "Every folder of this computer is already added.";
             }
-            catch (Exception ex) { error.Text = ex.Message; }
+            catch (Exception ex)
+            {
+                error.Text = ex.Message;
+                failed = true;
+            }
+            folders.Visibility = available.Count > 0 ? Visibility.Visible : Visibility.Collapsed;
             options.Visibility = Selected() != null ? Visibility.Visible : Visibility.Collapsed;
             Update();
+            // a computer that turned this PC away is off the list now
+            if (failed) await RefreshHostsAsync(false);
         }
 
         folders.SelectionChanged += (_, _) =>
@@ -168,7 +229,19 @@ internal static class SyncDialogs
         };
         hostCombo.SelectionChanged += async (_, _) =>
         {
-            if (hostCombo.SelectedItem is ComboBoxItem { Tag: string id } && id.Length > 0) await LoadAsync(id);
+            if (filling) return;
+            ShowForget();
+            if (ChosenHost() is not { Length: > 0 } id) ClearFolders();
+            else if (id != hostId) await LoadAsync(id); // not again for what is listed (or just failed) already
+        };
+        forget.Click += async (_, _) =>
+        {
+            if (ChosenHost() is not { Length: > 0 } id) return;
+            error.Text = "";
+            try { await Call("sync_forget_host", new { id }); }
+            catch (Exception ex) { error.Text = ex.Message; }
+            ClearFolders();
+            await RefreshHostsAsync(false, "");
         };
         connect.Click += async (_, _) =>
         {
@@ -180,7 +253,9 @@ internal static class SyncDialogs
             {
                 var paired = await Call("sync_pair", new { code });
                 codeBox.Text = "";
-                await LoadAsync(Str(paired, "host_id"));
+                var id = Str(paired, "host_id");
+                await RefreshHostsAsync(false, id);
+                await LoadAsync(id);
             }
             catch (Exception ex) { error.Text = ex.Message; }
             connect.IsEnabled = true;
@@ -209,20 +284,10 @@ internal static class SyncDialogs
             deferral.Complete();
         };
 
-        // computers this PC is paired with already: another of their folders needs no new code
-        try
-        {
-            var hosts = await Call("sync_hosts");
-            if (hosts.TryGetProperty("hosts", out var hs) && hs.GetArrayLength() > 0)
-            {
-                hostCombo.Items.Add(new ComboBoxItem { Content = "Choose…", Tag = "" });
-                foreach (var h in hs.EnumerateArray())
-                    hostCombo.Items.Add(new ComboBoxItem { Content = $"{Str(h, "name")}  ({Str(h, "address")})", Tag = Str(h, "id") });
-                hostCombo.SelectedIndex = 0;
-                hostCombo.Visibility = orText.Visibility = Visibility.Visible;
-            }
-        }
-        catch { /* the code field still works */ }
+        // what is known shows at once; then each computer is asked (a few seconds at most), and one that
+        // has removed this PC meanwhile drops out
+        await RefreshHostsAsync(false, "");
+        _ = RefreshHostsAsync(true);
 
         await dlg.ShowAsync();
         return joined;

@@ -120,6 +120,15 @@ impl CloudFrontend {
         self.inner.spawn_walk(String::new());
     }
 
+    /// Gives every file of the host the read-only attribute this folder now calls for, in the background.
+    /// Placeholders keep the attribute they were made with, and the host can turn a device into a reader
+    /// (or back) at any time: without this a folder that became writable would stay full of read-only
+    /// files. The user's own files in the folder are left alone.
+    pub fn reconcile_read_only(&self) {
+        let me = self.inner.clone();
+        let _ = std::thread::Builder::new().name("medialake-cloud-access".into()).spawn(move || me.mark_read_only());
+    }
+
     /// Tries again the conversions that failed because a file was open.
     fn retry_conversions(&self) {
         let pending: Vec<Retry> = std::mem::take(&mut *self.inner.retry.lock().unwrap());
@@ -198,6 +207,24 @@ impl Inner {
         }
     }
 
+    fn mark_read_only(&self) {
+        let mut stack = vec![self.root.clone()];
+        while let Some(dir) = stack.pop() {
+            let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+            for e in rd.flatten() {
+                let p = e.path();
+                let st = self.api.state_light(&p).unwrap_or_default();
+                if st.is_dir {
+                    stack.push(p);
+                } else if st.placeholder && (st.attributes & medialake_cloudapi::attr::READONLY != 0) != self.read_only {
+                    if let Err(e) = self.api.set_read_only(&p, self.read_only) {
+                        tracing::debug!("{}: {e}", p.display());
+                    }
+                }
+            }
+        }
+    }
+
     fn spawn_walk(self: &Arc<Self>, rel: String) {
         let me = self.clone();
         if !me.busy.lock().unwrap().insert(rel.clone()) {
@@ -219,6 +246,10 @@ impl Inner {
         if let Err(e) = self.api.mark_synced(&path, &r.identity) {
             tracing::debug!("{}: {e}; tried again later", r.rel);
             self.retry.lock().unwrap().push(r);
+        } else if self.read_only {
+            // a file the engine just put there (the host's new version of a kept file, a file that was
+            // changed here and put back) is one of the host's files like the others
+            let _ = self.api.set_read_only(&path, true);
         }
     }
 }
@@ -315,10 +346,15 @@ impl Frontend for CloudFrontend {
         if mtime > 0 {
             set_mtime_ms(&tmp, mtime)?;
         }
+        // in a read-only folder the file that is replaced is write-protected, and Windows does not rename
+        // over one
+        if self.inner.read_only {
+            let _ = self.inner.api.set_read_only(&dest, false);
+        }
         std::fs::rename(&tmp, &dest).inspect_err(|_| {
             let _ = std::fs::remove_file(&tmp);
         })?;
-        // `note_content` follows and turns it into an in-sync placeholder
+        // `note_content` follows and turns it into an in-sync placeholder (write-protected again)
         Ok(())
     }
 

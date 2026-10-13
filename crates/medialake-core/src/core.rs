@@ -279,7 +279,8 @@ impl Core {
 
     /// Redeems a pairing code and switches to the remote server.
     pub async fn pair_remote(&self, code: &str) -> Result<PairResult, String> {
-        let name = medialake_proto::platform::host_name("MediaLake client");
+        // the name this device goes by everywhere (Settings > Sync), not the system's
+        let name = self.config().sync.device();
         let paired = crate::remote::pair(code, &name).await?;
         let Some(server_model) = Model::parse(&paired.info.model_id) else {
             crate::remote::discard(&paired.creds.secret_protected);
@@ -676,9 +677,14 @@ impl Core {
             && (old.sync.device_name != new.sync.device_name || old.sync.hosting != new.sync.hosting)
         {
             if let Ok(s) = self.sync() {
-                s.reset_clients();
+                if old.sync.device_name != new.sync.device_name {
+                    s.device_renamed().await;
+                } else {
+                    s.reset_clients();
+                }
                 if let Err(e) = s.ensure_hosting().await {
-                    let _ = self.events.send(Event::Error { message: e });
+                    tracing::warn!("hosting: {e}");
+                    let _ = self.events.send(Event::Error { message: crate::sync::user_message(&e, "") });
                 }
             }
         }

@@ -97,9 +97,12 @@ impl CloudSession {
         };
         api.register(&root, &reg).map_err(|e| anyhow::anyhow!("{e}"))?;
         write_marker(&marker, &cfg.sync_id);
-        let conn = api.connect(&root, Arc::new(HostProvider::new(tr))).map_err(|e| anyhow::anyhow!("{e}"))?;
+        // a read-only folder is protected: Windows asks before a placeholder is deleted or moved, and
+        // programs other than this one are told no
+        let conn = api.connect(&root, Arc::new(HostProvider::new(tr)), cfg.read_only).map_err(|e| anyhow::anyhow!("{e}"))?;
         let frontend = Arc::new(CloudFrontend::new(api.clone(), &root, cfg.read_only));
         frontend.reconcile_pins();
+        frontend.reconcile_read_only();
         Ok(CloudSession { api, frontend, root, conn: Some(conn) })
     }
 
@@ -167,6 +170,9 @@ pub fn leave_root(api: &dyn CloudApi, root: &Path, keep_downloaded: bool) -> Res
                 first_error.get_or_insert(format!("removing {}: {e}", p.display()));
             }
         } else if st.placeholder {
+            // what stays is the user's own file from now on: not write-protected (it was, if the folder
+            // was read-only for this device), and not a placeholder
+            let _ = api.set_read_only(&p, false);
             if let Err(e) = api.revert(&p) {
                 first_error.get_or_insert(format!("{e}"));
             }

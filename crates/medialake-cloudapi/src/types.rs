@@ -148,7 +148,9 @@ pub trait CloudApi: Send + Sync {
     /// `Ok` if Cloud Files can be used for `root` (platform present, NTFS volume).
     fn available(&self, root: &Path) -> Result<(), String>;
     fn register(&self, root: &Path, reg: &Registration) -> CloudResult<()>;
-    fn connect(&self, root: &Path, provider: Arc<dyn Provider>) -> CloudResult<Box<dyn Connection>>;
+    /// Starts serving the root. `protect`: the folder is read-only for this device, so programs other than
+    /// this one are refused when they delete, rename or move one of its placeholders.
+    fn connect(&self, root: &Path, provider: Arc<dyn Provider>, protect: bool) -> CloudResult<Box<dyn Connection>>;
     /// Removes the registration (placeholders that were not reverted stop working).
     fn unregister(&self, root: &Path) -> CloudResult<()>;
 
@@ -169,6 +171,11 @@ pub trait CloudApi: Send + Sync {
     fn hydrate(&self, path: &Path) -> CloudResult<()>;
     fn dehydrate(&self, path: &Path) -> CloudResult<()>;
     fn set_pin(&self, path: &Path, pin: Pin) -> CloudResult<()>;
+    /// Sets or clears a file's read-only attribute (the folder became read-only for this device, or
+    /// writable again), keeping the placeholder as it is otherwise.
+    fn set_read_only(&self, _path: &Path, _read_only: bool) -> CloudResult<()> {
+        Ok(())
+    }
     /// Turns a placeholder back into a normal file (it must be hydrated).
     fn revert(&self, path: &Path) -> CloudResult<()>;
 }

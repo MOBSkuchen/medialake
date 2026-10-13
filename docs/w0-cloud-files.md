@@ -9,10 +9,10 @@ that still need a person in front of Explorer. Plan: `post-plan3.md` §8.2, §10
 
 | Piece | Where | Verified how |
 |---|---|---|
-| Typed layer over cfapi (register, connect, placeholders, TRANSFER_DATA, update, convert, pin, hydrate, dehydrate, revert) | `crates/medialake-cloudapi/src/win.rs` | **10 tests against the real platform** (`tests/win.rs`): each registers a sync root in a temporary folder and lets Windows fetch through it |
+| Typed layer over cfapi (register, connect, placeholders, TRANSFER_DATA, update, convert, pin, hydrate, dehydrate, revert, delete / rename veto) | `crates/medialake-cloudapi/src/win.rs` | **12 tests against the real platform** (`tests/win.rs`): each registers a sync root in a temporary folder and lets Windows fetch through it |
 | Platform-neutral half: identity blob, 4 KiB transfer planner, callback-path mapping, recall-attribute test | `…/cloudapi/src/{types,plan}.rs` | unit tests (any host) |
 | **W0 spike** | `crates/medialake-cloudapi/examples/spike.rs` | run, driven from a second process (reads, pin / free through `attrib`, copy in, rename, delete, disconnect, unregister) |
-| **W1 frontend** | `crates/medialake-cloud/` | **16 tests on the real platform with the real engine and host** (`tests/windows.rs`), next to the 11 over the stand-in (`tests/frontend.rs`, any host) |
+| **W1 frontend** | `crates/medialake-cloud/` | **17 tests on the real platform with the real engine and host** (`tests/windows.rs`), next to the 11 over the stand-in (`tests/frontend.rs`, any host) |
 | Core wiring: frontend kind `cloud` (auto on Windows, mirror fallback with a notice), browse / pin / unpin / leave, `sync_unregister_roots` | `medialake-core/src/sync.rs`, `core.rs`, `medialake-ffi/src/dispatch.rs` | `medialake-core/tests/sync.rs`: two cores over TLS, the member's folder a Cloud Files root (load on open, pin all, upload, host change, pause, leave, uninstall, fallback to a mirror) |
 | **W2**: WinUI Settings > Sync, welcome window, tray lines and balloons, uninstall step | `ui/MediaLake.App/` | builds without warnings; the real `MediaLake.exe` driven with `--selftest` against a scratch data folder (it hosts a folder, joins it as a Cloud Files root, reads and writes through Explorer's file system, renders the Sync page and its dialogs), then `--unregister-sync-roots` |
 | **X1**: files with `RECALL_ON_DATA_ACCESS` / `RECALL_ON_OPEN` / `OFFLINE` are indexed by name only | `medialake-core/src/indexer.rs`, `search.rs` | the attributes are asserted on real placeholders, and reading them with `symlink_metadata` fetches nothing; an index run with a model over a root of placeholders was **not** done |
@@ -60,12 +60,23 @@ removed.
 * **Callbacks**: `FETCH_DATA` (served from the engine's transport with the revision from the placeholder's
   identity, in 4 KiB-aligned pieces of at most 4 MiB, with progress; the log names the program that reads)
   and `CANCEL_FETCH_DATA`. A failed fetch is answered at once with an error status.
-* **No `NOTIFY_DELETE` / `NOTIFY_RENAME`**: the file watcher sees deletes and renames as it does for a mirror.
+* **`NOTIFY_DELETE` / `NOTIFY_RENAME` only for read-only folders.** A writable root does not register them
+  (every delete and rename would wait for our answer); the file watcher sees deletes and renames as it does
+  for a mirror.
 * **Pinning**: Explorer's "Always keep on this device" / "Free up space" only set attributes. The frontend
   watches attribute changes (and walks the tree once at start) and hydrates / dehydrates accordingly. The
   app's folder browser does the same per file and folder.
-* **Read-only members**: placeholders carry the read-only attribute; edits that happen anyway are reverted
-  and kept as a copy by the engine's existing rule.
+* **Read-only members**: the root is connected "protected". Windows then asks before one of its files or
+  folders is deleted, renamed or moved, and the answer is no for every program but MediaLake itself (which
+  applies what happens on the host) and for everything but the host's files (a file of the user's own in
+  the folder carries no identity and is theirs). The program is told `ERROR_CLOUD_FILE_READ_ONLY_VOLUME`,
+  "the cloud operation is not supported on a read-only volume": only cloud-file statuses reach it, anything
+  else arrives as a bare "the cloud operation was unsuccessful". Placeholders also carry the read-only
+  attribute, which stops ordinary programs from saving over them; an edit that happens anyway is reverted
+  and kept as a copy by the engine's existing rule. The host can change a device's access at any time: the
+  app notices within half a minute, connects the root again with or without the protection, and sets or
+  clears the attribute on what is there (through `CfUpdatePlaceholder`, which keeps the "in sync" mark and
+  fetches nothing).
 
 ## The questions of the first version, answered
 
@@ -109,6 +120,7 @@ removed.
 ## Still to check by hand
 
 Explorer's overlay icons and the "Always keep on this device" / "Free up space" menu entries on a real root;
+what Explorer shows when a delete in a read-only folder is refused (the command line and .NET get error 381);
 thumbnails and previews (each is a full download of the file); an Office application and a media player on a
 synced folder; Windows Search; Storage Sense freeing space; a second user account; Windows 10 1809.
 The WinUI windows were rendered by the test hooks, not clicked through.

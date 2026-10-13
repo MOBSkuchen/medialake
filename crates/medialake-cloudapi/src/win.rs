@@ -8,7 +8,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use windows::Win32::Foundation::{
-    CloseHandle, ERROR_ACCESS_DENIED, HANDLE, NTSTATUS, STATUS_CLOUD_FILE_NETWORK_UNAVAILABLE, STATUS_CLOUD_FILE_UNSUCCESSFUL,
+    CloseHandle, ERROR_ACCESS_DENIED, HANDLE, NTSTATUS, STATUS_CLOUD_FILE_NETWORK_UNAVAILABLE, STATUS_CLOUD_FILE_READ_ONLY_VOLUME,
+    STATUS_CLOUD_FILE_UNSUCCESSFUL,
 };
 use windows::Win32::Storage::CloudFilters::*;
 use windows::Win32::Storage::FileSystem::{
@@ -228,6 +229,69 @@ unsafe extern "system" fn on_cancel_fetch_data(info: *const CF_CALLBACK_INFO, _p
     }
 }
 
+// ---- a protected (read-only) root: deletes and renames are asked for, and refused ----
+
+/// What a program gets when it tries to delete or move a file of a read-only folder: "the cloud operation
+/// is not supported on a read-only volume". Only the cloud-file statuses reach the program; anything else
+/// (tried: "media is write protected") arrives as a bare "the cloud operation was unsuccessful".
+const REFUSED: NTSTATUS = STATUS_CLOUD_FILE_READ_ONLY_VOLUME;
+
+/// True if the request comes from this process: the sync engine applying what happened on the host.
+fn from_ourselves(info: &CF_CALLBACK_INFO) -> bool {
+    // SAFETY: with REQUIRE_PROCESS_INFO the platform passes a valid block (or null) for the callback's duration.
+    unsafe { info.ProcessInfo.as_ref() }.is_some_and(|p| p.ProcessId == std::process::id())
+}
+
+/// True if the file or folder is one of the host's (a placeholder that carries our identity). The
+/// platform also asks about the user's own files in the folder; those are theirs to delete.
+fn is_the_hosts(info: &CF_CALLBACK_INFO) -> bool {
+    if info.FileIdentity.is_null() || info.FileIdentityLength == 0 {
+        return false;
+    }
+    // SAFETY: the platform guarantees `FileIdentityLength` readable bytes.
+    Identity::decode(unsafe { std::slice::from_raw_parts(info.FileIdentity.cast::<u8>(), info.FileIdentityLength as usize) }).is_some()
+}
+
+/// Answers a NOTIFY_DELETE / NOTIFY_RENAME. The platform holds the program's request until this arrives,
+/// so it is sent at once, whatever the answer.
+fn acknowledge(info: &CF_CALLBACK_INFO, rename: bool, status: NTSTATUS) {
+    let op = CF_OPERATION_INFO {
+        StructSize: size_of::<CF_OPERATION_INFO>() as u32,
+        Type: if rename { CF_OPERATION_TYPE_ACK_RENAME } else { CF_OPERATION_TYPE_ACK_DELETE },
+        ConnectionKey: info.ConnectionKey,
+        TransferKey: info.TransferKey,
+        CorrelationVector: std::ptr::null(),
+        SyncStatus: std::ptr::null(),
+        RequestKey: info.RequestKey,
+    };
+    // SAFETY: an all-zero parameter block is valid; the union member used is set below.
+    let mut params: CF_OPERATION_PARAMETERS = unsafe { std::mem::zeroed() };
+    if rename {
+        params.ParamSize = (offset_of!(CF_OPERATION_PARAMETERS, Anonymous) + size_of::<CF_OPERATION_PARAMETERS_0_6>()) as u32;
+        params.Anonymous.AckRename = CF_OPERATION_PARAMETERS_0_6 { Flags: CF_OPERATION_ACK_RENAME_FLAG_NONE, CompletionStatus: status };
+    } else {
+        params.ParamSize = (offset_of!(CF_OPERATION_PARAMETERS, Anonymous) + size_of::<CF_OPERATION_PARAMETERS_0_7>()) as u32;
+        params.Anonymous.AckDelete = CF_OPERATION_PARAMETERS_0_7 { Flags: CF_OPERATION_ACK_DELETE_FLAG_NONE, CompletionStatus: status };
+    }
+    // SAFETY: both structures are fully initialised.
+    let _ = unsafe { CfExecute(&op, &mut params) };
+}
+
+unsafe extern "system" fn on_notify_delete(info: *const CF_CALLBACK_INFO, _params: *const CF_CALLBACK_PARAMETERS) {
+    // SAFETY: as in `on_fetch_data`.
+    let info = unsafe { &*info };
+    acknowledge(info, false, if from_ourselves(info) || !is_the_hosts(info) { NTSTATUS(0) } else { REFUSED });
+}
+
+unsafe extern "system" fn on_notify_rename(info: *const CF_CALLBACK_INFO, params: *const CF_CALLBACK_PARAMETERS) {
+    // SAFETY: as in `on_fetch_data`.
+    let (info, params) = unsafe { (&*info, &*params) };
+    let flags = unsafe { params.Anonymous.Rename.Flags };
+    // something that comes into the folder from outside takes nothing away from it
+    let leaves_its_place = flags.contains(CF_CALLBACK_RENAME_FLAG_SOURCE_IN_SCOPE);
+    acknowledge(info, true, if from_ourselves(info) || !leaves_its_place || !is_the_hosts(info) { NTSTATUS(0) } else { REFUSED });
+}
+
 struct WinConnection {
     key: CF_CONNECTION_KEY,
     ctx: *mut Ctx,
@@ -313,13 +377,19 @@ impl CloudApi for WinCloud {
         }
     }
 
-    fn connect(&self, root: &Path, provider: Arc<dyn Provider>) -> CloudResult<Box<dyn Connection>> {
+    fn connect(&self, root: &Path, provider: Arc<dyn Provider>, protect: bool) -> CloudResult<Box<dyn Connection>> {
         let ctx = Box::into_raw(Box::new(Ctx { provider, root: root.to_string_lossy().into_owned() }));
-        let table = [
+        let mut table = vec![
             CF_CALLBACK_REGISTRATION { Type: CF_CALLBACK_TYPE_FETCH_DATA, Callback: Some(on_fetch_data) },
             CF_CALLBACK_REGISTRATION { Type: CF_CALLBACK_TYPE_CANCEL_FETCH_DATA, Callback: Some(on_cancel_fetch_data) },
-            CF_CALLBACK_REGISTRATION { Type: CF_CALLBACK_TYPE_NONE, Callback: None },
         ];
+        if protect {
+            // only for a protected root: once registered, every delete and rename of a placeholder waits
+            // for our answer
+            table.push(CF_CALLBACK_REGISTRATION { Type: CF_CALLBACK_TYPE_NOTIFY_DELETE, Callback: Some(on_notify_delete) });
+            table.push(CF_CALLBACK_REGISTRATION { Type: CF_CALLBACK_TYPE_NOTIFY_RENAME, Callback: Some(on_notify_rename) });
+        }
+        table.push(CF_CALLBACK_REGISTRATION { Type: CF_CALLBACK_TYPE_NONE, Callback: None });
         let w = wide(root);
         // without REQUIRE_FULL_FILE_PATH the callbacks get no `NormalizedPath`, and every fetch would be
         // refused as "not below the sync root"; the process is for the log ("who downloaded this?")
@@ -452,6 +522,39 @@ impl CloudApi for WinCloud {
         };
         // SAFETY: `h` is an open handle.
         unsafe { CfSetPinState(h.0, state, CF_SET_PIN_FLAG_NONE, None) }.map_err(|e| fail(&format!("pinning {}", path.display()), e))
+    }
+
+    fn set_read_only(&self, path: &Path, read_only: bool) -> CloudResult<()> {
+        let st = self.state(path)?;
+        if !st.exists || st.is_dir || (st.attributes & attr::READONLY != 0) == read_only {
+            return Ok(());
+        }
+        if !st.placeholder {
+            let mut p = std::fs::metadata(path).map_err(|e| CloudError::Failed(format!("{}: {e}", path.display())))?.permissions();
+            p.set_readonly(read_only);
+            return std::fs::set_permissions(path, p).map_err(|e| CloudError::Failed(format!("{}: {e}", path.display())));
+        }
+        // through the platform, so that the placeholder keeps what it stands for and its "in sync" mark;
+        // zero times mean "leave them"
+        let h = open_change(path)?;
+        let attrs = if read_only { FILE_ATTRIBUTE_READONLY.0 } else { FILE_ATTRIBUTE_NORMAL.0 };
+        let md = CF_FS_METADATA { BasicInfo: FILE_BASIC_INFO { FileAttributes: attrs, ..Default::default() }, FileSize: st.size as i64 };
+        let id = st.identity.as_ref().map(Identity::encode);
+        let flags = if st.in_sync { CF_UPDATE_FLAG_MARK_IN_SYNC } else { CF_UPDATE_FLAG_NONE };
+        // SAFETY: as in `update_placeholder`.
+        unsafe {
+            CfUpdatePlaceholder(
+                h.0,
+                Some(&md),
+                id.as_ref().map(|v| v.as_ptr().cast::<c_void>()),
+                id.as_ref().map_or(0, |v| v.len() as u32),
+                None,
+                flags,
+                None,
+                None,
+            )
+        }
+        .map_err(|e| fail(&format!("updating {}", path.display()), e))
     }
 
     fn revert(&self, path: &Path) -> CloudResult<()> {

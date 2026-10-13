@@ -61,7 +61,7 @@ impl Root {
         };
         api.register(&path, &reg).expect("register");
         let source = Arc::new(Source::default());
-        let conn = api.connect(&path, source.clone()).expect("connect");
+        let conn = api.connect(&path, source.clone(), false).expect("connect");
         Root { _dir: dir, path, api, source, conn: Some(conn) }
     }
 
@@ -268,7 +268,7 @@ fn a_file_that_changed_size_here_comes_back_whole() {
     let mut r = Root::new();
     let host = Arc::new(Host(Mutex::new(vec![])));
     r.conn.take();
-    r.conn = Some(r.api.connect(&r.path, host.clone()).unwrap());
+    r.conn = Some(r.api.connect(&r.path, host.clone(), false).unwrap());
     for (name, new) in [("grow.txt", &b"version one, then edited on this PC"[..]), ("shrink.txt", b"short"), ("same.txt", b"VERSION ONE")] {
         *host.0.lock().unwrap() = b"version one".to_vec();
         r.file(name, 11, 1);
@@ -333,6 +333,92 @@ fn read_only_placeholders_and_revert() {
     let st = r.state("plain.txt");
     assert!(st.exists && !st.placeholder, "{st:?}");
     assert_eq!(std::fs::read(r.p("plain.txt")).unwrap(), pattern(0, 3000));
+}
+
+/// Runs a command line in another process, as a program of the user would.
+fn other_program(line: &str) -> (bool, String) {
+    use std::os::windows::process::CommandExt;
+    // the line as it is: cmd has its own rules for quotes (/s: take off the outer pair, nothing else)
+    let out = std::process::Command::new("cmd").raw_arg(format!("/s /c \"{line}\"")).output().expect("cmd");
+    (out.status.success(), format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)))
+}
+
+fn plain(p: &Path) -> String {
+    p.to_string_lossy().trim_start_matches(r"\\?\").to_string()
+}
+
+#[test]
+fn a_protected_root_refuses_deletes_and_moves_by_other_programs() {
+    let mut r = Root::new();
+    r.conn.take();
+    r.conn = Some(r.api.connect(&r.path, r.source.clone(), true).expect("connect protected"));
+    r.file("keep.txt", 3000, 1);
+    r.file("read.txt", 2000, 2);
+    r.dir("album");
+    r.file("album/photo.bin", 5000, 3);
+    assert_eq!(std::fs::read(r.p("read.txt")).unwrap(), pattern(0, 2000));
+    let outside = r.path.parent().unwrap().join("elsewhere.txt");
+
+    // another program: deleting, renaming, moving out and removing a folder are all refused, for files
+    // whose content is here as for those whose content is not
+    for line in [
+        format!("del \"{}\"", plain(&r.p("keep.txt"))),
+        format!("del \"{}\"", plain(&r.p("read.txt"))),
+        format!("ren \"{}\" renamed.txt", plain(&r.p("keep.txt"))),
+        format!("move \"{}\" \"{}\"", plain(&r.p("keep.txt")), plain(&outside)),
+        format!("rmdir /s /q \"{}\"", plain(&r.p("album"))),
+    ] {
+        let (_, said) = other_program(&line);
+        assert!(r.p("keep.txt").exists() && r.p("read.txt").exists() && r.p("album/photo.bin").exists(), "{line} went through: {said}");
+        assert!(!r.p("renamed.txt").exists() && !outside.exists(), "{line} went through: {said}");
+        // refused by the folder, not by a slip in the command line
+        assert!(!said.contains("Syntax") && !said.to_lowercase().contains("syntax"), "{line}: {said}");
+    }
+    // the reason a program is given: ERROR_CLOUD_FILE_READ_ONLY_VOLUME (381), "the cloud operation is not
+    // supported on a read-only volume"
+    let script = format!("try {{ [IO.File]::Delete('{}'); 'deleted' }} catch {{ $_.Exception.InnerException.HResult }}", plain(&r.p("keep.txt")));
+    let out = std::process::Command::new("powershell").args(["-NoProfile", "-Command", &script]).output().expect("powershell");
+    let said = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(said.trim(), (0x8007_017Du32 as i32).to_string(), "{said}");
+    // a file or folder of the user's own in the folder is theirs to rename and delete
+    std::fs::write(r.p("mine.txt"), b"x").unwrap();
+    std::fs::create_dir(r.p("my folder")).unwrap();
+    let (_, said) = other_program(&format!("ren \"{0}\" mine2.txt && del \"{1}\" && rmdir \"{2}\"", plain(&r.p("mine.txt")), plain(&r.p("mine2.txt")), plain(&r.p("my folder"))));
+    assert!(!r.p("mine.txt").exists() && !r.p("mine2.txt").exists() && !r.p("my folder").exists(), "{said}");
+
+    // this process is the sync engine: what happened on the host is applied
+    std::fs::rename(r.p("read.txt"), r.p("moved by the host.txt")).unwrap();
+    std::fs::remove_file(r.p("keep.txt")).unwrap();
+    std::fs::remove_dir_all(r.p("album")).unwrap();
+    assert!(r.p("moved by the host.txt").exists() && !r.p("keep.txt").exists() && !r.p("album").exists());
+
+    // connected without protection (the folder is writable again), the same root lets programs do it
+    r.conn.take();
+    r.conn = Some(r.api.connect(&r.path, r.source.clone(), false).unwrap());
+    let (ok, said) = other_program(&format!("del \"{}\"", plain(&r.p("moved by the host.txt"))));
+    assert!(ok && !r.p("moved by the host.txt").exists(), "{said}");
+}
+
+#[test]
+fn the_read_only_attribute_can_be_set_and_cleared_on_placeholders() {
+    let r = Root::new();
+    r.file("cloud.txt", 4000, 1);
+    r.file("here.txt", 4000, 2);
+    assert_eq!(std::fs::read(r.p("here.txt")).unwrap(), pattern(0, 4000));
+    for (name, dehydrated) in [("cloud.txt", true), ("here.txt", false)] {
+        r.api.set_read_only(&r.p(name), true).unwrap();
+        let st = r.state(name);
+        assert!(st.attributes & attr::READONLY != 0 && st.placeholder && st.in_sync && st.dehydrated == dehydrated, "{name}: {st:?}");
+        assert!(std::fs::OpenOptions::new().write(true).open(r.p(name)).is_err(), "{name} can be opened for writing");
+        r.api.set_read_only(&r.p(name), false).unwrap();
+        let st = r.state(name);
+        assert!(st.attributes & attr::READONLY == 0 && st.in_sync && st.dehydrated == dehydrated && st.size == 4000, "{name}: {st:?}");
+        assert_eq!(st.identity.map(|i| i.rev), Some(if dehydrated { 1 } else { 2 }));
+    }
+    // nothing was fetched for the attribute, and the content is what it was
+    assert_eq!(r.requests().len(), 1, "{:?}", r.requests());
+    assert_eq!(std::fs::read(r.p("cloud.txt")).unwrap(), pattern(0, 4000));
+    assert_eq!(std::fs::read(r.p("here.txt")).unwrap(), pattern(0, 4000));
 }
 
 #[test]

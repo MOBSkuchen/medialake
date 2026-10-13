@@ -50,6 +50,7 @@ public sealed partial class SettingsWindow : Window
     }
 
     public FrameworkElement RootElement => Nav;
+    internal FrameworkElement SyncContent => PageSync.Everything;
     public void SelectPage(int i) => Nav.SelectedItem = Nav.MenuItems[i];
 
     /// <summary>Opens the Sync page (a notification was clicked).</summary>

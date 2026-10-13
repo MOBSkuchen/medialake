@@ -127,7 +127,7 @@ impl CloudApi for Fake {
         Ok(())
     }
 
-    fn connect(&self, root: &Path, provider: Arc<dyn Provider>) -> CloudResult<Box<dyn Connection>> {
+    fn connect(&self, root: &Path, provider: Arc<dyn Provider>, _protect: bool) -> CloudResult<Box<dyn Connection>> {
         *self.root.lock().unwrap() = root.to_path_buf();
         *self.provider.lock().unwrap() = Some(provider);
         Ok(Box::new(Conn))

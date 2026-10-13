@@ -123,15 +123,46 @@ impl StateDir {
         id
     }
 
+    /// One attempt. `None`: the file is there but could not be read just now. A writer replaces these
+    /// files with a rename, and on Windows a read can collide with that for a moment; "could not read" must
+    /// never be taken for "empty" (an empty list of clients means that nobody is paired).
+    fn try_read_json<T: for<'a> Deserialize<'a> + Default>(&self, name: &str) -> Option<T> {
+        match std::fs::read_to_string(self.dir.join(name)) {
+            Ok(s) => serde_json::from_str(&s).ok(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(T::default()),
+            Err(_) => None,
+        }
+    }
+
+    /// For changing a file: its content, or an error rather than a default that would be written back.
+    fn load_json<T: for<'a> Deserialize<'a> + Default>(&self, name: &str) -> anyhow::Result<T> {
+        for _ in 0..10 {
+            if let Some(v) = self.try_read_json(name) {
+                return Ok(v);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        bail!("{name} cannot be read right now")
+    }
+
+    /// For looking only: what is there, or nothing.
     fn read_json<T: for<'a> Deserialize<'a> + Default>(&self, name: &str) -> T {
-        std::fs::read_to_string(self.dir.join(name)).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
+        self.load_json(name).unwrap_or_default()
     }
 
     fn write_json<T: Serialize>(&self, name: &str, v: &T) -> anyhow::Result<()> {
         let tmp = self.dir.join(format!("{name}.tmp"));
         std::fs::write(&tmp, serde_json::to_string_pretty(v)?)?;
-        std::fs::rename(tmp, self.dir.join(name))?;
-        Ok(())
+        // a reader may have the old file open for an instant (Windows refuses the rename meanwhile)
+        let mut last = None;
+        for _ in 0..10 {
+            match std::fs::rename(&tmp, self.dir.join(name)) {
+                Ok(()) => return Ok(()),
+                Err(e) => last = Some(e),
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        Err(last.unwrap().into())
     }
 
     /// Public address (`host:port`) remembered from the last `serve`.
@@ -147,7 +178,7 @@ impl StateDir {
     pub fn new_pairing(&self, address: &str, grants: Grants) -> anyhow::Result<PairingCode> {
         let id = self.identity()?;
         let code = PairingCode { address: address.to_string(), token: random_bytes(), secret: random_bytes(), fingerprint: id.fingerprint() };
-        let mut pending: BTreeMap<String, Pending> = self.read_json("pending.json");
+        let mut pending: BTreeMap<String, Pending> = self.load_json("pending.json")?;
         let t = now_secs() as u64;
         pending.retain(|_, p| p.expires > t);
         pending.insert(hex(&code.token), Pending { secret_hex: hex(&code.secret), expires: t + PAIRING_TTL.as_secs(), grants });
@@ -157,7 +188,9 @@ impl StateDir {
 
     /// Burns a one-time token and registers the client. Returns the new client id.
     pub fn consume_pairing(&self, token_hex: &str, client_name: &str) -> Option<String> {
-        let mut pending: BTreeMap<String, Pending> = self.read_json("pending.json");
+        // the list of clients first: if it cannot be read now, the code is not used up for nothing
+        let mut clients: BTreeMap<String, ClientRecord> = self.load_json("clients.json").ok()?;
+        let mut pending: BTreeMap<String, Pending> = self.load_json("pending.json").ok()?;
         let p = pending.remove(token_hex)?;
         let _ = self.write_json("pending.json", &pending);
         if p.expires <= now_secs() as u64 {
@@ -165,7 +198,6 @@ impl StateDir {
         }
         let secret = unhex(&p.secret_hex)?;
         let client_id = hex(&random_bytes::<6>());
-        let mut clients: BTreeMap<String, ClientRecord> = self.read_json("clients.json");
         clients.insert(
             client_id.clone(),
             ClientRecord {
@@ -195,8 +227,21 @@ impl StateDir {
         by_name.next().is_none().then_some(first)
     }
 
+    /// Records the name a paired device now calls itself. Writes only when it differs.
+    pub fn rename_client(&self, id: &str, name: &str) -> anyhow::Result<()> {
+        let mut clients: BTreeMap<String, ClientRecord> = self.load_json("clients.json")?;
+        let name: String = name.chars().take(64).collect();
+        match clients.get_mut(id) {
+            Some(rec) if rec.name != name => {
+                rec.name = name;
+                self.write_json("clients.json", &clients)
+            }
+            _ => Ok(()),
+        }
+    }
+
     pub fn revoke(&self, id: &str) -> anyhow::Result<bool> {
-        let mut clients: BTreeMap<String, ClientRecord> = self.read_json("clients.json");
+        let mut clients: BTreeMap<String, ClientRecord> = self.load_json("clients.json")?;
         let existed = clients.remove(id).is_some();
         if existed {
             self.write_json("clients.json", &clients)?;
@@ -206,7 +251,7 @@ impl StateDir {
 
     /// Grants (or changes) a client's access to a sync. `None` removes the grant.
     pub fn set_grant(&self, client: &str, sync: &str, access: Option<Access>) -> anyhow::Result<()> {
-        let mut clients: BTreeMap<String, ClientRecord> = self.read_json("clients.json");
+        let mut clients: BTreeMap<String, ClientRecord> = self.load_json("clients.json")?;
         let Some(rec) = clients.get_mut(client) else { bail!("no client {client}") };
         match access {
             Some(a) => {
@@ -221,7 +266,7 @@ impl StateDir {
 
     /// Removes every grant of a sync (the sync was deleted).
     pub fn drop_sync_grants(&self, sync: &str) -> anyhow::Result<()> {
-        let mut clients: BTreeMap<String, ClientRecord> = self.read_json("clients.json");
+        let mut clients: BTreeMap<String, ClientRecord> = self.load_json("clients.json")?;
         for c in clients.values_mut() {
             c.syncs.remove(sync);
         }
@@ -236,8 +281,13 @@ impl StateDir {
         let mtime = std::fs::metadata(self.dir.join("clients.json")).and_then(|m| m.modified()).ok();
         let mut g = self.clients.lock().unwrap();
         if g.0 != mtime || g.1.is_empty() {
-            g.1 = self.read_json("clients.json");
-            g.0 = mtime;
+            // a file that cannot be read this instant leaves what is known in place (and is looked at
+            // again with the next request): otherwise every paired device would be turned away, and a
+            // device that is told so forgets its pairing
+            if let Ok(c) = self.load_json("clients.json") {
+                g.1 = c;
+                g.0 = mtime;
+            }
         }
         let rec = g.1.get(id)?;
         ct_eq(rec.secret_sha256.as_bytes(), hex(&Sha256::digest(&secret)).as_bytes()).then(|| (id.to_string(), rec.clone()))

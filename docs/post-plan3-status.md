@@ -69,9 +69,9 @@ runs inside the app when `[[sync.hosted]]` has entries.
 - **Core / FFI**: `search_enabled` (switchable at runtime: server, watcher and indexer follow; the index
   stays on disk), `[sync]` config section, `SyncManager` (one engine thread per sync, hosting inside the
   app, bandwidth limits applied live), events `sync_state` / `sync_progress` / `sync_conflict` /
-  `sync_error`, and the `sync_*` methods of §11.1 plus `sync_enable`, `sync_hosting`,
-  `sync_host_snapshot`, `sync_confirm_deletes`. Sync states include `offline`, `denied` and `disk_full`.
-  Existing `config.toml` files load unchanged; sync is off by default.
+  `sync_error` / `sync_changed`, and the `sync_*` methods of §11.1 plus `sync_enable`, `sync_hosting`,
+  `sync_host_snapshot`, `sync_confirm_deletes`, `sync_hosts { check }`. Sync states include `offline`,
+  `denied` and `disk_full`. Existing `config.toml` files load unchanged; sync is off by default.
 - **One filesystem-event normaliser**: `medialake-sync::watch::normalize` (rename pairing, the FSEvents
   special case) is used by the host, the mirror frontend and the search indexer's watcher.
 
@@ -112,17 +112,47 @@ runs inside the app when `[[sync.hosted]]` has entries.
     Windows: Explorer's "Free up space" and Storage Sense do that job.
 15. **A file's delete waits while a new file of the same size cannot be read** (it may be the same file,
     renamed, and where content is not on the device the host's copy is the only one).
+16. **A member asks its hosts every half minute** (`check_hosts`: `Hello` + `ListSyncs`; also when a push is
+    refused, and when the "add a folder" dialog opens) and applies what it learns without a restart:
+    * the **access** the host gives it now. A folder that became read-only is set up again as one, and
+      back. A refused push is not an error state: the engine goes on as a reader and puts back what was
+      changed (changed files are kept as copies).
+    * the host's **name**. "Name shown to others" is the one name of a device: a hosting app announces it
+      (not the computer's name), members store what the host calls itself now, and a host renames a device
+      in its list when the device's requests carry another name.
+    * a host that answers "authentication failed" has **removed this device**. With nothing joined from
+      it the pairing is dropped; otherwise it is kept (its folders say "access withdrawn") but marked, and
+      not offered for new folders. The answer is asked for twice before a pairing is dropped (its secret
+      goes with it). Pairing again with a new code revives the folders: they start again with the new
+      credentials. `sync_forget_host` takes a computer off the list by hand.
+17. **Read-only is enforced where the system can do it.** Windows (Cloud Files): the root is connected with
+    `NOTIFY_DELETE` / `NOTIFY_RENAME`, and programs other than MediaLake are refused when they delete, rename
+    or move one of the host's files ("not supported on a read-only volume"); files also carry the read-only
+    attribute, set and cleared when the access changes. macOS: the volume is mounted read-only. A **mirror**
+    is an ordinary folder that its owner can always change; there the engine puts back what was deleted or
+    changed, as before. New files of the user's own in a read-only folder stay local and stay theirs.
+18. **Errors are one sentence** (`user_message`): what a `sync_*` call fails with, a folder's `detail`,
+    `sync_error` events and the hosting error are mapped from the wording the code writes itself (never from
+    the system's, which is localised) to a short text that names the other computer; the original goes to
+    the log. Pairing with a remote search server (`pair_remote`) answers the same way. Neither transport
+    formats errors with `{:?}` any more.
+19. **The host's list of clients is never taken for empty because it could not be read.** `clients.json` is
+    replaced by a rename, and on Windows a read can collide with that for an instant; a failed read used to
+    mean "nobody is paired" (every device turned away, and a change written back from an empty list).
 
 ## Still open
 
 - **By-hand checks on Windows** (W1's acceptance list): Explorer's overlay icons and menu entries on a real
   root, thumbnails and previews, an Office application and a media player on a synced folder, Windows Search,
   Storage Sense, Windows 10 1809; the WinUI windows clicked through; the installer rebuilt and its uninstaller
-  run. The list with what is already answered: `w0-cloud-files.md`. Known gaps: no navigation-pane entry /
-  "Status" column (that needs `StorageProviderSyncRootManager`), no `NOTIFY_DELETE` / `NOTIFY_RENAME`
-  callbacks, no badge on the tray icon (its tooltip and menu carry the state), no "kept on this PC" size per
-  folder, and a placeholder that was only touched or renamed keeps Explorer's "pending" mark until its next
-  push. Linux should work as is for the mirror.
+  run; what Explorer says when a delete in a read-only folder is refused. The list with what is already
+  answered: `w0-cloud-files.md`. Known gaps: no navigation-pane entry / "Status" column (that needs
+  `StorageProviderSyncRootManager`), no badge on the tray icon (its tooltip and menu carry the state), no
+  "kept on this PC" size per folder, and a placeholder that was only touched or renamed keeps Explorer's
+  "pending" mark until its next push. Linux should work as is for the mirror.
+- **Not rebuilt on a Mac** since the Windows bring-up: the Swift changes that mirror the Windows UI (the
+  join sheet's list of computers with "Forget", the name field's placeholder, the read-only line on a folder
+  card, "Restore as a copy" for readers) and the macOS branch that remounts a folder when its access changes.
 - **By-hand checks on a Mac** (A1's acceptance list): Finder copy in and out, Quick Look and column-view
   previews (does browsing read more than the first block?), TextEdit / Pages / Preview / an Office app saving
   on the volume, Spotlight staying out, macOS 14 and 15, Intel. The Cocoa save patterns that can be scripted
@@ -149,7 +179,9 @@ runs inside the app when `[[sync.hosted]]` has entries.
   connections, bandwidth limit, compression; ignored soak tests for throughput, a cut 5 GiB transfer and
   an hour-long idle stream.
 - `medialake-core/tests/sync.rs`: two cores (one hosting from the app, one joining with an invite code),
-  search toggling at runtime, sync enabling at runtime, error-state mapping, config compatibility; on macOS a
+  search toggling at runtime, sync enabling at runtime, error-state mapping and the sentences shown for
+  errors, config compatibility, the chosen name on both sides and through a rename, a removed device, a
+  change of access on the host and back; on macOS a
   mounted sync (placeholders, load on open, pin, write-through, leave keeping the downloaded files) and the
   fallback to a mirror; on Windows the same with a Cloud Files folder, plus the uninstall step.
 - `medialake-cloud/tests/frontend.rs` (any host): the frontend with the real engine and host over a
@@ -161,7 +193,8 @@ runs inside the app when `[[sync.hosted]]` has entries.
   temp folder): the same scenarios with Windows deciding what a placeholder is and when it is fetched, and
   what only Windows can show: a second program reading through the provider, a failing host, attribute
   pins from Explorer, a file that changed size, renames of placeholders, read-only placeholders, paths
-  beyond 260 characters, a session that stops and comes back.
+  beyond 260 characters, a session that stops and comes back, a read-only folder that other programs
+  cannot delete from, rename in or move out of (and can again when it becomes writable).
   From a Mac: `cargo check -p medialake-cloudapi --target x86_64-pc-windows-msvc --all-targets`.
 - `medialake-mount/tests/mount.rs` (macOS, really mounts): browsing fetches nothing, a read fetches a block,
   writes / rename-over / delete / junk files, host changes replace cached content, eviction and pins,

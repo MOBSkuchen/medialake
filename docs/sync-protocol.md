@@ -9,7 +9,10 @@ every request. `PROTO_VERSION` (embedding) is unchanged; sync has `SYNC_PROTO_VE
 ## Single calls
 
 `Action::Sync { auth, device, req }` → `Response::Sync(SyncResponse)`. `device` is the member's display name;
-it becomes the `author` of its changes and appears in conflict names.
+it becomes the `author` of its changes and appears in conflict names. When it differs from the name the host
+has for that client (the device was renamed), the host takes it over. In the other direction `Hello` answers
+with the name the host goes by now; the app asks every half minute, together with `ListSyncs`, whose
+`access` per sync is what the member runs a folder with from then on.
 
 | Request | Answer | Notes |
 |---|---|---|

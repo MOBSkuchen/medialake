@@ -117,6 +117,9 @@ fn print_report(name: &str, r: &Result<Report>) {
             if let Some(n) = r.held_deletes {
                 println!("{name}: {n} deletes are held back; `medialake-sync confirm-deletes {name}` lets them through");
             }
+            if r.became_read_only {
+                println!("{name}: the host lets this device only read now; what was changed here is put back (changed files are kept as copies)");
+            }
             for e in &r.errors {
                 eprintln!("{name}: {e}");
             }

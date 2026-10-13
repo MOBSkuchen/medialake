@@ -187,8 +187,10 @@ struct SyncPage: View {
             Text("This device").fontWeight(.semibold)
             HStack {
                 Text("Name shown to others").frame(width: 190, alignment: .leading)
-                TextField("", text: $model.deviceName).textFieldStyle(.roundedBorder).frame(width: 220)
+                TextField(model.systemName, text: $model.deviceName).textFieldStyle(.roundedBorder).frame(width: 220)
             }
+            Hint("Other computers list this device under this name, and it is part of the names of conflict copies. Empty means this Mac's own name.")
+                .font(.system(size: 12))
             LimitRow(title: "Limit upload speed", kbps: $model.uploadLimit)
             LimitRow(title: "Limit download speed", kbps: $model.downloadLimit)
             Button("Save") { Task { await model.saveSyncSettings() } }
@@ -253,6 +255,10 @@ private struct FolderCard: View {
                 Text("\(formatBytes(folder.cachedBytes)) kept on this Mac" + (folder.cacheLimitBytes > 0 ? " (up to \(formatBytes(folder.cacheLimitBytes)))" : ""))
                     .font(.system(size: 12)).opacity(0.6)
             }
+            if folder.readOnly {
+                Text("This device may only read this folder: files open as usual, changing and deleting them is refused.")
+                    .font(.system(size: 12)).opacity(0.6).fixedSize(horizontal: false, vertical: true)
+            }
             if !folder.notice.isEmpty {
                 HStack(alignment: .top, spacing: 6) {
                     Image(systemName: "info.circle")
@@ -315,19 +321,37 @@ struct JoinSheet: View {
     @State private var working = false
 
     private var selected: AvailableSyncRow? { available.first { $0.id == chosen } }
+    /// The computers to pick from: one that has removed this Mac is not offered (its folders, if any are
+    /// still joined, say what happened).
+    private var offered: [HostRow] { model.hosts.filter { $0.state != "revoked" } }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             Text("Add a synced folder").font(.title2).fontWeight(.semibold)
-            if !model.hosts.isEmpty {
+            if !offered.isEmpty {
                 HStack {
                     Text("Computer").frame(width: 90, alignment: .leading)
                     Picker("", selection: $hostId) {
                         Text("Choose…").tag("")
-                        ForEach(model.hosts) { h in Text("\(h.name)  (\(h.address))").tag(h.id) }
+                        ForEach(offered) { h in Text(h.label).tag(h.id) }
                     }
                     .labelsHidden().frame(width: 320)
-                    .onChange(of: hostId) { _, h in if !h.isEmpty { Task { await load(h) } } }
+                    .onChange(of: hostId) { _, h in
+                        if h.isEmpty {
+                            available = []
+                            chosen = ""
+                        } else {
+                            Task { await load(h) }
+                        }
+                    }
+                    // a computer that is no longer used (it stopped sharing, it was replaced) can go
+                    if let h = offered.first(where: { $0.id == hostId }), h.folders == 0 {
+                        Button("Forget") {
+                            let id = hostId
+                            hostId = ""
+                            Task { await model.forgetHost(id) }
+                        }
+                    }
                 }
                 Text("or paste an invitation code").opacity(0.6).font(.system(size: 12))
             }
@@ -386,6 +410,9 @@ struct JoinSheet: View {
             }
         }
         .padding(20).frame(width: 560)
+        // what is known shows at once; then each computer is asked, and one that has removed this Mac
+        // meanwhile drops out
+        .task { await model.checkHosts() }
     }
 
     private func connect() async {
@@ -408,6 +435,8 @@ struct JoinSheet: View {
         if !model.message.isEmpty { error = model.message }
         chosen = available.first(where: { !$0.joined })?.id ?? ""
         if let a = selected { location = SyncModel.defaultLocation(for: a.name) }
+        // a computer that turned this Mac away is off the list now: nothing stays selected
+        if !offered.contains(where: { $0.id == h }) { hostId = "" }
     }
 
     private func chooseLocation() {

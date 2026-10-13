@@ -68,7 +68,7 @@ fn main() {
         provider_id: *b"MediaLakeSpike01",
     };
     api.register(&root, &reg).expect("register the sync root");
-    let conn = api.connect(&root, Arc::new(Slow { delay: Duration::from_millis(250) })).expect("connect");
+    let conn = api.connect(&root, Arc::new(Slow { delay: Duration::from_millis(250) }), false).expect("connect");
     println!("registered and connected: {}", root.display());
 
     let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0);

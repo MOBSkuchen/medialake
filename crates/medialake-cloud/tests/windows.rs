@@ -123,6 +123,38 @@ impl Fx {
         Engine::new(cfg, fe, tr).unwrap()
     }
 
+    /// What the app does when the host changes this device's access: the same folder and engine state,
+    /// set up again as a reader or a writer.
+    fn set_access(&mut self, access: Access) {
+        let id = self.hs.id().to_string();
+        self.session.take().unwrap().stop();
+        self.tr = Arc::new(Counting {
+            inner: LocalTransport { host: self.hs.clone(), access, author: "PC".into() },
+            ranged: AtomicU64::new(0),
+            downloads: AtomicU64::new(0),
+            offline: Mutex::new(false),
+        });
+        let session = CloudSession::start(
+            CloudConfig { sync_id: id, name: "Docs".into(), root: self.root.clone(), read_only: access == Access::ReadOnly },
+            self.tr.clone(),
+        )
+        .expect("the folder again");
+        self.engine = Fx::engine(&self.base.join("state"), session.frontend(), self.tr.clone(), access);
+        self.session = Some(session);
+        self.access = access;
+    }
+
+    /// A command line run by another program, as the user's programs are.
+    fn other_program(&self, line: &str) -> String {
+        use std::os::windows::process::CommandExt;
+        let out = std::process::Command::new("cmd").raw_arg(format!("/s /c \"{line}\"")).output().expect("cmd");
+        format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr))
+    }
+
+    fn plain(&self, rel: &str) -> String {
+        self.p(rel).to_string_lossy().trim_start_matches(r"\\?\").to_string()
+    }
+
     fn host_write(&self, rel: &str, bytes: &[u8]) {
         let p = self.host_root.join(rel);
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
@@ -484,6 +516,96 @@ fn a_read_only_member_gets_read_only_files_and_edits_are_reverted() {
     fx.settle();
     assert_eq!(std::fs::read(fx.p("other.txt")).unwrap(), b"changed on the host");
     assert_eq!(fx.access, Access::ReadOnly);
+}
+
+#[test]
+fn a_read_only_folder_cannot_be_emptied_by_the_user_and_follows_the_host() {
+    let mut fx = Fx::with(Access::ReadOnly);
+    fx.host_write("a.txt", b"a");
+    fx.host_write("opened.txt", b"opened");
+    fx.host_write("album/one.txt", b"one");
+    fx.settle();
+    assert_eq!(std::fs::read(fx.p("opened.txt")).unwrap(), b"opened");
+
+    // the user's programs cannot delete, rename or move what belongs to the host
+    for line in [
+        format!("del \"{}\"", fx.plain("a.txt")),
+        format!("del /f \"{}\"", fx.plain("opened.txt")),
+        format!("ren \"{}\" b.txt", fx.plain("a.txt")),
+        format!("rmdir /s /q \"{}\"", fx.plain("album")),
+    ] {
+        let said = fx.other_program(&line);
+        assert!(fx.p("a.txt").exists() && fx.p("opened.txt").exists() && fx.p("album/one.txt").exists() && !fx.p("b.txt").exists(), "{line}: {said}");
+    }
+    fx.settle();
+    assert!(fx.host_root.join("a.txt").exists() && fx.host_root.join("album/one.txt").exists());
+
+    // what happens on the host still arrives: a change, a rename, a delete, a removed folder
+    fx.host_write("opened.txt", b"changed on the host");
+    std::fs::rename(fx.host_root.join("a.txt"), fx.host_root.join("renamed.txt")).unwrap();
+    std::fs::remove_dir_all(fx.host_root.join("album")).unwrap();
+    fx.settle();
+    assert_eq!(std::fs::read(fx.p("opened.txt")).unwrap(), b"changed on the host");
+    assert!(fx.p("renamed.txt").exists() && !fx.p("a.txt").exists() && !fx.p("album").exists());
+
+    // the host makes this device a writer: the files lose their write protection, and a delete travels
+    fx.set_access(Access::ReadWrite);
+    fx.eventually("the files are writable", || fx.state("renamed.txt").attributes & attr::READONLY == 0 && fx.state("opened.txt").attributes & attr::READONLY == 0);
+    assert!(fx.state("renamed.txt").in_sync && fx.state("renamed.txt").dehydrated, "{:?}", fx.state("renamed.txt"));
+    let said = fx.other_program(&format!("del \"{}\"", fx.plain("renamed.txt")));
+    assert!(!fx.p("renamed.txt").exists(), "{said}");
+    fx.settle();
+    assert!(!fx.host_root.join("renamed.txt").exists(), "a writer's delete reaches the host");
+
+    // and a reader again: write protection is back, on what was here before too
+    fx.set_access(Access::ReadOnly);
+    fx.eventually("the files are protected again", || fx.state("opened.txt").attributes & attr::READONLY != 0);
+    let said = fx.other_program(&format!("del /f \"{}\"", fx.plain("opened.txt")));
+    assert!(fx.p("opened.txt").exists(), "{said}");
+    assert_eq!(std::fs::read(fx.p("opened.txt")).unwrap(), b"changed on the host");
+}
+
+/// The engine's own writes meet write-protected files in a read-only folder: a file that is kept on this
+/// device is replaced when the host changes it, and leaving works both ways.
+#[test]
+fn a_read_only_folder_still_takes_the_hosts_changes_and_can_be_left() {
+    for keep in [true, false] {
+        let mut fx = Fx::with(Access::ReadOnly);
+        fx.host_write("kept.bin", &pattern(60_000, 1));
+        fx.host_write("opened.txt", b"opened");
+        fx.host_write("d/unseen.txt", b"unseen");
+        fx.settle();
+        let fe = fx.session.as_ref().unwrap().frontend();
+        fe.pin("kept.bin").unwrap();
+        fx.eventually("the kept file is fetched", || !fx.state("kept.bin").dehydrated);
+        assert_eq!(std::fs::read(fx.p("opened.txt")).unwrap(), b"opened");
+        fx.eventually("what is here is write-protected", || fx.state("kept.bin").attributes & attr::READONLY != 0 && fx.state("opened.txt").attributes & attr::READONLY != 0);
+
+        // the host changes the kept file: the new content is downloaded over the protected one
+        fx.host_write("kept.bin", &pattern(70_000, 2));
+        fx.settle();
+        assert_eq!(std::fs::read(fx.p("kept.bin")).unwrap(), pattern(70_000, 2));
+        let st = fx.state("kept.bin");
+        assert!(st.placeholder && st.in_sync && !st.dehydrated, "{st:?}");
+        fx.eventually("and is protected again", || fx.state("kept.bin").attributes & attr::READONLY != 0);
+
+        let root = fx.root.clone();
+        fx.session.take().unwrap().leave(keep).expect("leaving a read-only folder");
+        if keep {
+            // what was downloaded stays, as files of the user's own: no longer write-protected
+            assert_eq!(std::fs::read(root.join("kept.bin")).unwrap(), pattern(70_000, 2));
+            assert_eq!(std::fs::read(root.join("opened.txt")).unwrap(), b"opened");
+            assert!(!root.join("d").exists(), "a folder with nothing downloaded in it goes");
+            for name in ["kept.bin", "opened.txt"] {
+                let st = WinCloud.state(&root.join(name)).unwrap();
+                assert!(!st.placeholder && st.attributes & attr::READONLY == 0, "{name}: {st:?}");
+            }
+            std::fs::write(root.join("opened.txt"), b"mine now").unwrap();
+            std::fs::remove_file(root.join("kept.bin")).unwrap();
+        } else {
+            assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0, "nothing is left");
+        }
+    }
 }
 
 #[test]

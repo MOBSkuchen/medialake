@@ -23,4 +23,8 @@ pub enum Event {
     /// A conflict is waiting for a decision (policy "ask").
     SyncConflict { sync_id: String, name: String, path: String },
     SyncError { sync_id: String, message: String },
+    /// Something the Sync page shows changed without a folder changing state: `hosts` (a paired computer
+    /// was renamed or removed this device) or `access` (this device may now only read a folder, or
+    /// write to it again). The page reads the status again.
+    SyncChanged { what: String, sync_id: String },
 }

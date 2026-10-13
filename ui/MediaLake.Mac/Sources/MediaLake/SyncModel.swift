@@ -121,6 +121,13 @@ struct HostRow: Identifiable, Equatable {
     var id: String
     var name: String
     var address: String
+    /// `ok`, `unreachable`, `revoked` (that computer removed this Mac), or empty when it was not asked.
+    var state: String
+    /// Folders of this computer that are joined here.
+    var folders: Int
+
+    /// What the "add a folder" sheet lists it as.
+    var label: String { "\(name)  (\(address))" + (state == "unreachable" ? "  ·  not reachable right now" : "") }
 }
 
 struct BrowseRow: Identifiable, Equatable {
@@ -188,6 +195,8 @@ final class SyncModel: ObservableObject {
     @Published var hostingAddress = ""
     @Published var hostingError = ""
     @Published var deviceName = ""
+    /// What this Mac is called while no name is chosen (the name field's placeholder).
+    @Published var systemName = ""
     @Published var uploadLimit = 0
     @Published var downloadLimit = 0
     @Published var cacheLimitGb: [String: Int] = [:]
@@ -206,6 +215,7 @@ final class SyncModel: ObservableObject {
         guard let core else { return }
         guard let st = try? await core.callAsync("sync_status") else { return }
         enabled = st["enabled"] as? Bool ?? false
+        systemName = st.str("system_name")
         folders = ((st["syncs"] as? [[String: Any]]) ?? []).map(SyncFolder.init(json:))
         if let h = st["hosting"] as? [String: Any] {
             hostingRunning = h.flag("running")
@@ -226,7 +236,7 @@ final class SyncModel: ObservableObject {
                 }
             }
             if let h = try? await core.callAsync("sync_hosts") {
-                hosts = ((h["hosts"] as? [[String: Any]]) ?? []).map { HostRow(id: $0.str("id"), name: $0.str("name"), address: $0.str("address")) }
+                hosts = Self.hostRows(h)
             }
             if let c = try? await core.callAsync("sync_clients") {
                 clients = ((c["clients"] as? [[String: Any]]) ?? []).map {
@@ -294,6 +304,26 @@ final class SyncModel: ObservableObject {
             s["sync"] = sync
             _ = try await core.callAsync("set_settings", s)
         }
+    }
+
+    // MARK: paired computers
+
+    private static func hostRows(_ answer: [String: Any]) -> [HostRow] {
+        ((answer["hosts"] as? [[String: Any]]) ?? []).map {
+            HostRow(id: $0.str("id"), name: $0.str("name"), address: $0.str("address"), state: $0.str("state"), folders: Int($0.int("folders")))
+        }
+    }
+
+    /// Asks every paired computer whether it still knows this Mac (a few seconds at most). One that has
+    /// removed this Mac drops out of the list, or is marked if folders of it are still joined.
+    func checkHosts() async {
+        guard let core, let h = try? await core.callAsync("sync_hosts", ["check": true]) else { return }
+        hosts = Self.hostRows(h)
+    }
+
+    /// Takes a computer that is no longer used off the list (nothing of it may be joined).
+    func forgetHost(_ id: String) async {
+        _ = await run("forget") { _ = try await self.core!.callAsync("sync_forget_host", ["id": id]) }
     }
 
     // MARK: joining
