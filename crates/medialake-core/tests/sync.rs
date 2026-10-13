@@ -341,3 +341,21 @@ async fn a_cache_that_does_not_belong_to_the_engine_state_is_set_aside() {
     a.shutdown().await;
     b.shutdown().await;
 }
+
+/// Cloud Files is a Windows thing: elsewhere it is refused at join time, and "nothing to unregister" is
+/// a clean answer for the uninstall call.
+#[cfg(not(windows))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cloud_files_is_refused_off_windows_and_unregistering_nothing_is_fine() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    write_config(&home, "search_enabled = false\n[sync]\nenabled = true\n");
+    let core = Core::start(Paths::new(&home), StartOptions { no_watch: true, ..Default::default() }).await.unwrap();
+    let e = core.sync_join("nohost", "x", &tmp.path().join("f"), "cloud", "server_wins").await.unwrap_err();
+    assert!(e.contains("only available on Windows"), "{e}");
+    let (n, errors) = core.sync_unregister_roots().await;
+    assert_eq!((n, errors.len()), (0, 0));
+    // the sync was stopped by that call: starting it again is a settings change away
+    assert!(core.sync().is_err());
+    core.shutdown().await;
+}

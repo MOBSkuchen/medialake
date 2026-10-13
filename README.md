@@ -28,6 +28,8 @@ Supported platforms: Windows (WinUI 3) and macOS 14+ on Apple Silicon (SwiftUI +
 | `crates/medialake-server` | `medialake-server`: embedding server (`--local` child, `serve`, `pair`, `clients`, `bench`) |
 | `crates/medialake-sync` | file sync: host (watched folder, history), member engine, mirror frontend, `medialake-sync` CLI |
 | `crates/medialake-mount` | macOS: synced folders as a mounted volume (NFSv3 on loopback + sparse cache), see `docs/a0-macos-mount.md` |
+| `crates/medialake-cloudapi` | Windows: typed layer over the Cloud Files API (type-checks from any host; spike in `examples/`), see `docs/w0-cloud-files.md` |
+| `crates/medialake-cloud` | Windows: synced folders as a Cloud Files sync root (placeholders that fill in when opened); base version, not yet run on Windows |
 | `crates/medialake-core` | client logic + `medialake-cli` (diagnostics) |
 | `crates/medialake-ffi` | C ABI for the UI (`medialake_core_ffi.dll`; a static library on macOS) |
 | `ui/MediaLake.App` | Windows: WinUI 3 app (search window, tray, settings) |

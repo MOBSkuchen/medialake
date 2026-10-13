@@ -16,6 +16,9 @@
             <NavigationViewItem Content="Index" Tag="index">
                 <NavigationViewItem.Icon><FontIcon Glyph="&#xE8B7;" /></NavigationViewItem.Icon>
             </NavigationViewItem>
+            <NavigationViewItem Content="Sync" Tag="sync">
+                <NavigationViewItem.Icon><FontIcon Glyph="&#xE895;" /></NavigationViewItem.Icon>
+            </NavigationViewItem>
         </NavigationView.MenuItems>
 
         <Grid>
@@ -105,6 +108,9 @@
                     </Expander>
                 </StackPanel>
             </ScrollViewer>
+
+            <!-- ================= Sync ================= -->
+            <local:SyncPage x:Name="PageSync" xmlns:local="using:MediaLake" Visibility="Collapsed" />
 
             <!-- ================= Index ================= -->
             <ScrollViewer x:Name="PageIndex" Visibility="Collapsed">

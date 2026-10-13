@@ -43,6 +43,12 @@ public partial class App : Application
     protected override void OnLaunched(LaunchActivatedEventArgs args)
     {
         var argv = Environment.GetCommandLineArgs();
+        // the uninstaller's step: the synced folders go back to plain folders, then the app is gone
+        if (argv.Contains("--unregister-sync-roots"))
+        {
+            UnregisterSyncRootsAndExit();
+            return;
+        }
         var selfTest = argv.Contains("--selftest");
         var shotIdx = Array.IndexOf(argv, "--screenshot");
         var shot = shotIdx >= 0 && shotIdx + 1 < argv.Length ? argv[shotIdx + 1] : null;
@@ -78,6 +84,7 @@ public partial class App : Application
                 _main?.OnCoreEvent(ev);
                 _settings?.OnCoreEvent(ev);
                 _welcome?.OnCoreEvent(ev);
+                OnSyncEvent(ev);
             });
         }
 
@@ -105,6 +112,17 @@ public partial class App : Application
         _tray.Open += () => dq.TryEnqueue(Toggle);
         _tray.Settings += () => dq.TryEnqueue(ShowSettings);
         _tray.Quit += () => dq.TryEnqueue(Quit);
+        _tray.PauseAll += paused => dq.TryEnqueue(async () =>
+        {
+            try { await Core!.CallAsync(paused ? "sync_pause" : "sync_resume"); } catch { }
+            await RefreshSyncSummaryAsync();
+        });
+        _tray.BalloonClicked += () => dq.TryEnqueue(() =>
+        {
+            ShowSettings();
+            _settings?.SelectSync();
+        });
+        _ = RefreshSyncSummaryAsync();
 
         var waiter = new Thread(() =>
         {
@@ -147,6 +165,99 @@ public partial class App : Application
         }
         if (background) return;
         if (!ready || IsFirstRun()) _main?.ShowSearch();
+    }
+
+    // ---------- sync: tray lines and notifications ----------
+
+    private readonly Dictionary<string, DateTime> _notified = new();
+    private bool _summaryQueued;
+
+    private void OnSyncEvent(JsonElement ev)
+    {
+        var type = ev.GetProperty("type").GetString() ?? "";
+        if (!type.StartsWith("sync_")) return;
+        string Field(string n) => ev.TryGetProperty(n, out var v) && v.ValueKind == JsonValueKind.String ? v.GetString() ?? "" : "";
+        var name = Field("name") is { Length: > 0 } nm ? nm : "A synced folder";
+        switch (type)
+        {
+            case "sync_conflict":
+                Notify($"conflict-{name}-{Field("path")}", $"Conflict in {name}",
+                    $"{System.IO.Path.GetFileName(Field("path"))} was changed here and on another computer. Choose which version to keep.");
+                break;
+            case "sync_state":
+                switch (Field("state"))
+                {
+                    case "denied": Notify($"denied-{name}", $"{name} is no longer shared with you", "The computer that shares it withdrew access. Your downloaded files stay where they are."); break;
+                    case "disk_full": Notify($"full-{name}", "Your disk is full", $"{name} cannot be synced until some space is freed."); break;
+                    case "held": Notify($"held-{name}", $"Deletions in {name} are waiting", "Many files were removed here. Open Settings > Sync to confirm that they should be deleted everywhere."); break;
+                }
+                break;
+        }
+        if (_summaryQueued) return;
+        _summaryQueued = true;
+        _ = Task.Run(async () =>
+        {
+            await Task.Delay(500);
+            _main?.DispatcherQueue.TryEnqueue(async () =>
+            {
+                _summaryQueued = false;
+                await RefreshSyncSummaryAsync();
+            });
+        });
+    }
+
+    /// <summary>The same message at most every ten minutes.</summary>
+    private void Notify(string id, string title, string text)
+    {
+        if (_notified.TryGetValue(id, out var t) && DateTime.UtcNow - t < TimeSpan.FromMinutes(10)) return;
+        _notified[id] = DateTime.UtcNow;
+        _tray?.Balloon(title, text);
+    }
+
+    private async Task RefreshSyncSummaryAsync()
+    {
+        try
+        {
+            var st = await Core!.CallAsync("sync_status");
+            var enabled = st.TryGetProperty("enabled", out var en) && en.GetBoolean();
+            var lines = new List<string>();
+            var attention = st.TryGetProperty("conflicts", out var c) && c.ValueKind == JsonValueKind.Number && c.GetInt64() > 0;
+            var busy = false;
+            var allPaused = true;
+            if (enabled && st.TryGetProperty("syncs", out var syncs) && syncs.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var s in syncs.EnumerateArray())
+                {
+                    var state = s.TryGetProperty("state", out var sv) ? sv.GetString() ?? "" : "";
+                    var name = s.TryGetProperty("name", out var nv) ? nv.GetString() ?? "" : "";
+                    lines.Add($"{name}: {SyncPage.StateText(s)}");
+                    busy |= state == "syncing";
+                    attention |= state is "conflict" or "held" or "offline" or "denied" or "disk_full" or "error";
+                    allPaused &= s.TryGetProperty("paused", out var pv) && pv.ValueKind == JsonValueKind.True;
+                }
+            }
+            var tip = attention ? "MediaLake: needs attention" : busy ? "MediaLake: syncing" : "MediaLake";
+            _tray?.SetSync(lines.ToArray(), lines.Count > 0 && allPaused, tip);
+        }
+        catch { /* the next event tries again */ }
+    }
+
+    /// <summary>The uninstaller's step: no window, no single-instance check; the core does the work.</summary>
+    private static void UnregisterSyncRootsAndExit()
+    {
+        try
+        {
+            var opts = new { server_exe = Path.Combine(AppContext.BaseDirectory, "medialake-server.exe") };
+            var core = CoreClient.Create(Environment.GetEnvironmentVariable("MEDIALAKE_HOME"), opts);
+            var r = core.Call("sync_unregister_roots");
+            LogLine("unregister sync roots: " + r);
+            core.Dispose();
+        }
+        catch (Exception ex)
+        {
+            LogLine("unregister sync roots failed: " + ex.Message);
+        }
+        Environment.Exit(0);
     }
 
     /// <summary>The welcome window (shortcut and model, then sync); <paramref name="page"/> is 0 or 1.</summary>

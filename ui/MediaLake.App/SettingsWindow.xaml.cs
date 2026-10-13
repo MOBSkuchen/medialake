@@ -38,6 +38,7 @@ public sealed partial class SettingsWindow : Window
     public SettingsWindow()
     {
         InitializeComponent();
+        PageSync.OwnerHwnd = WinRT.Interop.WindowNative.GetWindowHandle(this);
         SystemBackdrop = new Microsoft.UI.Xaml.Media.MicaBackdrop();
         AppWindow.Resize(new Windows.Graphics.SizeInt32(960, 720));
         AppWindow.SetIcon(System.IO.Path.Combine(AppContext.BaseDirectory, "Assets", "MediaLake.ico"));
@@ -50,6 +51,9 @@ public sealed partial class SettingsWindow : Window
 
     public FrameworkElement RootElement => Nav;
     public void SelectPage(int i) => Nav.SelectedItem = Nav.MenuItems[i];
+
+    /// <summary>Opens the Sync page (a notification was clicked).</summary>
+    public void SelectSync() => Nav.SelectedItem = Nav.MenuItems.OfType<NavigationViewItem>().First(i => (i.Tag as string) == "sync");
 
     // ---------- load / save ----------
 
@@ -163,6 +167,7 @@ public sealed partial class SettingsWindow : Window
 
     public void OnCoreEvent(JsonElement ev)
     {
+        PageSync.OnCoreEvent(ev);
         switch (ev.GetProperty("type").GetString())
         {
             case "download":
@@ -186,7 +191,9 @@ public sealed partial class SettingsWindow : Window
         PageGeneral.Visibility = tag == "general" ? Visibility.Visible : Visibility.Collapsed;
         PageModel.Visibility = tag == "model" ? Visibility.Visible : Visibility.Collapsed;
         PageIndex.Visibility = tag == "index" ? Visibility.Visible : Visibility.Collapsed;
+        PageSync.Visibility = tag == "sync" ? Visibility.Visible : Visibility.Collapsed;
         if (tag == "index") _ = RefreshStatsAsync();
+        if (tag == "sync") _ = PageSync.RefreshAsync();
     }
 
     // ---------- General ----------
@@ -304,6 +311,10 @@ public sealed partial class SettingsWindow : Window
             XamlRoot = Content.XamlRoot,
         };
         if (await dlg.ShowAsync() != ContentDialogResult.Primary) return;
+        // leave the synced folders first: hydrated files stay as ordinary files, placeholders go, the
+        // sync roots are unregistered (the uninstaller runs the same step once more, for the case that it
+        // is started from Windows Settings)
+        try { await App.Core!.CallAsync("sync_unregister_roots"); } catch { }
         System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(uninstaller) { UseShellExecute = true });
         ((App)Application.Current).QuitApp();
     }

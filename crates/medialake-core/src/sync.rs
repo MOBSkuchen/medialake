@@ -19,6 +19,7 @@ use medialake_sync::member::engine::{Choice, ConflictPolicy, Report};
 use medialake_sync::member::frontend::{Frontend, Mirror};
 use medialake_sync::member::transport::{HostClient, HostCreds, Transport, pair_ex};
 use medialake_sync::member::{MemberConfig, MemberStore, RunningSync};
+use medialake_cloud::{CloudConfig, CloudFrontend, CloudSession};
 #[cfg(target_os = "macos")]
 use medialake_mount::{MountConfig, MountSession, Store as MountStore, mountctl};
 use serde::Serialize;
@@ -166,6 +167,9 @@ pub struct SyncManager {
     status: Arc<Mutex<HashMap<String, SyncStatus>>>,
     hosting: tokio::sync::Mutex<Option<Hosting>>,
     hosting_error: Mutex<String>,
+    /// Windows: one connected sync root per cloud sync (and its frontend, for browsing and pinning).
+    clouds: Mutex<HashMap<String, CloudSession>>,
+    cloud_fes: Mutex<HashMap<String, Arc<CloudFrontend>>>,
     #[cfg(target_os = "macos")]
     mounts: tokio::sync::Mutex<HashMap<String, MountSession>>,
     #[cfg(target_os = "macos")]
@@ -231,6 +235,8 @@ impl SyncManager {
             status: Arc::new(Mutex::new(HashMap::new())),
             hosting: tokio::sync::Mutex::new(None),
             hosting_error: Mutex::new(String::new()),
+            clouds: Mutex::new(HashMap::new()),
+            cloud_fes: Mutex::new(HashMap::new()),
             #[cfg(target_os = "macos")]
             mounts: tokio::sync::Mutex::new(HashMap::new()),
             #[cfg(target_os = "macos")]
@@ -349,6 +355,10 @@ impl SyncManager {
     pub async fn stop(&self) {
         let runs: Vec<RunningSync> = self.running.lock().unwrap().drain().map(|(_, r)| r).collect();
         let _ = tokio::task::spawn_blocking(move || drop(runs)).await;
+        // sync roots stay registered (placeholders keep their place); only the connections go
+        self.cloud_fes.lock().unwrap().clear();
+        let sessions: Vec<CloudSession> = self.clouds.lock().unwrap().drain().map(|(_, s)| s).collect();
+        let _ = tokio::task::spawn_blocking(move || drop(sessions)).await;
         #[cfg(target_os = "macos")]
         {
             let ids: Vec<String> = self.mounts.lock().await.keys().cloned().collect();
@@ -402,13 +412,16 @@ impl SyncManager {
         match f.frontend.as_str() {
             "mirror" => "mirror",
             "mount" => "mount",
+            "cloud" => "cloud",
             _ => {
                 let dir = self.store.state_dir(&f.sync_id);
                 match std::fs::read_to_string(dir.join("frontend")).ok().as_deref().map(str::trim) {
                     Some("mount") => "mount",
+                    Some("cloud") => "cloud",
                     Some("mirror") => "mirror",
                     _ if dir.join("state.db").exists() => "mirror",
                     _ if cfg!(target_os = "macos") => "mount",
+                    _ if cfg!(windows) => "cloud",
                     _ => "mirror",
                 }
             }
@@ -440,6 +453,15 @@ impl SyncManager {
     async fn frontend_for(&self, f: &SyncFolderCfg, tr: Arc<dyn Transport>) -> (Arc<dyn Frontend>, &'static str, String) {
         let kind = self.resolved_frontend(f);
         let _ = &tr;
+        if kind == "cloud" {
+            return match self.ensure_cloud(f, tr.clone()).await {
+                Ok(fe) => (fe, "cloud", String::new()),
+                Err(e) => {
+                    tracing::warn!("Cloud Files for {} failed: {e}", f.name);
+                    (Arc::new(Mirror::new(&f.path)), "mirror", format!("Could not use Cloud Files for {}: {e}. It is shown as a normal folder instead.", f.path.display()))
+                }
+            };
+        }
         #[cfg(target_os = "macos")]
         if kind == "mount" {
             return match self.ensure_mount(f, tr).await {
@@ -457,8 +479,31 @@ impl SyncManager {
         (Arc::new(Mirror::new(&f.path)), "mirror", String::new())
     }
 
+    /// The sync root of a Cloud Files sync: registered, connected, placeholders served. Off Windows this is
+    /// an error (and the caller shows a mirror).
+    async fn ensure_cloud(&self, f: &SyncFolderCfg, tr: Arc<dyn Transport>) -> Result<Arc<dyn Frontend>, String> {
+        if let Some(fe) = self.cloud_fes.lock().unwrap().get(&f.sync_id) {
+            return Ok(fe.clone());
+        }
+        let cfg = CloudConfig { sync_id: f.sync_id.clone(), name: f.name.clone(), root: f.path.clone(), read_only: f.access != "rw" };
+        let session = tokio::task::spawn_blocking(move || CloudSession::start(cfg, tr))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| format!("{e:#}"))?;
+        let fe = session.frontend();
+        self.cloud_fes.lock().unwrap().insert(f.sync_id.clone(), fe.clone());
+        self.clouds.lock().unwrap().insert(f.sync_id.clone(), session);
+        Ok(fe)
+    }
+
     /// The volume of a paused sync stays up.
     async fn ensure_volume_only(&self, f: &SyncFolderCfg) {
+        if self.resolved_frontend(f) == "cloud" {
+            if let Ok(client) = self.client(&f.host_id) {
+                let tr: Arc<dyn Transport> = Arc::new(client.transport(&f.sync_id));
+                let _ = self.ensure_cloud(f, tr).await;
+            }
+        }
         #[cfg(target_os = "macos")]
         if self.resolved_frontend(f) == "mount" {
             if let Ok(client) = self.client(&f.host_id) {
@@ -737,6 +782,8 @@ impl SyncManager {
             "mirror" => "mirror",
             "mount" if cfg!(target_os = "macos") => "mount",
             "mount" => return Err("mounting is only available on macOS".into()),
+            "cloud" if cfg!(windows) => "cloud",
+            "cloud" => return Err("Cloud Files is only available on Windows".into()),
             other => return Err(format!("unknown frontend {other:?}")),
         };
         let client = self.client(host_id)?;
@@ -773,6 +820,15 @@ impl SyncManager {
     pub async fn leave(&self, sync_id: &str, keep_files: bool) -> Result<(), String> {
         let f = self.folder(sync_id)?;
         self.stop_folder(&f.sync_id).await;
+        // a Cloud Files root: what was downloaded becomes ordinary files (or goes), the placeholders go
+        let session = self.clouds.lock().unwrap().remove(&f.sync_id);
+        self.cloud_fes.lock().unwrap().remove(&f.sync_id);
+        if let Some(session) = session {
+            tokio::task::spawn_blocking(move || session.leave(keep_files))
+                .await
+                .map_err(|e| e.to_string())?
+                .map_err(|e| format!("leaving {}: {e:#}", f.name))?;
+        }
         // a mount goes away; what was downloaded is kept as plain files if asked for
         #[cfg(target_os = "macos")]
         {
@@ -949,6 +1005,22 @@ impl SyncManager {
         if !rel.is_empty() {
             normalize_path(rel).map_err(|e| e.to_string())?;
         }
+        if let Some(fe) = self.cloud_fes.lock().unwrap().get(&f.sync_id).cloned() {
+            let items = fe.browse(rel).map_err(|e| format!("{e:#}"))?;
+            return Ok(items
+                .into_iter()
+                .map(|i| BrowseItem {
+                    name: i.name,
+                    path: i.path,
+                    is_dir: i.is_dir,
+                    size: i.size,
+                    mtime: i.mtime_ms,
+                    state: i.state.into(),
+                    pinned: i.pinned,
+                    cached_bytes: if i.state == "cached" || i.state == "local" || i.state == "dirty" { i.size } else { 0 },
+                })
+                .collect());
+        }
         #[cfg(target_os = "macos")]
         if let Some(store) = self.stores.lock().unwrap().get(&f.sync_id).cloned() {
             let items = store.browse(rel).map_err(|e| format!("{e:#}"))?;
@@ -998,6 +1070,9 @@ impl SyncManager {
         if !rel.is_empty() {
             normalize_path(rel).map_err(|e| e.to_string())?;
         }
+        if let Some(fe) = self.cloud_fes.lock().unwrap().get(&f.sync_id).cloned() {
+            return fe.pin(rel).map_err(|e| format!("{e:#}"));
+        }
         #[cfg(target_os = "macos")]
         if let Some(store) = self.stores.lock().unwrap().get(&f.sync_id).cloned() {
             return store.pin(rel).map_err(|e| format!("{e:#}"));
@@ -1010,6 +1085,9 @@ impl SyncManager {
     pub fn unpin(&self, sync_id: &str, rel: &str, evict_now: bool) -> Result<(), String> {
         let f = self.folder(sync_id)?;
         let rel = rel.trim_matches('/');
+        if let Some(fe) = self.cloud_fes.lock().unwrap().get(&f.sync_id).cloned() {
+            return fe.unpin(rel, evict_now).map_err(|e| format!("{e:#}"));
+        }
         #[cfg(target_os = "macos")]
         if let Some(store) = self.stores.lock().unwrap().get(&f.sync_id).cloned() {
             store.unpin(rel).map_err(|e| format!("{e:#}"))?;
@@ -1313,4 +1391,24 @@ impl SyncManager {
         drop(g);
         tokio::task::spawn_blocking(move || hs.snapshot_now().map_err(|e| format!("{e:#}"))).await.map_err(|e| e.to_string())?
     }
+}
+
+/// Uninstall (Windows): turns every Cloud Files sync root of this configuration back into plain folders and
+/// unregisters it. Hydrated files stay, placeholders without content go. Needs no network and no running
+/// sync. Returns `(folder, error)` for the roots that could not be handled.
+pub fn unregister_cloud_roots(cfg: &Config, data_root: &Path) -> (usize, Vec<(String, String)>) {
+    let state = data_root.join("sync");
+    let (mut done, mut errors) = (0, vec![]);
+    for f in &cfg.sync.folders {
+        let kind = std::fs::read_to_string(state.join(&f.sync_id).join("frontend")).unwrap_or_default();
+        let is_cloud = f.frontend == "cloud" || kind.trim() == "cloud";
+        if !is_cloud {
+            continue;
+        }
+        match medialake_cloud::leave_root_default(&f.path, true) {
+            Ok(()) => done += 1,
+            Err(e) => errors.push((f.path.display().to_string(), format!("{e:#}"))),
+        }
+    }
+    (done, errors)
 }

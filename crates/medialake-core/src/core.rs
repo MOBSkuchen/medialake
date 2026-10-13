@@ -399,7 +399,11 @@ impl Core {
         let ids: Vec<i64> = hits.iter().map(|h| h.0).collect();
         let info = self.store.lock().unwrap().chunk_info(&ids).unwrap_or_default();
         let r = Ranking { floor: cfg.score_floor, ceiling: cfg.score_ceiling, threshold: cfg.threshold, relative_cut: cfg.relative_cut, max_results: cfg.max_results };
-        Ok(search::rank(&hits, &info, &r))
+        let mut out = search::rank(&hits, &info, &r);
+        for h in out.iter_mut() {
+            h.available = !self.indexer.would_download(std::path::Path::new(&h.path));
+        }
+        Ok(out)
     }
 
     // ---------- directories / settings ----------
@@ -611,6 +615,17 @@ impl Core {
     }
 
     // ---------- sync ----------
+
+    /// Uninstall: disconnects the sync, then unregisters the Cloud Files roots (see
+    /// [`crate::sync::unregister_cloud_roots`]). Works whether or not sync is enabled.
+    pub async fn sync_unregister_roots(&self) -> (usize, Vec<(String, String)>) {
+        let m = self.sync.lock().unwrap().take();
+        if let Some(m) = m {
+            m.stop().await;
+        }
+        let (cfg, root) = (self.config(), self.paths.root.clone());
+        tokio::task::spawn_blocking(move || crate::sync::unregister_cloud_roots(&cfg, &root)).await.unwrap_or((0, vec![]))
+    }
 
     /// The sync manager, or why there is none.
     pub fn sync(&self) -> Result<Arc<SyncManager>, String> {

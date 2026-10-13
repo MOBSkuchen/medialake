@@ -27,7 +27,8 @@ Local file, data, media search based on embeddings.
 - Conflicts never discard a version; backups (time snapshots or last N versions, content-addressed) live on the host.
 - The engine is platform-free; a frontend only shows the result: a plain mirror folder (everywhere), or on macOS a
   mounted volume whose files load when opened (an NFSv3 server inside the app, mounted by the system; nothing to
-  install). Windows Cloud Files is the planned equivalent.
+  install), or on Windows a Cloud Files sync root whose placeholders fill in when opened (base version, not yet
+  run on Windows: `w0-cloud-files.md`).
 - Searching a synced folder never downloads it: files that are not on this device are indexed by name and get their
   content embedding once something else has fetched them.
 

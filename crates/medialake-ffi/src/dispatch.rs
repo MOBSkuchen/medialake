@@ -103,6 +103,11 @@ async fn sync_call(core: &std::sync::Arc<Core>, method: &str, args: Value) -> Re
             core.set_config(c).await.map_err(|e| e.to_string())?;
             Ok(json!({ "enabled": core.config().sync.enabled }))
         }
+        // uninstall on Windows: the sync roots go back to plain folders; needs no running sync
+        "sync_unregister_roots" => {
+            let (n, errors) = core.sync_unregister_roots().await;
+            Ok(json!({ "unregistered": n, "errors": errors.into_iter().map(|(p, e)| json!({ "path": p, "error": e })).collect::<Vec<_>>() }))
+        }
         "sync_status" => match core.sync() {
             Ok(m) => Ok(json!({ "enabled": true, "syncs": m.status(), "conflicts": m.conflicts().len(), "hosting": m.hosting_status().await })),
             Err(_) => Ok(json!({ "enabled": false, "syncs": [], "conflicts": 0 })),

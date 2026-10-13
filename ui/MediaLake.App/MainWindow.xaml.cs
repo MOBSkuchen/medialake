@@ -28,6 +28,8 @@ public sealed class ResultItem : INotifyPropertyChanged
     public string Snippet { get; set; } = "";
     public string Modality { get; set; } = "";
     public string ScoreText { get; set; } = "";
+    /// False for a file that is not on this computer (OneDrive, a synced folder): a thumbnail would download it.
+    public bool Available { get; set; } = true;
     public string Glyph { get; set; } = "";
     public Brush BadgeBrush { get; set; } = new SolidColorBrush(Color.FromArgb(255, 107, 114, 128));
     public Visibility SnippetVisibility => Snippet.Length > 0 ? Visibility.Visible : Visibility.Collapsed;
@@ -65,6 +67,7 @@ public sealed class ResultItem : INotifyPropertyChanged
             Snippet = r.GetProperty("snippet").GetString() ?? "",
             Modality = modality,
             ScoreText = $"{r.GetProperty("score").GetDouble() * 100:0}%",
+            Available = !r.TryGetProperty("available", out var av) || av.GetBoolean(),
             BadgeBrush = BadgeFor(modality),
             Glyph = modality switch
             {
@@ -254,6 +257,8 @@ public sealed partial class MainWindow : Window
 
     private static async Task LoadThumbAsync(ResultItem item)
     {
+        // a thumbnail reads the file: for a placeholder that would download it, so the glyph stays
+        if (!item.Available) return;
         try
         {
             var f = await StorageFile.GetFileFromPathAsync(item.Path);

@@ -14,6 +14,8 @@ final class ResultItem: ObservableObject, Identifiable {
     let snippet: String
     let modality: String
     let scoreText: String
+    /// False for a file that is not on this Mac (a synced folder's placeholder): a preview would download it.
+    let available: Bool
     @Published var thumb: NSImage?
 
     init(json r: [String: Any]) {
@@ -23,6 +25,7 @@ final class ResultItem: ObservableObject, Identifiable {
         snippet = r["snippet"] as? String ?? ""
         modality = r["modality"] as? String ?? "other"
         scoreText = String(format: "%.0f%%", ((r["score"] as? Double) ?? 0) * 100)
+        available = r["available"] as? Bool ?? true
     }
 
     var badgeColor: Color {
@@ -57,6 +60,11 @@ final class ResultItem: ObservableObject, Identifiable {
 
     func loadThumbnail() {
         let url = URL(fileURLWithPath: path)
+        // reading the file for a preview would fetch it: the file's icon (from its name) is enough
+        guard available else {
+            thumb = NSWorkspace.shared.icon(forFile: url.path)
+            return
+        }
         let req = QLThumbnailGenerator.Request(fileAt: url, size: CGSize(width: 44, height: 44), scale: 2, representationTypes: .all)
         Task { [weak self] in
             let image: NSImage

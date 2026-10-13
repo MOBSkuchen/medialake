@@ -57,6 +57,17 @@ pub struct Indexer {
     gate: RwLock<Option<Arc<dyn ContentGate>>>,
 }
 
+#[cfg(windows)]
+fn os_would_download(path: &Path) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    std::fs::symlink_metadata(path).map(|m| medialake_cloud::attr::would_download(m.file_attributes())).unwrap_or(false)
+}
+
+#[cfg(not(windows))]
+fn os_would_download(_path: &Path) -> bool {
+    false
+}
+
 fn key(p: &Path) -> String {
     p.to_string_lossy().to_lowercase()
 }
@@ -126,8 +137,11 @@ impl Indexer {
         *self.gate.write().unwrap() = gate;
     }
 
-    fn dehydrated(&self, path: &Path) -> bool {
-        self.gate.read().unwrap().as_ref().is_some_and(|g| g.would_download(path))
+    /// Reading `path` would first fetch it from somewhere: a sync volume says so through the gate, and on
+    /// Windows any file carrying the recall attributes (this also keeps an index run from downloading a
+    /// OneDrive folder) does.
+    pub fn would_download(&self, path: &Path) -> bool {
+        os_would_download(path) || self.gate.read().unwrap().as_ref().is_some_and(|g| g.would_download(path))
     }
 
     pub fn start_workers(self: &Arc<Self>, n: usize) {
@@ -341,7 +355,7 @@ impl Indexer {
         let need_name = old_name.map(|c| c.chunk_hash != name_hash).unwrap_or(true);
 
         // a file of a sync volume that has not been downloaded: name only, for now
-        let dehydrated = self.dehydrated(path);
+        let dehydrated = self.would_download(path);
         if let Some(f) = &existing {
             let unchanged = f.size == size && f.mtime == mtime && f.modality == modality.as_str() && !need_name;
             let settled = if f.status == "deferred" { dehydrated } else { f.status != "error" };

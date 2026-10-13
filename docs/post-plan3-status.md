@@ -1,7 +1,9 @@
 # File sync: implementation status
 
 Implements `post-plan3.md`: the engine and host (**S0–S5**), the backend half of **X2**, and the macOS
-side (**A0–A2**, with the macOS half of **X1**). Not started: Windows Cloud Files and its UI (W0–W2).
+side (**A0–A2**, with the macOS half of **X1**), and a **base version of the Windows side** (**W0–W2**,
+the Windows half of **X1** and **X2**): Cloud Files frontend, WinUI Sync page, tray, uninstall. The Windows
+side has never run: `w0-cloud-files.md` is its checklist.
 Everything below runs and is tested on a Mac, with no model loaded. Wire format: `sync-protocol.md`; the
 mount decision and measurements: `a0-macos-mount.md`.
 
@@ -17,6 +19,10 @@ mount decision and measurements: `a0-macos-mount.md`.
 | A0 spike: macOS mount | Done: built-in NFSv3 loopback chosen; macFUSE / FUSE-T not installed here, so not measured | `a0-macos-mount.md`, `crates/medialake-mount/spike/` |
 | A1 mount frontend | Done: browse offline, load on open (block-wise), upload on save, evict under the limit, pin, crash cleanup, fallback to a mirror. Finder / Office checks by hand are not done (see below) | `crates/medialake-mount/`, `medialake-core/src/sync.rs` |
 | A2 macOS UI + installer | Done: Sync page, status item, notifications, two-page welcome window (search with optional shortcut, then sync), uninstall. Verified by building and by driving the real app binary; not clicked through by a person. A pkg was built, not notarised | `ui/MediaLake.Mac/Sources/MediaLake/Sync*.swift`, `installer/macos/` |
+| W0 spike: Cloud Files | Base version: spike program written (`examples/spike.rs`), cfapi layer type-checks for `windows-msvc`; **not run on Windows** | `crates/medialake-cloudapi/`, `w0-cloud-files.md` |
+| W1 Cloud Files frontend | Base version: placeholders from the host's listing, FETCH_DATA from the transport, pin / free up, in-sync marking, leave; engine contract tested over a stand-in platform. **Not run on Windows** | `crates/medialake-cloud/` |
+| W2 WinUI Sync page, tray, toasts, uninstall | Base version, **never compiled** (no .NET SDK on the dev Mac) | `ui/MediaLake.App/SyncPage.xaml(.cs)`, `Native/Shell.cs`, `App.xaml.cs`, `installer/medialake.iss` |
+| X1 search integration (Windows) | Recall-attribute check in the indexer for every folder (OneDrive too) and `available` on search hits (no thumbnail that downloads); unrun on Windows | `indexer.rs` (`os_would_download`), `search.rs` |
 | X1 search integration (macOS) | Done in code: indexing never downloads, name-only entries are upgraded once fetched. Needs a model to exercise end to end, which was not run | `indexer.rs` (`ContentGate`), `watcher.rs`, `sync.rs` (`would_download`) |
 
 ## Try it
@@ -103,14 +109,13 @@ runs inside the app when `[[sync.hosted]]` has entries.
 
 ## Still open
 
-- **Windows** (W0–W2): Cloud Files frontend and WinUI page. The `Frontend` trait now has what an on-demand
-  frontend needs (`lazy`, `meta_path`, `place_placeholder`, `content_hash`, `note_content`, ranged
-  `Transport::read_range`), so it is a frontend plus UI. The mirror uses plain `std::fs`; `\\?\` long paths
-  are not added, and nothing was run on Windows. Linux should work as is for the mirror.
-  The welcome window, the search hint, the optional shortcut and the installer without a shortcut page were
-  also written for the WinUI app (`WelcomeWindow.xaml`, `MainWindow`, `App.xaml.cs`, `medialake.iss`) **without
-  a .NET SDK at hand: that code has not been compiled or run.** Its sync page is a minimal join form; the
-  Windows Sync settings page (W2) does not exist yet.
+- **Windows**: everything W0–W2 has to be built and run on a Windows machine: the cfapi layer and the
+  frontend have never executed, the WinUI files (welcome window, search hint, optional shortcut, Sync
+  page, tray, uninstall step, installer without a shortcut page) have never been compiled. Start with
+  `w0-cloud-files.md`. Known gaps: no navigation-pane entry / "Status" column (that needs
+  `StorageProviderSyncRootManager`), no `NOTIFY_DELETE` / `NOTIFY_RENAME` callbacks, no browse dialog (pin
+  and free up are done in Explorer), the mirror uses plain `std::fs` and adds no `\\?\` long paths.
+  Linux should work as is for the mirror.
 - **By-hand checks on a Mac** (A1's acceptance list): Finder copy in and out, Quick Look and column-view
   previews (does browsing read more than the first block?), TextEdit / Pages / Preview / an Office app saving
   on the volume, Spotlight staying out, macOS 14 and 15, Intel. The Cocoa save patterns that can be scripted
@@ -139,6 +144,12 @@ runs inside the app when `[[sync.hosted]]` has entries.
   search toggling at runtime, sync enabling at runtime, error-state mapping, config compatibility; on macOS a
   mounted sync (placeholders, load on open, pin, write-through, leave keeping the downloaded files) and the
   fallback to a mirror.
+- `medialake-cloud/tests/frontend.rs` (any host): the frontend with the real engine and host over a
+  stand-in for Cloud Files: placeholders without fetching, a lost state database not downloading anything,
+  edits and new files pushed and converted, remote changes freeing clean placeholders, pins, renames and
+  deletes, leaving (with and without keeping), refusing a non-empty folder, uninstall without a connection.
+  `medialake-cloudapi`: identity blob, transfer planner, callback paths, recall attributes.
+  Windows layer: `cargo check -p medialake-cloudapi --target x86_64-pc-windows-msvc --all-targets`.
 - `medialake-mount/tests/mount.rs` (macOS, really mounts): browsing fetches nothing, a read fetches a block,
   writes / rename-over / delete / junk files, host changes replace cached content, eviction and pins,
   read-only, conflicts keep both, offline, parallel readers, `touch` does not download, a Cocoa process's

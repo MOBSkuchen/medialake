@@ -51,6 +51,9 @@ Filename: "{app}\{#AppExe}"; Description: "Start MediaLake now"; Flags: nowait p
 [UninstallRun]
 Filename: "{sys}\taskkill.exe"; Parameters: "/F /IM {#AppExe}"; Flags: runhidden; RunOnceId: "KillApp"
 Filename: "{sys}\taskkill.exe"; Parameters: "/F /IM medialake-server.exe"; Flags: runhidden; RunOnceId: "KillServer"
+; the synced folders go back to plain folders (hydrated files stay, placeholders go) and their sync roots are
+; unregistered; after the kills, so that no second instance is running
+Filename: "{app}\{#AppExe}"; Parameters: "--unregister-sync-roots"; Flags: runhidden waituntilterminated; RunOnceId: "UnregisterSyncRoots"
 
 [Code]
 { The keyboard shortcut and the model are chosen in the "Welcome to MediaLake" window that the app shows
