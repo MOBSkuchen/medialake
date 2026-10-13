@@ -145,11 +145,17 @@ enum Hotkey {
 
 @MainActor
 final class StatusItemController: NSObject {
-    private let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+    private let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private let menu = NSMenu()
     var onOpen: (() -> Void)?
     var onSettings: (() -> Void)?
     var onQuit: (() -> Void)?
+    var onPauseAll: ((Bool) -> Void)?
+
+    // what the sync part of the menu shows
+    private var syncLines: [String] = []
+    private var allPaused = false
+    private var hasSyncs = false
 
     init(tooltip: String) {
         super.init()
@@ -158,23 +164,52 @@ final class StatusItemController: NSObject {
                 ?? NSImage(systemSymbolName: "magnifyingglass", accessibilityDescription: "MediaLake")
             img?.isTemplate = true
             button.image = img
+            button.imagePosition = .imageLeading
             button.toolTip = tooltip
             button.target = self
             button.action = #selector(clicked)
             button.sendAction(on: [.leftMouseUp, .rightMouseUp])
         }
+        rebuildMenu()
+    }
+
+    func setTooltip(_ s: String) { item.button?.toolTip = s }
+
+    /// One line per sync, "Pause all", and a badge next to the icon: orange dot = needs a decision or
+    /// an error, blue arrows = transferring.
+    func updateSync(lines: [String], allPaused: Bool, attention: Bool, busy: Bool) {
+        syncLines = lines
+        hasSyncs = !lines.isEmpty
+        self.allPaused = allPaused
+        rebuildMenu()
+        guard let button = item.button else { return }
+        let (glyph, color): (String, NSColor) = attention ? (" ●", .systemOrange) : busy ? (" ↻", .systemBlue) : ("", .labelColor)
+        button.attributedTitle = NSAttributedString(string: glyph, attributes: [.foregroundColor: color, .font: NSFont.systemFont(ofSize: 11)])
+    }
+
+    private func rebuildMenu() {
+        menu.removeAllItems()
         for (title, sel) in [("Open MediaLake", #selector(openAction)), ("Settings…", #selector(settingsAction))] {
             let mi = NSMenuItem(title: title, action: sel, keyEquivalent: "")
             mi.target = self
             menu.addItem(mi)
+        }
+        if hasSyncs {
+            menu.addItem(.separator())
+            for l in syncLines {
+                let mi = NSMenuItem(title: l, action: nil, keyEquivalent: "")
+                mi.isEnabled = false
+                menu.addItem(mi)
+            }
+            let pause = NSMenuItem(title: allPaused ? "Resume all syncing" : "Pause all syncing", action: #selector(pauseAction), keyEquivalent: "")
+            pause.target = self
+            menu.addItem(pause)
         }
         menu.addItem(.separator())
         let quit = NSMenuItem(title: "Quit MediaLake", action: #selector(quitAction), keyEquivalent: "")
         quit.target = self
         menu.addItem(quit)
     }
-
-    func setTooltip(_ s: String) { item.button?.toolTip = s }
 
     @objc private func clicked() {
         if NSApp.currentEvent?.type == .rightMouseUp {
@@ -189,6 +224,7 @@ final class StatusItemController: NSObject {
     @objc private func openAction() { onOpen?() }
     @objc private func settingsAction() { onSettings?() }
     @objc private func quitAction() { onQuit?() }
+    @objc private func pauseAction() { onPauseAll?(!allPaused) }
 }
 
 // MARK: - File actions, login item, folder access

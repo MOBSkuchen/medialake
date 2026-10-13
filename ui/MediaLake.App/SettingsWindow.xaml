@@ -16,6 +16,9 @@
             <NavigationViewItem Content="Index" Tag="index">
                 <NavigationViewItem.Icon><FontIcon Glyph="&#xE8B7;" /></NavigationViewItem.Icon>
             </NavigationViewItem>
+            <NavigationViewItem Content="Sync" Tag="sync">
+                <NavigationViewItem.Icon><FontIcon Glyph="&#xE895;" /></NavigationViewItem.Icon>
+            </NavigationViewItem>
         </NavigationView.MenuItems>
 
         <Grid>
@@ -24,16 +27,23 @@
                 <StackPanel Padding="32,24" Spacing="20" MaxWidth="720" HorizontalAlignment="Left">
                     <TextBlock Text="General" Style="{StaticResource TitleTextBlockStyle}" />
 
+                    <StackPanel Spacing="4">
+                        <ToggleSwitch x:Name="SearchSwitch" Header="Search my files by content" Toggled="Search_Toggled" />
+                        <TextBlock Opacity="0.7" TextWrapping="Wrap"
+                                   Text="Turn this off to use MediaLake only for syncing: no search model is loaded and nothing is indexed." />
+                    </StackPanel>
+
                     <StackPanel Spacing="6">
-                        <TextBlock Text="Global shortcut" FontWeight="SemiBold" />
-                        <TextBlock Text="Press this shortcut anywhere to open the search window." Opacity="0.7" />
+                        <TextBlock Text="Global shortcut (optional)" FontWeight="SemiBold" />
+                        <TextBlock Text="Press this shortcut anywhere to open the search window. Without one, use the icon in the notification area." Opacity="0.7" />
                         <StackPanel Orientation="Horizontal" Spacing="12">
                             <Border x:Name="HotkeyBox" BorderThickness="1" CornerRadius="4" Padding="14,8" MinWidth="220" IsTabStop="True"
                                     BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}"
                                     Background="{ThemeResource ControlFillColorDefaultBrush}"
                                     KeyDown="HotkeyBox_KeyDown" GotFocus="HotkeyBox_GotFocus" LostFocus="HotkeyBox_LostFocus" Tapped="HotkeyBox_Tapped">
-                                <TextBlock x:Name="HotkeyText" Text="Ctrl+Alt+Space" />
+                                <TextBlock x:Name="HotkeyText" Text="Not set" />
                             </Border>
+                            <Button x:Name="HotkeyRemove" Content="Remove" Click="HotkeyRemove_Click" Visibility="Collapsed" VerticalAlignment="Center" />
                             <TextBlock x:Name="HotkeyHint" Text="Click, then press the new combination" VerticalAlignment="Center" Opacity="0.6" />
                         </StackPanel>
                         <TextBlock x:Name="HotkeyError" Foreground="{ThemeResource SystemFillColorCriticalBrush}" />
@@ -104,6 +114,9 @@
                     </Expander>
                 </StackPanel>
             </ScrollViewer>
+
+            <!-- ================= Sync ================= -->
+            <local:SyncPage x:Name="PageSync" xmlns:local="using:MediaLake" Visibility="Collapsed" />
 
             <!-- ================= Index ================= -->
             <ScrollViewer x:Name="PageIndex" Visibility="Collapsed">

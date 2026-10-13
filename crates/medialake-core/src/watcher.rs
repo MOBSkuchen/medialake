@@ -6,22 +6,14 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
-use notify::event::{ModifyKind, RenameMode};
-use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::mpsc;
 
 use crate::config::{Config, IndexedDir};
 use crate::extract;
 use crate::indexer::Indexer;
 
-#[derive(Debug)]
-enum Change {
-    Touched(PathBuf),
-    Removed(PathBuf),
-    RenamedFrom(PathBuf),
-    RenamedTo(PathBuf),
-    Renamed(PathBuf, PathBuf),
-}
+use medialake_sync::watch::{FsChange as Change, normalize};
 
 pub struct FileWatcher {
     watcher: std::sync::Mutex<RecommendedWatcher>,
@@ -30,6 +22,10 @@ pub struct FileWatcher {
     /// or a symlinked home folder. FSEvents reports resolved paths, the index uses the configured ones.
     #[cfg(target_os = "macos")]
     aliases: Arc<std::sync::Mutex<Vec<(PathBuf, PathBuf)>>>,
+    /// Mounted sync volumes: (cache tree, mount point). FSEvents does not report changes inside an NFS
+    /// mount, so the local tree behind it is watched and its paths are mapped to the mount point.
+    #[cfg(target_os = "macos")]
+    mounts: Arc<std::sync::Mutex<Vec<(PathBuf, PathBuf)>>>,
 }
 
 impl FileWatcher {
@@ -39,54 +35,23 @@ impl FileWatcher {
         let aliases: Arc<std::sync::Mutex<Vec<(PathBuf, PathBuf)>>> = Default::default();
         #[cfg(target_os = "macos")]
         let event_aliases = aliases.clone();
+        #[cfg(target_os = "macos")]
+        let mounts: Arc<std::sync::Mutex<Vec<(PathBuf, PathBuf)>>> = Default::default();
+        #[cfg(target_os = "macos")]
+        let event_mounts = mounts.clone();
         let watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-            let Ok(ev) = res else { return };
+            #[allow(unused_mut)]
+            let Ok(mut ev) = res else { return };
             tracing::debug!("fs event {:?} {:?}", ev.kind, ev.paths);
             #[cfg(target_os = "macos")]
-            let ev_paths: Vec<PathBuf> = {
+            {
                 let a = event_aliases.lock().unwrap();
-                ev.paths.into_iter().map(|p| unalias(&a, p)).collect()
-            };
-            #[cfg(not(target_os = "macos"))]
-            let ev_paths = ev.paths;
-            let mut paths = ev_paths.into_iter();
-            match ev.kind {
-                EventKind::Create(_) | EventKind::Modify(ModifyKind::Data(_)) | EventKind::Modify(ModifyKind::Any) | EventKind::Modify(ModifyKind::Metadata(_)) => {
-                    for p in paths {
-                        let _ = tx.send(Change::Touched(p));
-                    }
-                }
-                EventKind::Modify(ModifyKind::Name(RenameMode::Both)) => {
-                    if let (Some(a), Some(b)) = (paths.next(), paths.next()) {
-                        let _ = tx.send(Change::Renamed(a, b));
-                    }
-                }
-                EventKind::Modify(ModifyKind::Name(RenameMode::From)) => {
-                    for p in paths {
-                        let _ = tx.send(Change::RenamedFrom(p));
-                    }
-                }
-                EventKind::Modify(ModifyKind::Name(RenameMode::To)) => {
-                    for p in paths {
-                        let _ = tx.send(Change::RenamedTo(p));
-                    }
-                }
-                EventKind::Modify(ModifyKind::Name(_)) => {
-                    for p in paths {
-                        // FSEvents reports a rename as an unpaired name change on each path: the one
-                        // that still exists is the new name, the missing one the old name.
-                        #[cfg(target_os = "macos")]
-                        let _ = tx.send(if p.symlink_metadata().is_ok() { Change::RenamedTo(p) } else { Change::RenamedFrom(p) });
-                        #[cfg(not(target_os = "macos"))]
-                        let _ = tx.send(Change::Touched(p));
-                    }
-                }
-                EventKind::Remove(_) => {
-                    for p in paths {
-                        let _ = tx.send(Change::Removed(p));
-                    }
-                }
-                _ => {}
+                let m = event_mounts.lock().unwrap();
+                ev.paths = std::mem::take(&mut ev.paths).into_iter().map(|p| unalias(&a, unalias(&m, p))).collect();
+            }
+            // rename pairing and the FSEvents special case live in medialake-sync, shared with sync
+            for ch in normalize(ev) {
+                let _ = tx.send(ch);
             }
         })?;
         let fw = Arc::new(FileWatcher {
@@ -94,6 +59,8 @@ impl FileWatcher {
             watched: std::sync::Mutex::new(vec![]),
             #[cfg(target_os = "macos")]
             aliases,
+            #[cfg(target_os = "macos")]
+            mounts,
         });
 
         // debouncer: path -> due time; ticks every 250 ms
@@ -156,6 +123,24 @@ impl FileWatcher {
             }
         });
         Ok(fw)
+    }
+
+    /// Replaces the set of mounted sync volumes whose cache trees stand in for the mount points.
+    #[cfg(target_os = "macos")]
+    pub fn set_mounts(&self, pairs: &[(PathBuf, PathBuf)]) {
+        let mut w = self.watcher.lock().unwrap();
+        let mut cur = self.mounts.lock().unwrap();
+        for (tree, _) in cur.iter() {
+            let _ = w.unwatch(tree);
+        }
+        cur.clear();
+        for (tree, point) in pairs {
+            let canon = tree.canonicalize().unwrap_or_else(|_| tree.clone());
+            match w.watch(&canon, RecursiveMode::Recursive) {
+                Ok(()) => cur.push((canon, point.clone())),
+                Err(e) => tracing::warn!("cannot watch {}: {e}", tree.display()),
+            }
+        }
     }
 
     /// Replaces the set of watched roots.

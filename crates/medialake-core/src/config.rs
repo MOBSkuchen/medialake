@@ -31,10 +31,123 @@ pub struct RemoteCreds {
     pub secret_protected: String,
 }
 
+/// A host this device is paired with for sync. The secret is protected like `RemoteCreds::secret_protected`.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+pub struct SyncHostCfg {
+    pub id: String,
+    pub name: String,
+    pub address: String,
+    pub fingerprint: String,
+    pub client_id: String,
+    pub secret_protected: String,
+}
+
+/// A sync this device is a member of.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(default)]
+pub struct SyncFolderCfg {
+    pub sync_id: String,
+    pub host_id: String,
+    pub name: String,
+    pub path: PathBuf,
+    /// `auto` = Cloud Files / mount where available; `mirror` = a plain folder with full copies.
+    pub frontend: String,
+    /// `server_wins` or `ask`
+    pub conflict: String,
+    /// `rw` or `ro`, as granted by the host when joining.
+    pub access: String,
+    pub cache_limit_gb: u64,
+    pub index_for_search: bool,
+    pub paused: bool,
+}
+
+impl Default for SyncFolderCfg {
+    fn default() -> Self {
+        SyncFolderCfg {
+            sync_id: String::new(),
+            host_id: String::new(),
+            name: String::new(),
+            path: PathBuf::new(),
+            frontend: "auto".into(),
+            conflict: "server_wins".into(),
+            access: "rw".into(),
+            cache_limit_gb: 10,
+            index_for_search: true,
+            paused: false,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(default)]
+pub struct SyncHostingCfg {
+    pub bind: String,
+    /// Empty = this computer's name.
+    pub public_addr: String,
+}
+
+impl Default for SyncHostingCfg {
+    fn default() -> Self {
+        SyncHostingCfg { bind: "0.0.0.0:47900".into(), public_addr: String::new() }
+    }
+}
+
+/// File sync (§9). Off by default: an existing install behaves exactly as before.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(default)]
+pub struct SyncConfig {
+    pub enabled: bool,
+    /// Shown in conflict names and on the host. Empty = this computer's name.
+    pub device_name: String,
+    pub debounce_ms: u64,
+    /// 0 = unlimited. (Stored; enforcement is part of the polish phase.)
+    pub upload_limit_kbps: u64,
+    pub download_limit_kbps: u64,
+    pub hosts: Vec<SyncHostCfg>,
+    pub folders: Vec<SyncFolderCfg>,
+    /// Folders this device hosts for others.
+    pub hosted: Vec<medialake_sync::host::config::HostedConfig>,
+    pub hosting: SyncHostingCfg,
+}
+
+impl Default for SyncConfig {
+    fn default() -> Self {
+        SyncConfig {
+            enabled: false,
+            device_name: String::new(),
+            debounce_ms: 2_000,
+            upload_limit_kbps: 0,
+            download_limit_kbps: 0,
+            hosts: vec![],
+            folders: vec![],
+            hosted: vec![],
+            hosting: SyncHostingCfg::default(),
+        }
+    }
+}
+
+impl SyncConfig {
+    pub fn device(&self) -> String {
+        if self.device_name.trim().is_empty() {
+            medialake_proto::platform::host_name("MediaLake device")
+        } else {
+            self.device_name.clone()
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(default)]
 pub struct Config {
+    /// `false` = no model, no indexer, no watcher, no search; the app is only a sync client / host.
+    pub search_enabled: bool,
+    pub sync: SyncConfig,
+    /// The global shortcut to show the search window. Empty = none: nobody has to set one.
     pub hotkey: String,
+    /// The welcome window (shortcut, model, sync) has been dealt with, by finishing or skipping it.
+    /// A config file from before this existed counts as done; only "no config at all" is a first run.
+    #[serde(default = "welcome_done_for_old_files")]
+    pub welcome_done: bool,
     /// The embedding model; changing it (or the quality) re-indexes everything.
     pub model: Model,
     pub quality: Quality,
@@ -61,12 +174,21 @@ pub struct Config {
     pub relative_cut: f32,
 }
 
+/// What a config file without `welcome_done` means: it was written by a version that had no welcome
+/// window, so the user is not new.
+fn welcome_done_for_old_files() -> bool {
+    true
+}
+
 impl Default for Config {
     fn default() -> Self {
         let model = Model::default();
         let cal = model.calibration();
         Config {
-            hotkey: if cfg!(target_os = "macos") { "Alt+Space" } else { "Ctrl+Alt+Space" }.into(),
+            search_enabled: true,
+            sync: SyncConfig::default(),
+            hotkey: String::new(),
+            welcome_done: false,
             model,
             quality: Quality::Normal,
             server_mode: ServerMode::Local,
@@ -155,9 +277,48 @@ impl Paths {
 
 /// Strips the verbatim path prefix that `canonicalize` adds on Windows.
 pub fn normalize_path(p: &Path) -> PathBuf {
-    let s = p.to_string_lossy();
-    match s.strip_prefix(r"\\?\") {
-        Some(rest) if !rest.starts_with("UNC\\") => PathBuf::from(rest),
-        _ => p.to_path_buf(),
+    medialake_sync::util::plain_path(p)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_fresh_install_has_no_shortcut_and_has_not_seen_the_welcome_window() {
+        let d = tempfile::tempdir().unwrap();
+        let c = Config::load(&d.path().join("config.toml")).unwrap();
+        assert!(!c.welcome_done);
+        assert_eq!(c.hotkey, "");
+    }
+
+    #[test]
+    fn a_config_from_before_the_welcome_window_counts_as_done() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("config.toml");
+        // what the Windows installer used to write, and what an older app saved
+        std::fs::write(&p, "hotkey = \"Ctrl+Alt+Space\"\n").unwrap();
+        let c = Config::load(&p).unwrap();
+        assert!(c.welcome_done);
+        assert_eq!(c.hotkey, "Ctrl+Alt+Space");
+        std::fs::write(&p, "threshold = 0.5\n").unwrap();
+        assert!(Config::load(&p).unwrap().welcome_done);
+    }
+
+    #[test]
+    fn the_welcome_flag_and_an_empty_shortcut_round_trip() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("config.toml");
+        let mut c = Config::default();
+        c.save(&p).unwrap();
+        let back = Config::load(&p).unwrap();
+        assert!(!back.welcome_done, "a saved first-run config is still a first run");
+        assert_eq!(back.hotkey, "");
+        c.welcome_done = true;
+        c.hotkey = "Ctrl+Space".into();
+        c.save(&p).unwrap();
+        let back = Config::load(&p).unwrap();
+        assert!(back.welcome_done);
+        assert_eq!(back.hotkey, "Ctrl+Space");
     }
 }

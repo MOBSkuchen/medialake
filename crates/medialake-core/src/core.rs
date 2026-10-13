@@ -18,6 +18,7 @@ use crate::events::Event;
 use crate::indexer::Indexer;
 use crate::remote::{RemoteBackend, RemoteConn};
 use crate::search::{self, Ranking, SearchHit};
+use crate::sync::{SyncManager, SyncPairResult};
 use crate::store::Store;
 use crate::supervisor::{Backend, ServerState, Supervisor, SupervisorConfig};
 use crate::vindex::VectorIndex;
@@ -50,6 +51,13 @@ pub struct Status {
     pub quality: String,
     pub mode: String,
     pub by_status: Vec<(String, u64)>,
+    /// Whether search can be used: `ready`, `no_model` (local mode and the selected model is not
+    /// downloaded) or `off` (search is switched off). Every UI shows its "not set up" hint from this.
+    pub search: String,
+    /// The selected model is on this computer (or a remote server provides one), whether or not search is on.
+    pub model_ready: bool,
+    /// A model download is running (it keeps running when the window that started it is closed).
+    pub downloading: bool,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -76,13 +84,14 @@ pub struct Core {
     pub vindex: Arc<VectorIndex>,
     pub client: Arc<EmbedClient>,
     pub indexer: Arc<Indexer>,
-    watcher: Option<Arc<FileWatcher>>,
+    watcher: Mutex<Option<Arc<FileWatcher>>>,
     events: broadcast::Sender<Event>,
     active: Mutex<Active>,
     opts: StartOptions,
     model_dir: PathBuf,
     download_cancel: Arc<AtomicBool>,
     downloading: AtomicBool,
+    sync: Mutex<Option<Arc<SyncManager>>>,
 }
 
 fn default_server_exe() -> PathBuf {
@@ -97,6 +106,7 @@ impl Core {
     pub async fn start(paths: Paths, opts: StartOptions) -> anyhow::Result<Arc<Core>> {
         paths.ensure()?;
         let cfg = Config::load(&paths.config_file)?;
+        let search_on = cfg.search_enabled;
         let store = Store::open(&paths.db_file)?;
 
         // changing model or quality invalidates every vector
@@ -127,9 +137,13 @@ impl Core {
         let cfg = Arc::new(RwLock::new(cfg));
 
         let indexer = Indexer::new(store.clone(), vindex.clone(), client.clone(), cfg.clone(), events.clone());
+        // workers wait for work: they are always there, search "off" just keeps them paused
         indexer.start_workers(opts.workers.unwrap_or(2));
+        if !search_on {
+            indexer.set_paused(true);
+        }
 
-        let watcher = if opts.no_watch {
+        let watcher = if opts.no_watch || !search_on {
             None
         } else {
             let w = FileWatcher::start(indexer.clone(), cfg.clone())?;
@@ -144,19 +158,20 @@ impl Core {
             vindex,
             client,
             indexer,
-            watcher,
+            watcher: Mutex::new(watcher),
             events,
             active: Mutex::new(Active { supervisor: None, remote: None, rx: idle_rx, forwarder: None }),
             opts,
             model_dir,
             download_cancel: Arc::new(AtomicBool::new(false)),
             downloading: AtomicBool::new(false),
+            sync: Mutex::new(None),
         });
 
         // pick the server: a paired remote one if configured, otherwise the bundled local one
         let c = core.config();
         let mut started_remote = false;
-        if c.server_mode == ServerMode::Remote {
+        if search_on && c.server_mode == ServerMode::Remote {
             match c.remote.as_ref().map(RemoteConn::from_creds) {
                 Some(Ok(conn)) => {
                     core.attach_remote(conn);
@@ -169,15 +184,23 @@ impl Core {
                 None => {}
             }
         }
-        if !started_remote {
+        if search_on && !started_remote {
             core.attach_local();
         }
 
         // catch up on whatever changed while we were not running
-        let me = core.clone();
-        tokio::spawn(async move {
-            me.indexer.reconcile().await;
-        });
+        if search_on {
+            let me = core.clone();
+            tokio::spawn(async move {
+                me.indexer.reconcile().await;
+            });
+        }
+        if core.config().sync.enabled {
+            if let Err(e) = core.start_sync().await {
+                tracing::error!("sync: {e}");
+                let _ = core.events.send(Event::Error { message: format!("Sync could not start: {e}") });
+            }
+        }
         Ok(core)
     }
 
@@ -361,6 +384,9 @@ impl Core {
     // ---------- search ----------
 
     pub async fn search(&self, query: &str) -> Result<Vec<SearchHit>, ClientError> {
+        if !self.config().search_enabled {
+            return Err(ClientError::Rejected("search is turned off".into()));
+        }
         let query = query.trim();
         if query.is_empty() {
             return Ok(vec![]);
@@ -373,7 +399,11 @@ impl Core {
         let ids: Vec<i64> = hits.iter().map(|h| h.0).collect();
         let info = self.store.lock().unwrap().chunk_info(&ids).unwrap_or_default();
         let r = Ranking { floor: cfg.score_floor, ceiling: cfg.score_ceiling, threshold: cfg.threshold, relative_cut: cfg.relative_cut, max_results: cfg.max_results };
-        Ok(search::rank(&hits, &info, &r))
+        let mut out = search::rank(&hits, &info, &r);
+        for h in out.iter_mut() {
+            h.available = !self.indexer.would_download(std::path::Path::new(&h.path));
+        }
+        Ok(out)
     }
 
     // ---------- directories / settings ----------
@@ -399,9 +429,50 @@ impl Core {
         Ok(())
     }
 
+    /// Search switched on or off while running: server, watcher and indexer follow. Off leaves the index
+    /// on disk untouched.
+    async fn apply_search_toggle(&self, on: bool) {
+        if on {
+            self.indexer.set_paused(false);
+            if !self.opts.no_watch && self.watcher.lock().unwrap().is_none() {
+                match FileWatcher::start(self.indexer.clone(), self.cfg.clone()) {
+                    Ok(w) => {
+                        w.set_dirs(&self.cfg.read().unwrap().dirs);
+                        *self.watcher.lock().unwrap() = Some(w);
+                        self.refresh_mount_watch();
+                    }
+                    Err(e) => {
+                        let _ = self.events.send(Event::Error { message: format!("Cannot watch folders: {e}") });
+                    }
+                }
+            }
+            let c = self.config();
+            let remote = if c.server_mode == ServerMode::Remote { c.remote.as_ref().map(RemoteConn::from_creds) } else { None };
+            match remote {
+                Some(Ok(conn)) => self.attach_remote(conn),
+                Some(Err(e)) => {
+                    let _ = self.events.send(Event::Error { message: format!("Remote server credentials unusable: {e}") });
+                    self.attach_local();
+                }
+                None => self.attach_local(),
+            }
+            self.indexer.reconcile().await;
+        } else {
+            self.indexer.set_paused(true);
+            self.indexer.save_if_dirty();
+            *self.watcher.lock().unwrap() = None;
+            self.deactivate();
+            let (tx, rx) = watch::channel(ServerState::Idle);
+            self.client.switch(rx.clone(), None);
+            let mut a = self.active.lock().unwrap();
+            a.rx = rx;
+            drop(tx);
+        }
+    }
+
     /// Re-syncs the watcher and the store with the configured directories.
     async fn apply_dirs(&self) {
-        if let Some(w) = &self.watcher {
+        if let Some(w) = self.watcher.lock().unwrap().as_ref() {
             w.set_dirs(&self.cfg.read().unwrap().dirs);
         }
         self.indexer.reconcile().await;
@@ -414,12 +485,24 @@ impl Core {
         let mut new = new;
         new.server_mode = old.server_mode;
         new.remote = old.remote.clone();
+        // hosts, joined and hosted syncs are changed by their own calls (they hold secrets and state)
+        new.sync.hosts = old.sync.hosts.clone();
+        new.sync.folders = old.sync.folders.clone();
+        new.sync.hosted = old.sync.hosted.clone();
         // a remote server dictates the model; locally the score mapping follows the model
         let wanted = if new.server_mode == ServerMode::Local { new.model } else { old.model };
         new.model = old.model;
         new.set_model(wanted);
         *self.cfg.write().unwrap() = new.clone();
         self.save_config()?;
+        self.apply_sync_settings(&old, &new).await;
+        if old.search_enabled != new.search_enabled {
+            self.apply_search_toggle(new.search_enabled).await;
+            return Ok(false);
+        }
+        if !new.search_enabled {
+            return Ok(false);
+        }
         let mut reindex = false;
         if (old.model != new.model || old.quality != new.quality) && new.server_mode == ServerMode::Local {
             self.client.expect_model(new.model);
@@ -531,6 +614,132 @@ impl Core {
         r
     }
 
+    // ---------- sync ----------
+
+    /// Uninstall: disconnects the sync, then unregisters the Cloud Files roots (see
+    /// [`crate::sync::unregister_cloud_roots`]). Works whether or not sync is enabled.
+    pub async fn sync_unregister_roots(&self) -> (usize, Vec<(String, String)>) {
+        let m = self.sync.lock().unwrap().take();
+        if let Some(m) = m {
+            m.stop().await;
+        }
+        let (cfg, root) = (self.config(), self.paths.root.clone());
+        tokio::task::spawn_blocking(move || crate::sync::unregister_cloud_roots(&cfg, &root)).await.unwrap_or((0, vec![]))
+    }
+
+    /// The sync manager, or why there is none.
+    pub fn sync(&self) -> Result<Arc<SyncManager>, String> {
+        self.sync.lock().unwrap().clone().ok_or_else(|| "sync is turned off (Settings > Sync)".to_string())
+    }
+
+    async fn start_sync(&self) -> Result<(), String> {
+        if self.sync.lock().unwrap().is_some() {
+            return Ok(());
+        }
+        let m = SyncManager::new(self.cfg.clone(), self.paths.config_file.clone(), self.paths.root.clone(), self.events.clone())
+            .map_err(|e| format!("{e:#}"))?;
+        *self.sync.lock().unwrap() = Some(m.clone());
+        m.start().await;
+        self.indexer.set_gate(Some(m.clone()));
+        self.refresh_mount_watch();
+        // folders of joined syncs are indexed like any other folder
+        if self.config().search_enabled {
+            let folders = self.config().sync.folders;
+            for f in folders.into_iter().filter(|f| f.index_for_search) {
+                let _ = self.add_dir(f.path, true).await;
+            }
+        }
+        Ok(())
+    }
+
+    /// Starts or stops sync when `sync.enabled` changed, and tells a running manager about new settings.
+    async fn apply_sync_settings(&self, old: &Config, new: &Config) {
+        if old.sync.enabled != new.sync.enabled {
+            if new.sync.enabled {
+                if let Err(e) = self.start_sync().await {
+                    let _ = self.events.send(Event::Error { message: format!("Sync could not start: {e}") });
+                }
+            } else {
+                let s = self.sync.lock().unwrap().take();
+                self.indexer.set_gate(None);
+                if let Some(s) = s {
+                    s.stop().await;
+                }
+                self.refresh_mount_watch();
+            }
+        } else if old.sync.upload_limit_kbps != new.sync.upload_limit_kbps || old.sync.download_limit_kbps != new.sync.download_limit_kbps {
+            if let Ok(s) = self.sync() {
+                s.apply_limits();
+            }
+        }
+        if old.sync.enabled == new.sync.enabled
+            && (old.sync.device_name != new.sync.device_name || old.sync.hosting != new.sync.hosting)
+        {
+            if let Ok(s) = self.sync() {
+                s.reset_clients();
+                if let Err(e) = s.ensure_hosting().await {
+                    let _ = self.events.send(Event::Error { message: e });
+                }
+            }
+        }
+    }
+
+    /// Pairs with a host for sync. A code that also grants embedding fills the embedding server
+    /// credentials too (without switching to it).
+    pub async fn sync_pair(&self, code: &str) -> Result<SyncPairResult, String> {
+        let m = self.sync()?;
+        let (result, host) = m.pair(code).await?;
+        if result.embedding && self.cfg.read().unwrap().remote.is_none() {
+            if let Ok(sec) = crate::remote::unprotect(&host.secret_protected) {
+                if let Ok(prot) = crate::remote::protect(&sec) {
+                    self.cfg.write().unwrap().remote = Some(crate::config::RemoteCreds {
+                        address: host.address.clone(),
+                        fingerprint: host.fingerprint.clone(),
+                        client_id: host.client_id.clone(),
+                        secret_protected: prot,
+                    });
+                    let _ = self.save_config();
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    /// Tells the file watcher which cache trees stand behind mounted sync volumes (FSEvents does not
+    /// report changes inside an NFS mount).
+    fn refresh_mount_watch(&self) {
+        #[cfg(target_os = "macos")]
+        {
+            let pairs = self.sync().map(|m| m.mount_trees()).unwrap_or_default();
+            if let Some(w) = self.watcher.lock().unwrap().as_ref() {
+                w.set_mounts(&pairs);
+            }
+        }
+    }
+
+    pub async fn sync_join(&self, host_id: &str, sync_id: &str, path: &std::path::Path, frontend: &str, conflict: &str) -> Result<crate::config::SyncFolderCfg, String> {
+        let m = self.sync()?;
+        let f = m.join(host_id, sync_id, path, frontend, conflict).await?;
+        self.refresh_mount_watch();
+        if f.index_for_search && self.config().search_enabled {
+            let _ = self.add_dir(f.path.clone(), true).await;
+        }
+        Ok(f)
+    }
+
+    pub async fn sync_leave(&self, sync_id: &str, keep_files: bool) -> Result<(), String> {
+        let m = self.sync()?;
+        let path = self.config().sync.folders.iter().find(|f| f.sync_id == sync_id || f.name == sync_id).map(|f| f.path.clone());
+        m.leave(sync_id, keep_files).await?;
+        self.refresh_mount_watch();
+        if let Some(p) = path {
+            if self.config().dirs.iter().any(|d| d.path == p) {
+                let _ = self.remove_dir(&p).await;
+            }
+        }
+        Ok(())
+    }
+
     // ---------- status / lifecycle ----------
 
     pub fn status(&self) -> Status {
@@ -560,10 +769,34 @@ impl Core {
                 ServerMode::Remote => "remote".into(),
             },
             by_status,
+            search: self.search_state().into(),
+            model_ready: self.model_ready(),
+            downloading: self.downloading.load(Ordering::SeqCst),
         }
     }
 
+    /// `ready`, `no_model` or `off`; see [`Status::search`].
+    pub fn search_state(&self) -> &'static str {
+        if !self.config().search_enabled {
+            "off"
+        } else if self.model_ready() {
+            "ready"
+        } else {
+            "no_model"
+        }
+    }
+
+    /// A remote server brings its own model; locally the selected model and quality must be downloaded.
+    pub fn model_ready(&self) -> bool {
+        let c = self.config();
+        c.server_mode == ServerMode::Remote || crate::models::is_downloaded(&self.model_dir, c.model, c.quality)
+    }
+
     pub async fn shutdown(&self) {
+        let sync = self.sync.lock().unwrap().take();
+        if let Some(s) = sync {
+            s.stop().await;
+        }
         self.indexer.set_paused(true);
         self.indexer.save_if_dirty();
         let sup = self.active.lock().unwrap().supervisor.clone();

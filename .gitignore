@@ -5,4 +5,5 @@ target/
 *.log
 /poc/
 *.lock
+.claude/
 .DS_Store

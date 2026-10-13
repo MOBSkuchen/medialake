@@ -23,6 +23,9 @@ pub struct SearchHit {
     pub segment: i64,
     pub mtime: i64,
     pub size: u64,
+    /// The file is on this computer. False for a placeholder (OneDrive, a synced folder): showing a thumbnail
+    /// of it would download it, so the UI shows the file's icon instead.
+    pub available: bool,
 }
 
 /// Raw cosines are model specific (EmbeddingGemma: unrelated ~0.50-0.66, relevant ~0.65-0.80;
@@ -78,6 +81,7 @@ pub fn rank(hits: &[(i64, f32)], info: &HashMap<i64, ChunkInfo>, r: &Ranking) ->
                 segment: content.map(|c| c.seq).unwrap_or(0),
                 mtime: best.mtime,
                 size: best.size,
+                available: true,
             })
         })
         .collect();

@@ -1,0 +1,22 @@
+[package]
+name = "medialake-cloudapi"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "medialake_cloudapi"
+
+# Windows only. On other hosts the crate has just its platform-neutral half; to type-check the rest from a
+# Mac or Linux:  cargo check -p medialake-cloudapi --target x86_64-pc-windows-msvc --all-targets
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_CloudFilters",
+    "Win32_Storage_FileSystem",
+    "Win32_System_CorrelationVector",
+    "Win32_System_IO",
+] }
+
+[dev-dependencies]
+tempfile = "3"

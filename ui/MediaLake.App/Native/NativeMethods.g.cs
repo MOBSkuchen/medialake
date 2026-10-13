@@ -58,6 +58,17 @@ namespace MediaLake.Native
         internal static extern byte* sn_call(Handle* h, byte* method, byte* args_json);
 
         /// <summary>
+        ///  The uninstaller's step (Windows): every Cloud Files folder of the configuration in `config_dir` (empty =
+        ///  the default data folder) goes back to being a plain folder. Starts nothing: no core, no model server, no
+        ///  sync, no network. Returns `{"ok":{"unregistered":n,"errors":[{"path","error"}]}}` or `{"error":"..."}`.
+        ///
+        ///  # Safety
+        ///  `config_dir` must be null or a valid NUL-terminated UTF-8 string.
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "sn_unregister_sync_roots", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        internal static extern byte* sn_unregister_sync_roots(byte* config_dir);
+
+        /// <summary>
         ///  # Safety
         ///  `p` must come from this library (or be null).
         /// </summary>

@@ -27,7 +27,7 @@
     <key>NSRemovableVolumesUsageDescription</key>
     <string>MediaLake reads files on external drives only if you add a folder from one to the index.</string>
     <key>NSNetworkVolumesUsageDescription</key>
-    <string>MediaLake reads files on network volumes only if you add a folder from one to the index.</string>
+    <string>MediaLake shows synced folders as volumes under ~/MediaLake, and reads files on network volumes only if you add a folder from one to the index.</string>
     <key>NSFileProviderDomainUsageDescription</key>
     <string>MediaLake reads files in iCloud Drive and other cloud folders only if you add such a folder to the index.</string>
 </dict>

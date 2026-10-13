@@ -42,6 +42,16 @@ void sn_set_event_callback(struct Handle *h, void (*cb)(const char*));
 char *sn_call(struct Handle *h, const char *method, const char *args_json);
 
 /**
+ * The uninstaller's step (Windows): every Cloud Files folder of the configuration in `config_dir` (empty =
+ * the default data folder) goes back to being a plain folder. Starts nothing: no core, no model server, no
+ * sync, no network. Returns `{"ok":{"unregistered":n,"errors":[{"path","error"}]}}` or `{"error":"..."}`.
+ *
+ * # Safety
+ * `config_dir` must be null or a valid NUL-terminated UTF-8 string.
+ */
+char *sn_unregister_sync_roots(const char *config_dir);
+
+/**
  * # Safety
  * `p` must come from this library (or be null).
  */

@@ -38,6 +38,7 @@ public sealed partial class SettingsWindow : Window
     public SettingsWindow()
     {
         InitializeComponent();
+        PageSync.OwnerHwnd = WinRT.Interop.WindowNative.GetWindowHandle(this);
         SystemBackdrop = new Microsoft.UI.Xaml.Media.MicaBackdrop();
         AppWindow.Resize(new Windows.Graphics.SizeInt32(960, 720));
         AppWindow.SetIcon(System.IO.Path.Combine(AppContext.BaseDirectory, "Assets", "MediaLake.ico"));
@@ -51,7 +52,13 @@ public sealed partial class SettingsWindow : Window
     public FrameworkElement RootElement => Nav;
     public void SelectPage(int i) => Nav.SelectedItem = Nav.MenuItems[i];
 
+    /// <summary>Opens the Sync page (a notification was clicked).</summary>
+    public void SelectSync() => Nav.SelectedItem = Nav.MenuItems.OfType<NavigationViewItem>().First(i => (i.Tag as string) == "sync");
+
     // ---------- load / save ----------
+
+    /// <summary>Re-reads the settings (the welcome window changed the shortcut, the model or the search switch).</summary>
+    public Task ReloadAsync() => LoadAsync();
 
     private async Task LoadAsync()
     {
@@ -84,7 +91,8 @@ public sealed partial class SettingsWindow : Window
         RefreshQualityLabels();
         SelectModelItem();
         _loading = true;
-        HotkeyText.Text = (string?)_cfg["hotkey"] ?? "Ctrl+Alt+Space";
+        SearchSwitch.IsOn = (bool?)_cfg["search_enabled"] ?? true;
+        ShowHotkey((string?)_cfg["hotkey"] ?? "");
         AutostartSwitch.IsOn = Registry.CurrentUser.OpenSubKey(RunKey)?.GetValue(RunValue) != null;
 
         var mode = (string?)_cfg["server_mode"] ?? "local";
@@ -121,6 +129,11 @@ public sealed partial class SettingsWindow : Window
         if (core == null || _loading) return;
         try
         {
+            // the Sync page and the welcome window save their own settings: do not write back an older copy
+            // of them (sync would be switched off again, the welcome flag would come back as false)
+            var fresh = await core.CallAsync("get_settings");
+            if (fresh.TryGetProperty("sync", out var sync)) _cfg["sync"] = JsonNode.Parse(sync.GetRawText());
+            if (fresh.TryGetProperty("welcome_done", out var wd)) _cfg["welcome_done"] = wd.GetBoolean();
             var res = await core.CallAsync("set_settings", JsonSerializer.Deserialize<JsonElement>(_cfg.ToJsonString()));
             if (res.TryGetProperty("reindex", out var r) && r.GetBoolean()) await RefreshStatsAsync();
         }
@@ -157,6 +170,7 @@ public sealed partial class SettingsWindow : Window
 
     public void OnCoreEvent(JsonElement ev)
     {
+        PageSync.OnCoreEvent(ev);
         switch (ev.GetProperty("type").GetString())
         {
             case "download":
@@ -180,10 +194,37 @@ public sealed partial class SettingsWindow : Window
         PageGeneral.Visibility = tag == "general" ? Visibility.Visible : Visibility.Collapsed;
         PageModel.Visibility = tag == "model" ? Visibility.Visible : Visibility.Collapsed;
         PageIndex.Visibility = tag == "index" ? Visibility.Visible : Visibility.Collapsed;
+        PageSync.Visibility = tag == "sync" ? Visibility.Visible : Visibility.Collapsed;
         if (tag == "index") _ = RefreshStatsAsync();
+        if (tag == "sync") _ = PageSync.RefreshAsync();
     }
 
     // ---------- General ----------
+
+    /// <summary>Search on or off. Off: MediaLake only syncs, no model is loaded and nothing is indexed.</summary>
+    private async void Search_Toggled(object sender, RoutedEventArgs e)
+    {
+        var core = App.Core;
+        if (_loading || core == null) return;
+        var on = SearchSwitch.IsOn;
+        if (on)
+        {
+            var ready = false;
+            try { ready = (await core.CallAsync("status")).TryGetProperty("model_ready", out var m) && m.GetBoolean(); } catch { }
+            if (!ready)
+            {
+                // there is no model to search with: setting it up is the way to switch search on
+                _loading = true;
+                SearchSwitch.IsOn = false;
+                _loading = false;
+                ((App)Application.Current).ShowWelcome(0);
+                return;
+            }
+        }
+        _cfg["search_enabled"] = on;
+        await SaveAsync();
+        ((App)Application.Current).SearchChanged(reloadSettings: false);
+    }
 
     private bool _recording;
 
@@ -229,7 +270,7 @@ public sealed partial class SettingsWindow : Window
         parts.Add(name);
         var combo = string.Join('+', parts);
         var app = (App)Application.Current;
-        var previous = (string?)_cfg["hotkey"] ?? "Ctrl+Alt+Space";
+        var previous = (string?)_cfg["hotkey"] ?? "";
         var err = Hotkey.Register(combo); // validates by actually registering it
         if (err != null)
         {
@@ -238,11 +279,28 @@ public sealed partial class SettingsWindow : Window
             return;
         }
         HotkeyError.Text = "";
-        HotkeyText.Text = combo;
+        ShowHotkey(combo);
         _cfg["hotkey"] = combo;
         app.ApplyHotkey(combo);
         _ = SaveAsync();
         Nav.Focus(FocusState.Programmatic);
+    }
+
+    /// <summary>"Not set" and a Remove button when there is no shortcut: nobody has to have one.</summary>
+    private void ShowHotkey(string combo)
+    {
+        HotkeyText.Text = combo.Length == 0 ? "Not set" : combo;
+        HotkeyText.Opacity = combo.Length == 0 ? 0.6 : 1;
+        HotkeyRemove.Visibility = combo.Length == 0 ? Visibility.Collapsed : Visibility.Visible;
+    }
+
+    private void HotkeyRemove_Click(object sender, RoutedEventArgs e)
+    {
+        HotkeyError.Text = "";
+        ShowHotkey("");
+        _cfg["hotkey"] = "";
+        ((App)Application.Current).ApplyHotkey("");
+        _ = SaveAsync();
     }
 
     private async void KillDaemon_Click(object sender, RoutedEventArgs e)
@@ -281,6 +339,10 @@ public sealed partial class SettingsWindow : Window
             XamlRoot = Content.XamlRoot,
         };
         if (await dlg.ShowAsync() != ContentDialogResult.Primary) return;
+        // leave the synced folders first: hydrated files stay as ordinary files, placeholders go, the
+        // sync roots are unregistered (the uninstaller runs the same step once more, for the case that it
+        // is started from Windows Settings)
+        try { await App.Core!.CallAsync("sync_unregister_roots"); } catch { }
         System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(uninstaller) { UseShellExecute = true });
         ((App)Application.Current).QuitApp();
     }
@@ -356,7 +418,7 @@ public sealed partial class SettingsWindow : Window
             {
                 var label = tag switch { "heavy" => "Heavy: most precise", "light" => "Light: smallest and fastest", _ => "Normal: recommended" };
                 var size = info.size >= 1L << 30 ? $"{info.size / 1073741824.0:0.0} GB" : $"{info.size / 1048576.0:0} MB";
-                ci.Content = $"{label}  Â·  {size}" + (info.downloaded ? "  Â·  downloaded" : "");
+                ci.Content = $"{label}  ·  {size}" + (info.downloaded ? " (downloaded)" : "");
             }
         }
     }

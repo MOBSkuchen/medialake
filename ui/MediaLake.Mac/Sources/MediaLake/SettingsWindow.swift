@@ -13,11 +13,16 @@ struct DirItem: Identifiable, Equatable {
 @MainActor
 final class SettingsModel: ObservableObject {
     enum Page: Int, CaseIterable, Identifiable {
-        case general, model, index
+        case general, model, index, sync
         var id: Int { rawValue }
-        var title: String { ["General", "Model", "Index"][rawValue] }
-        var symbol: String { ["gearshape", "cpu", "folder"][rawValue] }
+        var title: String { ["General", "Model", "Index", "Sync"][rawValue] }
+        var symbol: String { ["gearshape", "cpu", "folder", "arrow.triangle.2.circlepath"][rawValue] }
     }
+
+    /// Owned by the app (the status item needs it while this window is closed).
+    let sync: SyncModel
+
+    init(sync: SyncModel) { self.sync = sync }
 
     @Published var page: Page = .general
 
@@ -27,7 +32,9 @@ final class SettingsModel: ObservableObject {
     private var saveTask: Task<Void, Never>?
 
     // General
-    @Published var hotkeyText = "Alt+Space"
+    @Published var searchEnabled = true
+    /// Empty = no global shortcut.
+    @Published var hotkeyText = ""
     @Published var hotkeyError = ""
     @Published var autostart = false
     @Published var autostartError = ""
@@ -59,6 +66,8 @@ final class SettingsModel: ObservableObject {
     @Published var statsText = ""
 
     var applyHotkey: ((String) -> String?)?
+    /// Turning search on while its model is missing leads to the welcome window instead.
+    var openSearchSetup: (() -> Void)?
     var requestQuit: (() -> Void)?
     var uninstall: (() -> Void)?
 
@@ -90,7 +99,8 @@ final class SettingsModel: ObservableObject {
             return
         }
         loading = true
-        hotkeyText = cfg["hotkey"] as? String ?? "Alt+Space"
+        searchEnabled = cfg["search_enabled"] as? Bool ?? true
+        hotkeyText = cfg["hotkey"] as? String ?? ""
         autostart = LoginItem.isEnabled
         mode = cfg["server_mode"] as? String ?? "local"
         embedModel = cfg["model"] as? String ?? "embeddinggemma-2"
@@ -130,6 +140,12 @@ final class SettingsModel: ObservableObject {
     func save() async {
         guard let core, !loading else { return }
         do {
+            // the Sync page and the welcome window save their own settings: do not write back an older
+            // copy of them (the welcome flag would otherwise come back as false)
+            if let fresh = try? await core.callAsync("get_settings") {
+                cfg["sync"] = fresh["sync"]
+                cfg["welcome_done"] = fresh["welcome_done"]
+            }
             let res = try await core.callAsync("set_settings", cfg)
             if res["reindex"] as? Bool == true { await refreshStats() }
         } catch {
@@ -172,7 +188,7 @@ final class SettingsModel: ObservableObject {
     // MARK: General
 
     func hotkeyRecorded(_ combo: String) -> String? {
-        let previous = cfg["hotkey"] as? String ?? "Alt+Space"
+        let previous = cfg["hotkey"] as? String ?? ""
         if let err = applyHotkey?(combo) {
             _ = applyHotkey?(previous)
             return err
@@ -180,6 +196,20 @@ final class SettingsModel: ObservableObject {
         cfg["hotkey"] = combo
         Task { await save() }
         return nil
+    }
+
+    func setSearchEnabled(_ on: Bool) {
+        guard !loading else { return }
+        Task {
+            if on, let st = try? await core?.callAsync("status"), st["model_ready"] as? Bool != true {
+                // there is no model to search with: setting it up is the way to switch search on
+                searchEnabled = false
+                openSearchSetup?()
+                return
+            }
+            cfg["search_enabled"] = on
+            await save()
+        }
     }
 
     func setAutostart(_ on: Bool) {
@@ -408,12 +438,13 @@ final class SettingsModel: ObservableObject {
 
 @MainActor
 final class SettingsWindowController: NSObject, NSWindowDelegate {
-    let model = SettingsModel()
+    let model: SettingsModel
     let window: NSWindow
     var onClose: (() -> Void)?
     var rootView: NSView { window.contentView! }
 
-    override init() {
+    init(sync: SyncModel) {
+        model = SettingsModel(sync: sync)
         window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 960, height: 720),
             styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
@@ -452,6 +483,7 @@ struct SettingsView: View {
                     case .general: GeneralPage(model: model)
                     case .model: ModelPage(model: model)
                     case .index: IndexPage(model: model)
+                    case .sync: SyncPage(model: model.sync)
                     }
                 }
                 .padding(.horizontal, 32).padding(.vertical, 24)
@@ -461,16 +493,17 @@ struct SettingsView: View {
         }
         .onChange(of: model.page) { _, p in
             if p == .index { Task { await model.refreshStats() } }
+            if p == .sync { Task { await model.sync.refresh() } }
         }
     }
 }
 
-private struct PageTitle: View {
+struct PageTitle: View {
     let text: String
     var body: some View { Text(text).font(.title).fontWeight(.semibold) }
 }
 
-private struct Hint: View {
+struct Hint: View {
     let text: String
     init(_ text: String) { self.text = text }
     var body: some View { Text(text).opacity(0.7).fixedSize(horizontal: false, vertical: true) }
@@ -482,9 +515,16 @@ struct GeneralPage: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 20) {
             PageTitle(text: "General")
+            VStack(alignment: .leading, spacing: 4) {
+                Toggle("Search my files by content", isOn: Binding(get: { model.searchEnabled }, set: { v in
+                    model.searchEnabled = v
+                    model.setSearchEnabled(v)
+                }))
+                Hint("Turn this off to use MediaLake only for syncing: no search model is loaded and nothing is indexed.")
+            }
             VStack(alignment: .leading, spacing: 6) {
-                Text("Global shortcut").fontWeight(.semibold)
-                Hint("Press this shortcut anywhere to open the search window.")
+                Text("Global shortcut (optional)").fontWeight(.semibold)
+                Hint("Press this shortcut anywhere to open the search window. Without one, use the menu bar icon.")
                 HotkeyRecorder(text: $model.hotkeyText, error: $model.hotkeyError) { model.hotkeyRecorded($0) }
             }
             VStack(alignment: .leading, spacing: 4) {
@@ -671,7 +711,8 @@ struct HotkeyRecorder: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 12) {
-                Text(recording ? "…" : HotkeySpec.display(of: text))
+                Text(recording ? "…" : (text.isEmpty ? "Not set" : HotkeySpec.display(of: text)))
+                    .opacity(text.isEmpty && !recording ? 0.55 : 1)
                     .frame(minWidth: 180, alignment: .leading)
                     .padding(.horizontal, 14).padding(.vertical, 8)
                     .background(RoundedRectangle(cornerRadius: 6).fill(Color.primary.opacity(recording ? 0.14 : 0.07)))
@@ -680,6 +721,16 @@ struct HotkeyRecorder: View {
                     .onTapGesture { startRecording() }
                 Text(recording ? "Press the new combination… (Esc cancels)" : "Click, then press the new combination")
                     .opacity(0.6)
+                if !text.isEmpty && !recording {
+                    Button("Remove") {
+                        if let err = apply("") {
+                            error = err
+                        } else {
+                            error = ""
+                            text = ""
+                        }
+                    }
+                }
             }
             if !error.isEmpty { Text(error).foregroundColor(.red).font(.system(size: 12)) }
         }

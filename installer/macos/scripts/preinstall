@@ -7,4 +7,10 @@ for i in 1 2 3 4 5 6 7 8 9 10; do
 done
 pkill -x MediaLake >/dev/null 2>&1
 pkill -x medialake-server >/dev/null 2>&1
+# A synced folder is an NFS volume served by the app itself. A normal quit unmounts it; after a kill the
+# system would keep a dead mount (and Finder would wait on it) until it times out. No component is
+# installed for this: the mount uses the NFS client that is part of macOS.
+/sbin/mount 2>/dev/null | /usr/bin/sed -n 's|^127\.0\.0\.1:/medialake-[^ ]* on \(.*\) (nfs.*|\1|p' | while IFS= read -r point; do
+    /sbin/umount -f "$point" >/dev/null 2>&1
+done
 exit 0

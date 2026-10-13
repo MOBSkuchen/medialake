@@ -70,6 +70,12 @@ internal static class Hotkey
     /// <summary>Registers the hotkey; the previous one is released first. Returns an error text or null.</summary>
     public static string? Register(string text)
     {
+        // no shortcut is a valid choice: release the old one
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            Win32.UnregisterHotKey(_hwnd, Id);
+            return null;
+        }
         if (!TryParse(text, out var mods, out var vk)) return "Use at least one modifier and one key, e.g. Ctrl+Alt+Space.";
         Win32.UnregisterHotKey(_hwnd, Id);
         if (!Win32.RegisterHotKey(_hwnd, Id, mods | Win32.MOD_NOREPEAT, vk))
@@ -82,8 +88,9 @@ internal static class Hotkey
 
 internal sealed class TrayIcon : IDisposable
 {
-    private const uint NIM_ADD = 0, NIM_DELETE = 2;
-    private const uint NIF_MESSAGE = 1, NIF_ICON = 2, NIF_TIP = 4;
+    private const uint NIM_ADD = 0, NIM_MODIFY = 1, NIM_DELETE = 2;
+    private const uint NIF_MESSAGE = 1, NIF_ICON = 2, NIF_TIP = 4, NIF_INFO = 0x10;
+    private const int NIN_BALLOONUSERCLICK = 0x405;
     private const int WM_TRAY = Win32.WM_APP + 1;
     private readonly nint _hwnd;
     private NOTIFYICONDATA _data;
@@ -91,6 +98,13 @@ internal sealed class TrayIcon : IDisposable
     public event Action? Open;
     public event Action? Settings;
     public event Action? Quit;
+    /// <summary>"Pause all syncing" (true) / "Resume all syncing" (false) from the menu.</summary>
+    public event Action<bool>? PauseAll;
+    /// <summary>The user clicked a balloon notification.</summary>
+    public event Action? BalloonClicked;
+
+    private string[] _syncLines = [];
+    private bool _allPaused;
 
     public TrayIcon(nint hwnd, string tooltip)
     {
@@ -118,6 +132,7 @@ internal sealed class TrayIcon : IDisposable
         var ev = (int)(l & 0xFFFF);
         if (ev == Win32.WM_LBUTTONUP) Open?.Invoke();
         else if (ev == Win32.WM_RBUTTONUP) ShowMenu();
+        else if (ev == NIN_BALLOONUSERCLICK) BalloonClicked?.Invoke();
         return true;
     }
 
@@ -127,6 +142,12 @@ internal sealed class TrayIcon : IDisposable
         var menu = Win32.CreatePopupMenu();
         Win32.AppendMenuW(menu, 0, 1, "Open MediaLake");
         Win32.AppendMenuW(menu, 0, 2, "Settings");
+        if (_syncLines.Length > 0)
+        {
+            Win32.AppendMenuW(menu, 0x800, 0, null); // separator
+            foreach (var l in _syncLines) Win32.AppendMenuW(menu, 0x3 /* MF_GRAYED | MF_DISABLED */, 0, l);
+            Win32.AppendMenuW(menu, 0, 4, _allPaused ? "Resume all syncing" : "Pause all syncing");
+        }
         Win32.AppendMenuW(menu, 0x800, 0, null); // separator
         Win32.AppendMenuW(menu, 0, 3, "Quit");
         Win32.SetForegroundWindow(_hwnd); // required for the menu to dismiss properly
@@ -137,7 +158,31 @@ internal sealed class TrayIcon : IDisposable
             case 1: Open?.Invoke(); break;
             case 2: Settings?.Invoke(); break;
             case 3: Quit?.Invoke(); break;
+            case 4: PauseAll?.Invoke(!_allPaused); break;
         }
+    }
+
+    /// <summary>The sync lines of the menu and the tooltip (what the icon says when hovered).</summary>
+    public void SetSync(string[] lines, bool allPaused, string tooltip)
+    {
+        _syncLines = lines;
+        _allPaused = allPaused;
+        _data.szTip = tooltip.Length > 120 ? tooltip[..120] : tooltip;
+        _data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+        Win32.Shell_NotifyIconW(NIM_MODIFY, ref _data);
+    }
+
+    /// <summary>A balloon notification from the icon (no registration needed; a click raises <see cref="BalloonClicked"/>).</summary>
+    public void Balloon(string title, string text)
+    {
+        _data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_INFO;
+        _data.szInfoTitle = title.Length > 60 ? title[..60] : title;
+        _data.szInfo = text.Length > 250 ? text[..250] : text;
+        _data.dwInfoFlags = 1; // NIIF_INFO
+        Win32.Shell_NotifyIconW(NIM_MODIFY, ref _data);
+        _data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+        _data.szInfo = "";
+        _data.szInfoTitle = "";
     }
 
     public void Dispose() => Win32.Shell_NotifyIconW(NIM_DELETE, ref _data);

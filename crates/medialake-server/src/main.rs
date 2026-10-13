@@ -1,7 +1,7 @@
 mod engine;
 mod serve;
 mod service;
-mod state;
+mod syncs;
 
 use std::io::BufRead;
 use std::net::SocketAddr;
@@ -18,6 +18,7 @@ use medialake_proto::{MAX_MESSAGE_BYTES, READY_PREFIX, ServerInfo};
 use crate::engine::Engine;
 use crate::service::{Auth, Service};
 use crate::serve::{PairArgs, ServeArgs, StateArgs};
+use crate::syncs::SyncCmd;
 
 #[derive(Parser)]
 #[command(name = "medialake-server", version, about = "MediaLake embedding server (EmbeddingGemma 2 / Qwen3-VL-Embedding via llama.cpp)")]
@@ -64,6 +65,11 @@ enum Cmd {
     Clients {
         #[command(subcommand)]
         cmd: ClientsCmd,
+    },
+    /// Manage hosted syncs (shared folders): add, grant, snapshots, restore.
+    Sync {
+        #[command(subcommand)]
+        cmd: SyncCmd,
     },
     /// Embed a fixed set of items and print timings.
     Bench {
@@ -141,6 +147,12 @@ pub(crate) fn start_engine(c: &Common) -> anyhow::Result<(Engine, ModelSet)> {
     Ok((engine, set))
 }
 
+/// True if both model files of the configured model and quality exist.
+pub(crate) fn model_files_present(c: &Common) -> bool {
+    let Ok(set) = selected_set(c) else { return false };
+    [set.model.file_name, set.mmproj.file_name].iter().all(|f| c.model_dir.join(f).exists())
+}
+
 pub(crate) fn server_info(engine: &Engine, set: &ModelSet) -> ServerInfo {
     ServerInfo {
         model_id: set.model_id.as_str().into(),
@@ -163,10 +175,11 @@ async fn run_local(cli: Cli) -> anyhow::Result<()> {
     let (engine, set) = start_engine(&cli.common)?;
     let shutdown = Arc::new(tokio::sync::Notify::new());
     let svc = Service {
-        engine: engine.clone(),
+        engine: Some(engine.clone()),
         model: set.model_id,
         auth: Arc::new(Auth { local_token: Some(token), remote: None }),
-        info: server_info(&engine, &set),
+        info: Some(server_info(&engine, &set)),
+        sync: None,
         shutdown: shutdown.clone(),
         pairing: None,
     };
@@ -260,6 +273,7 @@ fn main() -> anyhow::Result<()> {
         Some(Cmd::Bench { media_dir, repeat }) => bench(&cli.common, media_dir.clone(), *repeat),
         Some(Cmd::Serve(a)) => tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(serve::serve(&cli.common, a.clone())),
         Some(Cmd::Pair(a)) => serve::pair(a.clone()),
+        Some(Cmd::Sync { cmd }) => syncs::run(cmd.clone()),
         Some(Cmd::Clients { cmd: ClientsCmd::List(s) }) => serve::clients_list(s.clone()),
         Some(Cmd::Clients { cmd: ClientsCmd::Revoke { id, state } }) => serve::clients_revoke(state.clone(), id),
         None if cli.local => tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(run_local(cli)),
