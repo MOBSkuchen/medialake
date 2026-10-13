@@ -73,7 +73,6 @@ fn pattern(len: usize, seed: u8) -> Vec<u8> {
 }
 
 struct Fx {
-    _dir: tempfile::TempDir,
     base: PathBuf,
     host_root: PathBuf,
     hs: Arc<HostedSync>,
@@ -82,6 +81,8 @@ struct Fx {
     session: Option<CloudSession>,
     tr: Arc<Counting>,
     access: Access,
+    /// Last: it is deleted when everything that has files open in it is gone.
+    _dir: tempfile::TempDir,
 }
 
 impl Fx {

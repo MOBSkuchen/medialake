@@ -168,6 +168,10 @@ runs inside the app when `[[sync.hosted]]` has entries.
   read-only, conflicts keep both, offline, parallel readers, `touch` does not download, a Cocoa process's
   save patterns, stale-mount cleanup and the process registry.
 
+On Windows the tests that run a host on the test's own runtime (`network.rs`, the core's `sync.rs`) leave
+about a dozen small folders in `%TEMP%` per run: a folder cannot be deleted there while a task still has a
+database in it open. The other fixtures close everything first.
+
 Exercised on macOS (arm64) and on Windows 11 (x64); the macOS-only and Windows-only suites each on their own
 system. The changes made while bringing up Windows (the engine's rename guard, the Windows UI) were not
 rebuilt on a Mac.

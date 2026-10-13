@@ -12,10 +12,12 @@ use medialake_sync::member::frontend::Mirror;
 use medialake_sync::member::transport::LocalTransport;
 use tempfile::TempDir;
 
+// The temporary folder is the last field of each fixture: fields are dropped in order, and Windows does not
+// delete a folder while a database in it is still open (the folder would stay behind in %TEMP%).
 pub struct Host {
-    pub dir: TempDir,
     pub root: PathBuf,
     pub hs: Arc<HostedSync>,
+    pub dir: TempDir,
 }
 
 pub fn host(backup: BackupPolicy) -> Host {
@@ -35,10 +37,10 @@ pub fn host(backup: BackupPolicy) -> Host {
 }
 
 pub struct Member {
-    pub _dir: TempDir,
     pub root: PathBuf,
     pub engine: Engine,
     pub name: String,
+    pub _dir: TempDir,
 }
 
 pub fn member(h: &Host, name: &str, policy: ConflictPolicy, access: Access) -> Member {
